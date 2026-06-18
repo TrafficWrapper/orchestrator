@@ -20,6 +20,10 @@ build/install the app and import a bootstrap payload from the orchestrator.
 Architecture and threat-model notes live in [ARCHITECTURE.md](ARCHITECTURE.md)
 and [THREAT_MODEL.md](THREAT_MODEL.md).
 
+Operational and contributor guides: [FAQ.md](FAQ.md),
+[TROUBLESHOOTING.md](TROUBLESHOOTING.md), [DEVELOPMENT.md](DEVELOPMENT.md), and
+[RUNBOOK.md](RUNBOOK.md).
+
 ## Start Here: End-to-End Flow
 
 1. Start the orchestrator with Docker Compose and open the admin UI at

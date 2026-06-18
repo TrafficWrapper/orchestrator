@@ -20,6 +20,10 @@ TrafficWrapper разделён на три репозитория:
 Архитектура и threat model описаны в [ARCHITECTURE.md](ARCHITECTURE.md) и
 [THREAT_MODEL.md](THREAT_MODEL.md).
 
+Операционные и contributor guides: [FAQ.ru.md](FAQ.ru.md),
+[TROUBLESHOOTING.ru.md](TROUBLESHOOTING.ru.md),
+[DEVELOPMENT.ru.md](DEVELOPMENT.ru.md) и [RUNBOOK.ru.md](RUNBOOK.ru.md).
+
 ## Начните здесь: сквозной сценарий
 
 1. Запустите orchestrator через Docker Compose и откройте admin UI по
