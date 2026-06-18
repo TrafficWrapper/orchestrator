@@ -71,23 +71,29 @@ type workerRecord struct {
 }
 
 type deviceRecord struct {
-	ID              string          `json:"id"`
-	Status          string          `json:"status"`
-	NoisePublicKey  string          `json:"noise_public_key"`
-	IdentityPubKey  string          `json:"identity_pubkey"`
-	IdentityKeyType string          `json:"identity_key_type,omitempty"`
-	AndroidID       string          `json:"android_id,omitempty"`
-	Model           string          `json:"model,omitempty"`
-	EnrollmentNonce string          `json:"enrollment_nonce,omitempty"`
-	ClientVersion   string          `json:"client_version,omitempty"`
-	AWGPublicKey    string          `json:"awg_public_key,omitempty"`
-	RealityUUID     string          `json:"reality_uuid,omitempty"`
-	InternalIP      string          `json:"internal_ip,omitempty"`
-	PSK2            string          `json:"psk2,omitempty"`
-	BootstrapToken  string          `json:"bootstrap_token"`
-	Limits          json.RawMessage `json:"limits,omitempty"`
-	CreatedAt       time.Time       `json:"created_at"`
-	ConfigSeq       int64           `json:"config_seq"`
+	ID              string       `json:"id"`
+	Status          string       `json:"status"`
+	NoisePublicKey  string       `json:"noise_public_key"`
+	IdentityPubKey  string       `json:"identity_pubkey"`
+	IdentityKeyType string       `json:"identity_key_type,omitempty"`
+	AndroidID       string       `json:"android_id,omitempty"`
+	Model           string       `json:"model,omitempty"`
+	EnrollmentNonce string       `json:"enrollment_nonce,omitempty"`
+	ClientVersion   string       `json:"client_version,omitempty"`
+	AWGPublicKey    string       `json:"awg_public_key,omitempty"`
+	RealityUUID     string       `json:"reality_uuid,omitempty"`
+	InternalIP      string       `json:"internal_ip,omitempty"`
+	PSK2            string       `json:"psk2,omitempty"`
+	BootstrapToken  string       `json:"bootstrap_token"`
+	Limits          deviceLimits `json:"limits,omitempty"`
+	CreatedAt       time.Time    `json:"created_at"`
+	ConfigSeq       int64        `json:"config_seq"`
+}
+
+type deviceLimits struct {
+	TrafficQuotaBytes uint64  `json:"traffic_quota_bytes,omitempty"`
+	RateLimit         string  `json:"rate_limit,omitempty"`
+	ExpiresAt         *string `json:"expires_at,omitempty"`
 }
 
 type telemetrySnapshotRecord struct {
@@ -233,6 +239,33 @@ func copyRawJSON(raw json.RawMessage) json.RawMessage {
 	return append(json.RawMessage(nil), raw...)
 }
 
+func parseDeviceLimitsRaw(raw json.RawMessage) (deviceLimits, error) {
+	if len(strings.TrimSpace(string(raw))) == 0 {
+		return deviceLimits{}, nil
+	}
+	var limits deviceLimits
+	if err := json.Unmarshal(raw, &limits); err != nil {
+		return deviceLimits{}, err
+	}
+	if limits.ExpiresAt != nil {
+		trimmed := strings.TrimSpace(*limits.ExpiresAt)
+		if trimmed == "" {
+			limits.ExpiresAt = nil
+		} else {
+			if _, err := time.Parse(time.RFC3339, trimmed); err != nil {
+				return deviceLimits{}, fmt.Errorf("expires_at: %w", err)
+			}
+			limits.ExpiresAt = &trimmed
+		}
+	}
+	limits.RateLimit = strings.TrimSpace(limits.RateLimit)
+	return limits, nil
+}
+
+func deviceLimitsEmpty(limits deviceLimits) bool {
+	return limits.TrafficQuotaBytes == 0 && strings.TrimSpace(limits.RateLimit) == "" && limits.ExpiresAt == nil
+}
+
 func (s *orchStore) setAdminPassword(secret string) error {
 	return s.setAdminPasswordWithMustChange(secret, false)
 }
@@ -334,6 +367,31 @@ func (s *orchStore) botSettings() (botSettingsRecord, bool, error) {
 		return botSettingsRecord{}, false, nil
 	}
 	return rec, true, nil
+}
+
+func (s *orchStore) botPendingWorkerNotified(workerID string) (bool, error) {
+	workerID = strings.TrimSpace(workerID)
+	if workerID == "" {
+		return false, nil
+	}
+	key := []byte("bot_pending_worker_notified:" + workerID)
+	var found bool
+	err := s.db.View(func(tx *bolt.Tx) error {
+		found = tx.Bucket(bucketMeta).Get(key) != nil
+		return nil
+	})
+	return found, err
+}
+
+func (s *orchStore) markBotPendingWorkerNotified(workerID string) error {
+	workerID = strings.TrimSpace(workerID)
+	if workerID == "" {
+		return nil
+	}
+	key := []byte("bot_pending_worker_notified:" + workerID)
+	return s.db.Update(func(tx *bolt.Tx) error {
+		return tx.Bucket(bucketMeta).Put(key, []byte(time.Now().UTC().Format(time.RFC3339Nano)))
+	})
 }
 
 func (s *orchStore) createToken(id, secret string, ttl time.Duration, maxUses int, workerStaticPub string) error {
@@ -450,7 +508,11 @@ func (s *orchStore) consumeBootstrapToken(secret string, device deviceRecord, aw
 			}
 			device.Status = "approved"
 			device.BootstrapToken = rec.ID
-			device.Limits = copyRawJSON(rec.Limits)
+			limits, err := parseDeviceLimitsRaw(rec.Limits)
+			if err != nil {
+				return err
+			}
+			device.Limits = limits
 			device.CreatedAt = now
 			if device.RealityUUID == "" {
 				device.RealityUUID = uuidV4()
@@ -520,6 +582,36 @@ func (s *orchStore) device(id string) (deviceRecord, error) {
 		return s.openJSON(raw, &rec)
 	})
 	return rec, err
+}
+
+func (s *orchStore) setDeviceLimits(id string, limits deviceLimits) error {
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return errors.New("device id is required")
+	}
+	return s.db.Update(func(tx *bolt.Tx) error {
+		b := tx.Bucket(bucketDevices)
+		raw := b.Get([]byte(id))
+		if raw == nil {
+			return errors.New("device not found")
+		}
+		var rec deviceRecord
+		if err := s.openJSON(raw, &rec); err != nil {
+			return err
+		}
+		rec.Limits = limits
+		if rec.ConfigSeq < 1 {
+			rec.ConfigSeq = 1
+		}
+		sealed, err := s.sealJSON(rec)
+		if err != nil {
+			return err
+		}
+		if err := b.Put([]byte(rec.ID), sealed); err != nil {
+			return err
+		}
+		return s.bumpWorkerSeqsTx(tx)
+	})
 }
 
 func (s *orchStore) setTelemetrySnapshot(rec telemetrySnapshotRecord) error {

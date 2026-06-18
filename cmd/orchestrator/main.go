@@ -1215,14 +1215,21 @@ func canonicalClientRouteParams(routeType string, params map[string]any) map[str
 func approvedDevicePayloads(devices []deviceRecord) []any {
 	out := make([]any, 0, len(devices))
 	for _, device := range devices {
-		out = append(out, map[string]any{
+		payload := map[string]any{
 			"device_id":      device.ID,
 			"reality_uuid":   device.RealityUUID,
 			"awg_public_key": device.AWGPublicKey,
 			"internal_ip":    device.InternalIP,
 			"psk2":           device.PSK2,
 			"status":         device.Status,
-		})
+		}
+		if !deviceLimitsEmpty(device.Limits) {
+			payload["limits"] = device.Limits
+			if device.Limits.ExpiresAt != nil && strings.TrimSpace(*device.Limits.ExpiresAt) != "" {
+				payload["expires_at"] = strings.TrimSpace(*device.Limits.ExpiresAt)
+			}
+		}
+		out = append(out, payload)
 	}
 	return out
 }

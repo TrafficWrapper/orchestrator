@@ -9,7 +9,11 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
+	"mime/multipart"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -23,6 +27,11 @@ const (
 	botLoginApprovalTTL       = 2 * time.Minute
 	botMessageMaxDevices      = 12
 	botMessageMaxWorkers      = 12
+	botPendingNotifyInterval  = 30 * time.Second
+	botLimitStateTTL          = 2 * time.Minute
+	telegramMaxDocumentSize   = 50 << 20
+	telegramMaxQuotaBytes     = 100 * 1024 * 1024 * 1024 * 1024
+	telegramMaxLimitDuration  = 3650 * 24 * time.Hour
 	botCallbackApprovePrefix  = "login:approve:"
 	botCallbackDenyPrefix     = "login:deny:"
 	botCallbackWorkerPrefix   = "worker:"
@@ -46,6 +55,7 @@ type telegramClientFactory func(token string) telegramAPI
 type telegramAPI interface {
 	getUpdates(ctx context.Context, offset int64, timeoutSeconds int) ([]telegramUpdate, error)
 	sendMessage(ctx context.Context, chatID int64, text string, keyboard *telegramInlineKeyboard) error
+	sendDocument(ctx context.Context, chatID int64, path, filename, caption string) error
 	answerCallback(ctx context.Context, callbackID, text string) error
 }
 
@@ -54,6 +64,8 @@ type telegramBot struct {
 	ownerID  int64
 	client   telegramAPI
 	approver *botAuthApprover
+	limitMu  sync.Mutex
+	limits   map[int64]telegramLimitState
 }
 
 type botAuthApprover struct {
@@ -61,6 +73,11 @@ type botAuthApprover struct {
 	ttl     time.Duration
 	mu      sync.Mutex
 	pending map[string]chan bool
+}
+
+type telegramLimitState struct {
+	DeviceID  string
+	ExpiresAt time.Time
 }
 
 type telegramUpdate struct {
@@ -225,6 +242,7 @@ func newTelegramBot(s *server, settings botSettingsRecord, client telegramAPI) *
 		server:  s,
 		ownerID: settings.OwnerID,
 		client:  client,
+		limits:  map[int64]telegramLimitState{},
 	}
 	b.approver = &botAuthApprover{
 		bot:     b,
@@ -244,11 +262,16 @@ func newTelegramHTTPClient(token string) telegramAPI {
 
 func (b *telegramBot) run(ctx context.Context) {
 	var offset int64
+	nextNotify := time.Now()
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		default:
+		}
+		if !time.Now().Before(nextNotify) {
+			b.notifyPendingWorkers(ctx)
+			nextNotify = time.Now().Add(botPendingNotifyInterval)
 		}
 		updates, err := b.client.getUpdates(ctx, offset, botPollTimeoutSeconds)
 		if err != nil {
@@ -289,6 +312,21 @@ func (b *telegramBot) handleUpdate(ctx context.Context, update telegramUpdate) {
 
 func (b *telegramBot) handleMessage(ctx context.Context, msg telegramMessage) {
 	text := strings.TrimSpace(msg.Text)
+	if !strings.HasPrefix(text, "/") {
+		if state, ok := b.takeLimitState(msg.From.ID); ok {
+			limits, err := parseTelegramDeviceLimits(text, time.Now().UTC())
+			if err != nil {
+				_ = b.sendOwnerMessage(ctx, "Лимиты не применены: "+err.Error(), nil)
+				return
+			}
+			if err := b.server.store.setDeviceLimits(state.DeviceID, limits); err != nil {
+				_ = b.sendOwnerMessage(ctx, "Лимиты не применены: "+err.Error(), nil)
+				return
+			}
+			_ = b.sendOwnerMessage(ctx, "Лимиты заданы: "+telegramLimitsSummary(limits), nil)
+			return
+		}
+	}
 	command := strings.Fields(text)
 	if len(command) == 0 {
 		_ = b.sendOwnerMessage(ctx, botHelpText(), nil)
@@ -309,9 +347,15 @@ func (b *telegramBot) handleMessage(ctx context.Context, msg telegramMessage) {
 		_ = b.sendOwnerMessage(ctx, b.configText(), nil)
 	case "/publish_apk":
 		_ = b.sendOwnerMessage(ctx, b.apkText(), nil)
+	case "/get_apk":
+		if err := b.sendCurrentAPK(ctx); err != nil {
+			_ = b.sendOwnerMessage(ctx, "APK: "+err.Error(), nil)
+		}
 	case "/approve":
 		text, keyboard := b.approveText()
 		_ = b.sendOwnerMessage(ctx, text, keyboard)
+	case "/limit":
+		_ = b.handleLimitCommand(ctx, command)
 	default:
 		_ = b.sendOwnerMessage(ctx, "Неизвестная команда.\n\n"+botHelpText(), nil)
 	}
@@ -479,6 +523,9 @@ func (b *telegramBot) devicesText() (string, *telegramInlineKeyboard) {
 			firstNotBlank(device.ClientVersion, "-"),
 			firstNotBlank(device.InternalIP, "-"),
 		)
+		if !deviceLimitsEmpty(device.Limits) {
+			fmt.Fprintf(&out, "  limits: %s\n", telegramLimitsSummary(device.Limits))
+		}
 		if device.Status != "revoked" {
 			keyboard.InlineKeyboard = append(keyboard.InlineKeyboard, []telegramInlineButton{{
 				Text:         "Revoke " + shortString(device.ID, 8),
@@ -487,6 +534,51 @@ func (b *telegramBot) devicesText() (string, *telegramInlineKeyboard) {
 		}
 	}
 	return out.String(), keyboard
+}
+
+func (b *telegramBot) handleLimitCommand(ctx context.Context, command []string) error {
+	if len(command) < 2 {
+		return b.sendOwnerMessage(ctx, "Формат: /limit <device_id> <quota|-|reset> <rate|-|0> <expiry|-|нет>\nПример: /limit twpk_abcd 10GB 20mbit 30d", nil)
+	}
+	deviceID := strings.TrimSpace(command[1])
+	if _, err := b.server.store.device(deviceID); err != nil {
+		return b.sendOwnerMessage(ctx, "Device: "+err.Error(), nil)
+	}
+	if len(command) == 2 {
+		b.putLimitState(b.ownerID, deviceID)
+		return b.sendOwnerMessage(ctx, "Отправьте лимиты для "+shortString(deviceID, 12)+": quota rate expiry\nПример: 10GB 20mbit 30d\nСброс: reset", nil)
+	}
+	limits, err := parseTelegramDeviceLimits(strings.Join(command[2:], " "), time.Now().UTC())
+	if err != nil {
+		return b.sendOwnerMessage(ctx, "Лимиты не применены: "+err.Error(), nil)
+	}
+	if err := b.server.store.setDeviceLimits(deviceID, limits); err != nil {
+		return b.sendOwnerMessage(ctx, "Лимиты не применены: "+err.Error(), nil)
+	}
+	return b.sendOwnerMessage(ctx, "Лимиты заданы: "+telegramLimitsSummary(limits), nil)
+}
+
+func (b *telegramBot) putLimitState(ownerID int64, deviceID string) {
+	b.limitMu.Lock()
+	defer b.limitMu.Unlock()
+	if b.limits == nil {
+		b.limits = map[int64]telegramLimitState{}
+	}
+	b.limits[ownerID] = telegramLimitState{DeviceID: strings.TrimSpace(deviceID), ExpiresAt: time.Now().UTC().Add(botLimitStateTTL)}
+}
+
+func (b *telegramBot) takeLimitState(ownerID int64) (telegramLimitState, bool) {
+	b.limitMu.Lock()
+	defer b.limitMu.Unlock()
+	state, ok := b.limits[ownerID]
+	if !ok {
+		return telegramLimitState{}, false
+	}
+	delete(b.limits, ownerID)
+	if time.Now().UTC().After(state.ExpiresAt) {
+		return telegramLimitState{}, false
+	}
+	return state, true
 }
 
 func (b *telegramBot) configText() string {
@@ -526,6 +618,31 @@ func (b *telegramBot) apkText() string {
 	)
 }
 
+func (b *telegramBot) sendCurrentAPK(ctx context.Context) error {
+	rec, ok, err := b.server.store.currentAPKRelease()
+	if err != nil {
+		return err
+	}
+	if !ok || strings.TrimSpace(rec.APKPath) == "" {
+		return errors.New("релиз не опубликован")
+	}
+	stat, err := os.Stat(rec.APKPath)
+	if err != nil {
+		return err
+	}
+	if stat.Size() > telegramMaxDocumentSize {
+		return fmt.Errorf("APK больше лимита Telegram Bot API: %s", humanBytes(uint64(stat.Size())))
+	}
+	filename := strings.TrimSpace(rec.APKName)
+	if filename == "" {
+		filename = filepath.Base(rec.APKPath)
+	}
+	if strings.TrimSpace(rec.VersionName) != "" && rec.VersionCode > 0 {
+		filename = fmt.Sprintf("TrafficWrapper-app-v%s-code%d.apk", rec.VersionName, rec.VersionCode)
+	}
+	return b.client.sendDocument(ctx, b.ownerID, rec.APKPath, filename, "Текущий опубликованный APK")
+}
+
 func (b *telegramBot) approveText() (string, *telegramInlineKeyboard) {
 	workers, err := b.server.store.workers()
 	if err != nil {
@@ -552,6 +669,41 @@ func (b *telegramBot) approveText() (string, *telegramInlineKeyboard) {
 	return out.String(), keyboard
 }
 
+func (b *telegramBot) notifyPendingWorkers(ctx context.Context) {
+	workers, err := b.server.store.workers()
+	if err != nil {
+		log.Printf("telegram pending worker notify list failed: %v", err)
+		return
+	}
+	for _, worker := range workers {
+		if worker.Status != "pending" {
+			continue
+		}
+		notified, err := b.server.store.botPendingWorkerNotified(worker.ID)
+		if err != nil || notified {
+			continue
+		}
+		if err := b.sendPendingWorkerNotice(ctx, worker); err != nil {
+			log.Printf("telegram pending worker notify send failed: %v", err)
+			continue
+		}
+		_ = b.server.store.markBotPendingWorkerNotified(worker.ID)
+	}
+}
+
+func (b *telegramBot) sendPendingWorkerNotice(ctx context.Context, worker workerRecord) error {
+	text := fmt.Sprintf(
+		"Новый pending worker\nid: %s\ncreated: %s\naddress: %s",
+		worker.ID,
+		worker.CreatedAt.UTC().Format(time.RFC3339),
+		firstNotBlank(stringFromMap(worker.SelfDescribe, "public_address"), "-"),
+	)
+	keyboard := &telegramInlineKeyboard{InlineKeyboard: [][]telegramInlineButton{{
+		{Text: "Approve " + shortString(worker.ID, 8), CallbackData: "worker:approve:" + worker.ID},
+	}}}
+	return b.sendOwnerMessage(ctx, text, keyboard)
+}
+
 func botHelpText() string {
 	return strings.Join([]string{
 		"Команды:",
@@ -560,7 +712,9 @@ func botHelpText() string {
 		"/devices — устройства",
 		"/config — priority/weight",
 		"/publish_apk — статус APK",
+		"/get_apk — отправить текущий APK",
 		"/approve — pending approvals",
+		"/limit <device_id> <quota> <rate> <expiry> — задать лимиты",
 	}, "\n")
 }
 
@@ -586,6 +740,177 @@ func boolInt(value bool) int {
 		return 1
 	}
 	return 0
+}
+
+func parseTelegramDeviceLimits(input string, now time.Time) (deviceLimits, error) {
+	value := strings.TrimSpace(input)
+	if value == "" {
+		return deviceLimits{}, errors.New("пустая строка; формат: квота скорость срок")
+	}
+	if isResetLimitsToken(value) {
+		return deviceLimits{}, nil
+	}
+	fields := strings.Fields(value)
+	if len(fields) > 3 {
+		return deviceLimits{}, errors.New("нужно не больше трёх полей: квота скорость срок")
+	}
+	var limits deviceLimits
+	var err error
+	if len(fields) >= 1 {
+		limits.TrafficQuotaBytes, err = parseTelegramQuotaBytes(fields[0])
+		if err != nil {
+			return deviceLimits{}, fmt.Errorf("квота: %w", err)
+		}
+	}
+	if len(fields) >= 2 {
+		limits.RateLimit, err = parseTelegramRateLimit(fields[1])
+		if err != nil {
+			return deviceLimits{}, fmt.Errorf("скорость: %w", err)
+		}
+	}
+	if len(fields) >= 3 {
+		limits.ExpiresAt, err = parseTelegramLimitExpiry(fields[2], now)
+		if err != nil {
+			return deviceLimits{}, fmt.Errorf("срок: %w", err)
+		}
+	}
+	return limits, nil
+}
+
+func parseTelegramQuotaBytes(token string) (uint64, error) {
+	token = strings.ToLower(strings.TrimSpace(strings.ReplaceAll(token, ",", ".")))
+	if isNoLimitToken(token) {
+		return 0, nil
+	}
+	units := []struct {
+		suffix     string
+		multiplier float64
+	}{
+		{"gib", 1024 * 1024 * 1024},
+		{"gb", 1024 * 1024 * 1024},
+		{"gi", 1024 * 1024 * 1024},
+		{"g", 1024 * 1024 * 1024},
+		{"mib", 1024 * 1024},
+		{"mb", 1024 * 1024},
+		{"mi", 1024 * 1024},
+		{"m", 1024 * 1024},
+		{"kib", 1024},
+		{"kb", 1024},
+		{"ki", 1024},
+		{"k", 1024},
+		{"bytes", 1},
+		{"byte", 1},
+		{"b", 1},
+	}
+	multiplier := float64(1)
+	number := token
+	for _, unit := range units {
+		if strings.HasSuffix(token, unit.suffix) {
+			multiplier = unit.multiplier
+			number = strings.TrimSpace(strings.TrimSuffix(token, unit.suffix))
+			break
+		}
+	}
+	amount, err := strconv.ParseFloat(number, 64)
+	if err != nil || math.IsNaN(amount) || math.IsInf(amount, 0) {
+		return 0, errors.New("пример: 10GB, 500MB, 1.5G или -")
+	}
+	if amount <= 0 {
+		return 0, errors.New("должна быть больше 0 или '-'")
+	}
+	bytes := math.Round(amount * multiplier)
+	if bytes <= 0 || bytes > telegramMaxQuotaBytes {
+		return 0, fmt.Errorf("должна быть в пределах %s", humanBytes(uint64(telegramMaxQuotaBytes)))
+	}
+	return uint64(bytes), nil
+}
+
+func parseTelegramRateLimit(token string) (string, error) {
+	token = strings.ToLower(strings.TrimSpace(token))
+	if isNoLimitToken(token) {
+		return "", nil
+	}
+	if len([]rune(token)) > 32 || strings.ContainsAny(token, "\r\n\t ") {
+		return "", errors.New("пример: 20mbit, 50mbps или -")
+	}
+	return token, nil
+}
+
+func parseTelegramLimitExpiry(token string, now time.Time) (*string, error) {
+	token = strings.ToLower(strings.TrimSpace(strings.ReplaceAll(token, ",", ".")))
+	if isNoLimitToken(token) {
+		return nil, nil
+	}
+	if len(token) < 2 {
+		return nil, errors.New("пример: 24h, 7d, 30d или -")
+	}
+	unit := token[len(token)-1:]
+	number := strings.TrimSpace(token[:len(token)-1])
+	amount, err := strconv.ParseFloat(number, 64)
+	if err != nil || math.IsNaN(amount) || math.IsInf(amount, 0) || amount <= 0 {
+		return nil, errors.New("пример: 24h, 7d, 30d или -")
+	}
+	var duration time.Duration
+	switch unit {
+	case "h":
+		duration = time.Duration(amount * float64(time.Hour))
+	case "d":
+		duration = time.Duration(amount * float64(24*time.Hour))
+	default:
+		return nil, errors.New("единица срока должна быть h или d")
+	}
+	if duration <= 0 || duration > telegramMaxLimitDuration {
+		return nil, fmt.Errorf("срок должен быть от 1с до %s", telegramMaxLimitDuration)
+	}
+	expiresAt := now.UTC().Add(duration).Format(time.RFC3339)
+	return &expiresAt, nil
+}
+
+func telegramLimitsSummary(limits deviceLimits) string {
+	quota := "нет"
+	if limits.TrafficQuotaBytes > 0 {
+		quota = humanBytes(limits.TrafficQuotaBytes)
+	}
+	rate := "нет"
+	if strings.TrimSpace(limits.RateLimit) != "" {
+		rate = strings.TrimSpace(limits.RateLimit) + " (hint)"
+	}
+	expires := "нет"
+	if limits.ExpiresAt != nil && strings.TrimSpace(*limits.ExpiresAt) != "" {
+		expires = strings.TrimSpace(*limits.ExpiresAt) + " (enforced)"
+	}
+	return fmt.Sprintf("квота %s (TODO), скорость %s, срок %s", quota, rate, expires)
+}
+
+func isNoLimitToken(token string) bool {
+	switch strings.ToLower(strings.TrimSpace(token)) {
+	case "", "-", "0", "нет", "none", "no":
+		return true
+	default:
+		return false
+	}
+}
+
+func isResetLimitsToken(token string) bool {
+	switch strings.ToLower(strings.TrimSpace(token)) {
+	case "reset", "сброс", "clear":
+		return true
+	default:
+		return false
+	}
+}
+
+func humanBytes(value uint64) string {
+	const unit = 1024
+	if value < unit {
+		return fmt.Sprintf("%d B", value)
+	}
+	div, exp := uint64(unit), 0
+	for n := value / unit; n >= unit; n /= unit {
+		div *= unit
+		exp++
+	}
+	return fmt.Sprintf("%.1f %ciB", float64(value)/float64(div), "KMGTPE"[exp])
 }
 
 func (a *botAuthApprover) enabled() bool {
@@ -679,6 +1004,57 @@ func (c *telegramHTTPClient) sendMessage(ctx context.Context, chatID int64, text
 	}
 	if !resp.OK {
 		return errors.New(firstNotBlank(resp.Error, "telegram sendMessage failed"))
+	}
+	return nil
+}
+
+func (c *telegramHTTPClient) sendDocument(ctx context.Context, chatID int64, path, filename, caption string) error {
+	file, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+	pr, pw := io.Pipe()
+	writer := multipart.NewWriter(pw)
+	go func() {
+		defer pw.Close()
+		_ = writer.WriteField("chat_id", strconv.FormatInt(chatID, 10))
+		if strings.TrimSpace(caption) != "" {
+			_ = writer.WriteField("caption", caption)
+		}
+		part, err := writer.CreateFormFile("document", filename)
+		if err == nil {
+			_, err = io.Copy(part, file)
+		}
+		closeErr := writer.Close()
+		if err != nil {
+			_ = pw.CloseWithError(err)
+			return
+		}
+		if closeErr != nil {
+			_ = pw.CloseWithError(closeErr)
+		}
+	}()
+	url := strings.TrimRight(c.apiURL, "/") + "/bot" + c.token + "/sendDocument"
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, pr)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", writer.FormDataContentType())
+	resp, err := c.client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	var env struct {
+		OK    bool   `json:"ok"`
+		Error string `json:"description,omitempty"`
+	}
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&env); err != nil {
+		return err
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 || !env.OK {
+		return errors.New(firstNotBlank(env.Error, "telegram sendDocument failed"))
 	}
 	return nil
 }
