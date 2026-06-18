@@ -1,0 +1,36 @@
+services:
+  signer:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: ["signer"]
+    environment:
+      ORCH_STATE_DIR: /orch-state
+      ORCH_SIGNER_SOCKET: /orch-state/signer.sock
+    volumes:
+      - ./orch-state:/orch-state
+    restart: unless-stopped
+
+  orchestrator:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: ["serve"]
+    depends_on:
+      - signer
+    environment:
+      ORCH_STATE_DIR: /orch-state
+      ORCH_SIGNER_SOCKET: /orch-state/signer.sock
+      ORCH_LISTEN: ${ORCH_LISTEN:-:9091}
+      ORCH_TLS: ${ORCH_TLS:-1}
+      ORCH_PUBLIC_URL: ${ORCH_PUBLIC_URL:-https://127.0.0.1:9091}
+      ORCH_EGRESS_PROBE_URL: ${ORCH_EGRESS_PROBE_URL:-http://127.0.0.1:9090/self-describe}
+      ORCH_UPDATE_PUBKEY: ${ORCH_UPDATE_PUBKEY:-}
+      SEED_APK_PATH: ${SEED_APK_PATH:-/seed/app.apk}
+      SEED_APK_VERSION_CODE: ${SEED_APK_VERSION_CODE:-1}
+      SEED_APK_VERSION_NAME: ${SEED_APK_VERSION_NAME:-seed}
+    network_mode: host
+    volumes:
+      - ./orch-state:/orch-state
+      - ./seed:/seed:ro
+    restart: unless-stopped

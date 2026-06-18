@@ -1,0 +1,221 @@
+# TrafficWrapper Orchestrator
+
+[English](README.md)
+
+Control plane платформы TrafficWrapper. Orchestrator approve'ит workers,
+enroll'ит устройства, подписывает client-config, отдаёт web-админку владельца,
+хранит APK update artifacts и опционально запускает owner-only Telegram-бота.
+
+TrafficWrapper разделён на три репозитория:
+
+- [orchestrator](https://github.com/TrafficWrapper/orchestrator) — control plane.
+- [worker](https://github.com/TrafficWrapper/worker) — REALITY + AmneziaWG data plane nodes.
+- [app](https://github.com/TrafficWrapper/app) — Android public client.
+
+Обычный workflow: запустить orchestrator, подключить один или несколько workers,
+затем собрать/установить app и импортировать bootstrap payload из orchestrator.
+
+## Требования
+
+- Linux host с Docker и Docker Compose.
+- HTTPS URL, доступный устройствам и workers.
+- Go 1.23+ только для локальной сборки вне Docker.
+- Минимум для запуска: 1 CPU и 1 GB RAM. На серверах с 1 GB добавьте swap;
+  сборки и pull Docker images стабильнее с 2 GB+ RAM.
+
+Установка Docker на чистом host:
+
+```sh
+curl -fsSL https://get.docker.com | sh
+sudo usermod -aG docker "$USER"
+```
+
+## Быстрый старт
+
+```sh
+git clone https://github.com/TrafficWrapper/orchestrator.git
+cd orchestrator
+cp .env.example .env
+docker compose up -d --build signer orchestrator
+docker compose logs orchestrator | grep -i 'initial admin password'
+docker compose exec orchestrator orchestrator public-key
+```
+
+Откройте web UI по `ORCH_PUBLIC_URL`, войдите с initial password из лога
+контейнера и сразу смените пароль. Initial password хранится только как hash и
+не создаёт полноценную admin session до смены.
+
+Чтобы подключить телефон через web UI, сначала approve хотя бы один worker,
+затем откройте **Устройства** -> **+ Новое устройство**. Страница создаёт
+one-time bootstrap payload и показывает QR, Base64 и pretty JSON. В Android app
+импортируйте его вставкой Base64-строки, открытием скачанного `.json` файла или
+через Android «Поделиться» -> TrafficWrapper.
+
+Для headless-настройки при запущенном server используйте HTTP admin API. Если
+включён встроенный self-signed TLS, добавьте `-k` к `curl` или сначала поставьте
+свой TLS-сертификат. Admin API принимает bearer session token; CSRF нужен только
+для cookie-сессии браузера.
+
+```sh
+ORCH_URL=https://127.0.0.1:9091
+INITIAL_PASSWORD='<password from docker compose logs orchestrator>'
+NEW_PASSWORD='<new owner password>'
+
+LOGIN_JSON=$(curl -ksS -H 'content-type: application/json' \
+  --data "{\"secret\":\"$INITIAL_PASSWORD\"}" \
+  "$ORCH_URL/admin/v1/login")
+SESSION_TOKEN=$(printf '%s' "$LOGIN_JSON" | python3 -c 'import json,sys; print(json.load(sys.stdin)["session_token"])')
+
+CHANGE_JSON=$(curl -ksS -H "authorization: Bearer $SESSION_TOKEN" \
+  -H 'content-type: application/json' \
+  --data "{\"current_secret\":\"$INITIAL_PASSWORD\",\"new_secret\":\"$NEW_PASSWORD\"}" \
+  "$ORCH_URL/admin/v1/password/change")
+SESSION_TOKEN=$(printf '%s' "$CHANGE_JSON" | python3 -c 'import json,sys; print(json.load(sys.stdin)["session_token"])')
+
+WORKER_TOKEN=$(openssl rand -base64 24 | tr '+/' '-_' | tr -d '=')
+curl -ksS -H "authorization: Bearer $SESSION_TOKEN" \
+  -H 'content-type: application/json' \
+  --data "{\"id\":\"worker-1\",\"value\":\"$WORKER_TOKEN\",\"ttl\":\"48h\"}" \
+  "$ORCH_URL/admin/v1/token/create"
+
+EXPIRES=$(date -u -d '+24 hours' +%Y-%m-%dT%H:%M:%SZ)
+curl -ksS -H "authorization: Bearer $SESSION_TOKEN" \
+  -H 'content-type: application/json' \
+  --data "{\"limits\":{},\"expires\":\"$EXPIRES\"}" \
+  "$ORCH_URL/admin/v1/bootstrap-token/create"
+```
+
+`WORKER_TOKEN` используйте как worker `ENROLL_TOKEN`. Если orchestrator server
+остановлен и вы работаете напрямую с local state, остаётся безопасный CLI-путь:
+
+```sh
+read -r -s ORCH_NEW_ADMIN_PASSWORD
+printf '%s\n' "$ORCH_NEW_ADMIN_PASSWORD" | docker compose run --rm orchestrator \
+  orchestrator admin set-password --stdin
+unset ORCH_NEW_ADMIN_PASSWORD
+```
+
+## Переменные окружения
+
+Эти переменные реально читаются orchestrator-кодом или поставляемым Compose:
+
+| Переменная | Назначение | Обязательна | Дефолт | Пример / как получить |
+| --- | --- | --- | --- | --- |
+| `ORCH_LISTEN` | HTTP(S) listen address. | Опц. | `:9091` | Оставьте default для host-network Compose или задайте `127.0.0.1:9091` за reverse proxy. |
+| `ORCH_STATE_DIR` | Local state directory для bbolt DB, generated keys, APK artifacts и bot/admin secrets. | Опц. | `./orch-state` | В Compose используется `/orch-state`, смонтированный из `./orch-state`. |
+| `ORCH_SIGNER_SOCKET` | Unix socket для config signer sidecar. | Опц. | `./orch-state/signer.sock` | В Compose используется `/orch-state/signer.sock`. |
+| `ORCH_PUBLIC_URL` | Public URL, попадает в bootstrap payloads и используется workers/devices. | Обяз. для реального deploy | `https://127.0.0.1:9091` | `https://orch.example.com` или LAN URL для dev. |
+| `ORCH_EGRESS_PROBE_URL` | Optional worker egress probe URL. | Опц. | empty | Обычно `http://127.0.0.1:9090/self-describe` в local dev. |
+| `ORCH_ADMIN_SECRET` | Optional seed для first-run admin password. Лучше использовать generated initial password или safe CLI input. | Опц. | empty | Если нужен, передавайте через secret manager/env, не коммитьте. |
+| `ORCH_ADMIN_SESSION_TOKEN` | Optional bearer session token для local CLI admin requests при запущенном сервере. | Опц. | empty | Получите из `/admin/v1/login`; не кладите в shell history или git. |
+| `ORCH_UPDATE_PUBKEY` | Public minisign key для APK update manifests. | Опц. | empty | Для управляемого update-канала задайте свой offline `update.pub` до первого старта. Empty разрешает seed-on-first-run сгенерировать demo key в local state. |
+| `ORCH_TLS` | Включает built-in self-signed TLS listener, если не `0`. | Опц. | `1` | `0` только для local dev за доверенным транспортом. |
+| `SEED_APK_PATH` | Путь к APK для seed-on-first-run. | Опц. | `./seed/app.apk` | Compose монтирует `./seed` и ставит `/seed/app.apk`. |
+| `SEED_APK_VERSION_CODE` | Version code в generated seed update manifest. | Опц. | `1` | Должен совпадать с seed APK version code. |
+| `SEED_APK_VERSION_NAME` | Version name в generated seed update manifest. | Опц. | `seed` | Например `0.1.0`. |
+
+Config-signing key генерируется и хранится signer-процессом в
+`ORCH_STATE_DIR`; orchestrator обращается к нему через `ORCH_SIGNER_SOCKET`.
+Для APK updates задайте `ORCH_UPDATE_PUBKEY` от своего offline minisign update
+key, если планируете публиковать будущие обновления. Seed-on-first-run может
+сгенерировать update key в local state для первого demo APK, но дальнейшая
+публикация APK должна использовать manifests, подписанные настроенным update
+public key. Private keys и `orch-state/` нельзя коммитить.
+
+## Production TLS
+
+`ORCH_TLS=1` запускает встроенный self-signed TLS listener. Это удобно для
+локального dogfooding, но в production лучше использовать настоящий сертификат
+для `ORCH_PUBLIC_URL`, чтобы Android, workers и браузеры подключались без
+insecure-TLS override.
+
+Рекомендуемый вариант:
+
+1. Запустить orchestrator на loopback без встроенного TLS:
+   `ORCH_LISTEN=127.0.0.1:9091`, `ORCH_TLS=0`.
+2. Поставить Caddy, nginx или другой reverse proxy перед orchestrator.
+3. Выпустить Let's Encrypt certificate для вашего `ORCH_PUBLIC_URL`.
+4. Проксировать HTTPS на `http://127.0.0.1:9091`.
+
+Для тестов с дефолтным self-signed listener workers должны ставить
+`ORCH_INSECURE_TLS=1`. Не используйте это в production.
+
+## Опциональный seed APK
+
+Если при первом старте существует `./seed/app.apk`, orchestrator генерирует
+update minisign key в `orch-state/`, подписывает update manifest этого APK и
+публикует его как update `seq=1`. Приватный update key не хранится в Git.
+
+Настройка:
+
+```env
+SEED_APK_PATH=/seed/app.apk
+SEED_APK_VERSION_CODE=1
+SEED_APK_VERSION_NAME=seed
+```
+
+Сгенерированный public update key попадает в bootstrap payload, если
+`ORCH_UPDATE_PUBKEY` не задан явно. Используйте это только для demo/first-run
+bootstrap. Для управляемого владельцем update-канала сгенерируйте offline
+minisign key сами и задайте `ORCH_UPDATE_PUBKEY` до первого старта.
+
+## Как опубликовать APK
+
+Есть два штатных способа опубликовать Android update через платформу:
+
+- **Web-админка:** откройте admin UI, загрузите подписанный APK и подписанный
+  update manifest. APK signing key остаётся вне orchestrator; orchestrator
+  только хранит и раздаёт уже подписанные артефакты.
+- **Seed при первом старте:** положите APK в `seed/app.apk` до первого запуска.
+  Orchestrator сгенерирует свой update minisign key в local state, подпишет
+  manifest для этого APK и опубликует его как `seq=1`. Это только demo/initial
+  bootstrap; для последующих APK от владельца стартуйте со своим offline update
+  key и `ORCH_UPDATE_PUBKEY`.
+
+Готовый публичный APK можно взять из release репозитория app:
+<https://github.com/TrafficWrapper/app/releases/tag/v0.1.8>.
+
+- Файл: `TrafficWrapper-app-v0.1.8.apk`
+- APK SHA-256: `d47c6e400820510d6079973820555dd18fe876a97526e52ee4e24360d2292a9c`
+- SHA-256 signing certificate: `bb8fcd34383b32c595c7d28a09cf7b89b473b86b632f3c1f5e722b4fa36e97d8`
+
+## Telegram-бот
+
+Бот опционален. Создайте своего бота через BotFather, затем задайте token и owner
+Telegram ID в web-админке на странице Settings. Token шифруется в
+`orch-state/orchestrator.db` и больше не показывается.
+
+Headless-вариант:
+
+```sh
+read -r -s TW_BOT_TOKEN
+printf '%s\n' "$TW_BOT_TOKEN" | docker compose exec -T orchestrator \
+  orchestrator bot set-token --stdin --owner-id 123456789
+unset TW_BOT_TOKEN
+```
+
+## Безопасность
+
+- Не коммитьте `.env`, `orch-state/`, TLS keys, minisign private keys, APK и
+  generated update keys.
+- Config signing key держит отдельный signer process.
+- Admin secrets можно передавать через stdin, env или файл; открытые `--value` и
+  `--token` deprecated, потому что светятся в shell history и process list.
+- Orchestrator хранит секреты в local state DB, зашифрованные AEAD.
+
+## 💚 Поддержать проект
+
+Проект бесплатный и развивается на энтузиазме. Если он вам помогает — спасибо за
+любую поддержку!
+
+- **Bitcoin (BTC):** `bc1qdlqer9rtej6tpzdjzljdwltj7vxr4h6tv9eucp`
+- **Ethereum (ETH):** `0xbe945043EaB956149ca24793c01d4927E90F878d`
+- **USDT (ERC-20):** `0xbe945043EaB956149ca24793c01d4927E90F878d`
+- **TRON (TRX):** `TGo4JyQnwH9Zb4ZZ37T3oaWuboy9qE7siq`
+- **USDT (TRC-20):** `TGo4JyQnwH9Zb4ZZ37T3oaWuboy9qE7siq`
+
+С благодарностью за вашу поддержку! 🙏
+
+## Лицензия
+
+MIT. См. `LICENSE`.

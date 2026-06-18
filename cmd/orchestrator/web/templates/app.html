@@ -1,0 +1,585 @@
+{{define "layout"}}
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="csrf-token" content="{{.CSRFToken}}">
+  <title>{{.Title}} · TrafficWrapper ORCH</title>
+  <style>
+    :root { color-scheme: light; --bg:#f6f7f9; --panel:#fff; --text:#15202b; --muted:#627386; --line:#d8e0e8; --accent:#1f6feb; --bad:#b42318; --ok:#067647; }
+    * { box-sizing: border-box; }
+    body { margin:0; font:14px/1.45 system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif; color:var(--text); background:var(--bg); }
+    header { background:#111827; color:#fff; padding:14px 22px; display:flex; align-items:center; justify-content:space-between; }
+    header strong { font-size:16px; }
+    nav { display:flex; gap:10px; align-items:center; }
+    nav a { color:#cbd5e1; text-decoration:none; padding:6px 9px; border-radius:6px; }
+    nav a.active, nav a:hover { background:#243244; color:#fff; }
+    main { max-width:1180px; margin:0 auto; padding:22px; }
+    h1 { margin:0 0 16px; font-size:24px; }
+    h2 { margin:0 0 12px; font-size:18px; }
+    .panel { background:var(--panel); border:1px solid var(--line); border-radius:8px; padding:16px; margin-bottom:16px; }
+    .grid { display:grid; gap:12px; grid-template-columns:repeat(auto-fit,minmax(180px,1fr)); }
+    .metric { background:var(--panel); border:1px solid var(--line); border-radius:8px; padding:14px; }
+    .metric b { display:block; font-size:24px; }
+    .muted { color:var(--muted); }
+    .ok { color:var(--ok); font-weight:600; }
+    .bad { color:var(--bad); font-weight:600; }
+    table { width:100%; border-collapse:collapse; background:var(--panel); border:1px solid var(--line); border-radius:8px; overflow:hidden; }
+    th, td { padding:10px; border-bottom:1px solid var(--line); text-align:left; vertical-align:middle; }
+    th { background:#eef3f8; font-size:12px; text-transform:uppercase; letter-spacing:.02em; color:#415166; }
+    tr:last-child td { border-bottom:0; }
+    input[type="number"] { width:82px; padding:7px; border:1px solid var(--line); border-radius:6px; }
+    input[type="password"], input[type="text"], input[type="datetime-local"], select { width:100%; padding:10px; border:1px solid var(--line); border-radius:6px; background:#fff; }
+    textarea { width:100%; padding:10px; border:1px solid var(--line); border-radius:6px; font:12px/1.45 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; color:var(--text); background:#fff; }
+    label.check { display:inline-flex; gap:6px; align-items:center; margin-right:10px; }
+    button { appearance:none; border:1px solid #1d4ed8; background:var(--accent); color:#fff; border-radius:6px; padding:8px 11px; cursor:pointer; }
+    button.secondary { background:#fff; color:#1f2937; border-color:var(--line); }
+    button.danger { background:#b42318; border-color:#b42318; }
+    button:disabled { opacity:.55; cursor:not-allowed; }
+    .actions { display:flex; flex-wrap:wrap; gap:8px; }
+    .toolbar { display:flex; align-items:center; justify-content:space-between; gap:12px; flex-wrap:wrap; }
+    .bootstrap-result { display:none; border-top:1px solid var(--line); margin-top:14px; padding-top:14px; }
+    .bootstrap-result-grid { display:grid; gap:14px; grid-template-columns:260px minmax(0,1fr); }
+    .qr-box { display:flex; align-items:center; justify-content:center; border:1px solid var(--line); border-radius:8px; background:#fff; min-height:260px; padding:12px; }
+    .qr-box img { width:232px; height:232px; image-rendering:pixelated; }
+    .copy-row { display:flex; gap:8px; align-items:flex-start; margin-top:8px; }
+    .copy-row textarea { flex:1; min-height:74px; }
+    .login { max-width:420px; margin:72px auto; }
+    .notice { padding:10px 12px; border-radius:6px; background:#eef6ff; color:#174ea6; margin-bottom:12px; display:none; }
+    .error { background:#fff2f0; color:#b42318; }
+    code { background:#eef3f8; padding:2px 5px; border-radius:5px; }
+    @media (max-width: 760px) { table { display:block; overflow-x:auto; } header { align-items:flex-start; flex-direction:column; gap:10px; } .bootstrap-result-grid { grid-template-columns:1fr; } }
+  </style>
+</head>
+<body>
+{{if .Authenticated}}
+  <header>
+    <strong>TrafficWrapper ORCH</strong>
+    <nav>
+      <a href="/" class="{{if eq .Path "/"}}active{{end}}">Обзор</a>
+      <a href="/workers" class="{{if eq .Path "/workers"}}active{{end}}">Workers</a>
+      <a href="/devices" class="{{if eq .Path "/devices"}}active{{end}}">Устройства</a>
+      <a href="/config" class="{{if eq .Path "/config"}}active{{end}}">Конфигурация</a>
+      <a href="/settings" class="{{if eq .Path "/settings"}}active{{end}}">Настройки</a>
+    </nav>
+  </header>
+{{end}}
+  <main>
+    {{if eq .Template "login"}}
+      {{template "login" .}}
+    {{else if eq .Template "change_password"}}
+      {{template "change_password" .}}
+    {{else if eq .Template "dashboard"}}
+      {{template "dashboard" .}}
+    {{else if eq .Template "workers"}}
+      {{template "workers" .}}
+    {{else if eq .Template "devices"}}
+      {{template "devices" .}}
+    {{else if eq .Template "config"}}
+      {{template "config" .}}
+    {{else if eq .Template "settings"}}
+      {{template "settings" .}}
+    {{end}}
+  </main>
+  <script>
+    const csrfToken = document.querySelector('meta[name="csrf-token"]')?.content || '';
+    async function postJSON(path, payload, confirmText) {
+      if (confirmText && !window.confirm(confirmText)) return;
+      const response = await fetch(path, {
+        method: 'POST',
+        credentials: 'same-origin',
+        headers: {'Content-Type': 'application/json', 'X-CSRF-Token': csrfToken},
+        body: JSON.stringify(payload)
+      });
+      if (!response.ok) {
+        alert(await response.text());
+        return;
+      }
+      window.location.reload();
+    }
+    async function loginOwner(event) {
+      event.preventDefault();
+      const notice = document.getElementById('login-notice');
+      notice.className = 'notice';
+      notice.style.display = 'block';
+      notice.textContent = 'Проверяем пароль...';
+      const secret = document.getElementById('owner-secret').value;
+      const response = await fetch('/admin/v1/login', {
+        method: 'POST',
+        credentials: 'same-origin',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({secret})
+      });
+      if (!response.ok) {
+        notice.className = 'notice error';
+        notice.textContent = await response.text();
+        return;
+      }
+      const result = await response.json();
+      if (result.must_change) {
+        window.location.href = '/change-password';
+        return;
+      }
+      window.location.href = '/';
+    }
+    async function changePassword(event) {
+      event.preventDefault();
+      const notice = document.getElementById('change-password-notice');
+      notice.className = 'notice';
+      notice.style.display = 'block';
+      notice.textContent = 'Сохраняем новый пароль...';
+      const current_secret = document.getElementById('current-secret').value;
+      const new_secret = document.getElementById('new-secret').value;
+      const repeat = document.getElementById('new-secret-repeat').value;
+      if (new_secret !== repeat) {
+        notice.className = 'notice error';
+        notice.textContent = 'Новый пароль и повтор не совпадают.';
+        return;
+      }
+      const response = await fetch('/admin/v1/password/change', {
+        method: 'POST',
+        credentials: 'same-origin',
+        headers: {'Content-Type': 'application/json', 'X-CSRF-Token': csrfToken},
+        body: JSON.stringify({current_secret, new_secret})
+      });
+      if (!response.ok) {
+        notice.className = 'notice error';
+        notice.textContent = await response.text();
+        return;
+      }
+      window.location.href = '/';
+    }
+    function setWorkerEnabled(id, enabled) {
+      postJSON('/admin/v1/workers/set-enabled', {id, enabled}, enabled ? '' : 'Отключить worker из выдаваемой конфигурации?');
+    }
+    function setProtocol(id, protocol, enabled) {
+      postJSON('/admin/v1/workers/protocol', {id, protocol, enabled}, '');
+    }
+    function revokeDevice(id) {
+      postJSON('/admin/v1/revoke-device', {id}, 'Отозвать устройство ' + id + '? Доступ будет удалён у workers.');
+    }
+    function toggleBootstrapForm() {
+      const form = document.getElementById('bootstrap-form');
+      if (!form) return;
+      form.style.display = form.style.display === 'none' || !form.style.display ? 'block' : 'none';
+    }
+    function localDateTimeValue(date) {
+      const pad = n => String(n).padStart(2, '0');
+      return date.getFullYear() + '-' + pad(date.getMonth() + 1) + '-' + pad(date.getDate()) + 'T' + pad(date.getHours()) + ':' + pad(date.getMinutes());
+    }
+    function rfc3339FromLocal(value) {
+      if (!value) throw new Error('Укажите срок действия bootstrap.');
+      return new Date(value).toISOString().replace(/\.\d{3}Z$/, 'Z');
+    }
+    function setBootstrapExpiryPreset(value) {
+      const input = document.getElementById('bootstrap-expires');
+      if (!input) return;
+      const now = new Date();
+      let expires;
+      if (value === 'none') {
+        expires = new Date('2030-01-01T00:00:00Z');
+      } else {
+        expires = new Date(now.getTime() + Number(value || 30) * 24 * 60 * 60 * 1000);
+      }
+      input.value = localDateTimeValue(expires);
+    }
+    function base64UTF8(value) {
+      const bytes = new TextEncoder().encode(value);
+      let binary = '';
+      for (const byte of bytes) binary += String.fromCharCode(byte);
+      return btoa(binary);
+    }
+    async function createBootstrap(event) {
+      event.preventDefault();
+      const notice = document.getElementById('bootstrap-notice');
+      const resultBox = document.getElementById('bootstrap-result');
+      notice.className = 'notice';
+      notice.style.display = 'block';
+      notice.textContent = 'Создаём одноразовый bootstrap...';
+      const note = document.getElementById('bootstrap-note').value.trim();
+      let expires;
+      try {
+        expires = rfc3339FromLocal(document.getElementById('bootstrap-expires').value);
+      } catch (err) {
+        notice.className = 'notice error';
+        notice.textContent = err.message;
+        return;
+      }
+      const response = await fetch('/admin/v1/bootstrap-token/create', {
+        method: 'POST',
+        credentials: 'same-origin',
+        headers: {'Content-Type': 'application/json', 'X-CSRF-Token': csrfToken},
+        body: JSON.stringify({limits: note ? {note} : {}, expires})
+      });
+      if (!response.ok) {
+        notice.className = 'notice error';
+        notice.textContent = await response.text();
+        return;
+      }
+      const payload = await response.json();
+      const compactJSON = JSON.stringify(payload);
+      const prettyJSON = JSON.stringify(payload, null, 2);
+      const base64 = base64UTF8(compactJSON);
+      document.getElementById('bootstrap-base64').value = base64;
+      document.getElementById('bootstrap-json').value = prettyJSON;
+      document.getElementById('bootstrap-expires-out').textContent = payload.expires || expires;
+      const qrResponse = await fetch('/admin/v1/bootstrap-token/qr', {
+        method: 'POST',
+        credentials: 'same-origin',
+        headers: {'Content-Type': 'application/json', 'X-CSRF-Token': csrfToken},
+        body: JSON.stringify({data: base64})
+      });
+      if (qrResponse.ok) {
+        const qr = await qrResponse.json();
+        document.getElementById('bootstrap-qr').src = qr.image;
+      } else {
+        document.getElementById('bootstrap-qr').removeAttribute('src');
+        alert(await qrResponse.text());
+      }
+      resultBox.style.display = 'block';
+      notice.textContent = 'Bootstrap создан. Token показывается один раз: скопируйте Base64 или скачайте JSON.';
+    }
+    async function copyText(id) {
+      const element = document.getElementById(id);
+      const text = element.value || element.textContent || '';
+      try {
+        await navigator.clipboard.writeText(text);
+      } catch (_) {
+        element.focus();
+        element.select?.();
+        document.execCommand('copy');
+      }
+    }
+    function downloadBootstrapJSON() {
+      const text = document.getElementById('bootstrap-json').value;
+      if (!text) return;
+      const blob = new Blob([text + '\n'], {type: 'application/json'});
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = 'trafficwrapper-bootstrap.json';
+      a.click();
+      URL.revokeObjectURL(url);
+    }
+    function applyConfig() {
+      const workers = Array.from(document.querySelectorAll('tr[data-worker-id]')).map(row => ({
+        worker_id: row.dataset.workerId,
+        enabled: row.querySelector('[data-field="enabled"]').checked,
+        priority: Number(row.querySelector('[data-field="priority"]').value),
+        weight: Number(row.querySelector('[data-field="weight"]').value),
+        protocols: {
+          reality: row.querySelector('[data-field="reality"]').checked,
+          awg: row.querySelector('[data-field="awg"]').checked
+        }
+      }));
+      postJSON('/admin/v1/config/edit', {workers}, '');
+    }
+    async function sha256Hex(file) {
+      const buffer = await file.arrayBuffer();
+      const digest = await crypto.subtle.digest('SHA-256', buffer);
+      return Array.from(new Uint8Array(digest)).map(b => b.toString(16).padStart(2, '0')).join('');
+    }
+    async function draftApkManifest() {
+      const file = document.getElementById('apk-file').files[0];
+      if (!file) { alert('Выберите APK'); return; }
+      const sha = await sha256Hex(file);
+      const payload = {
+        version_code: Number(document.getElementById('apk-version-code').value),
+        version_name: document.getElementById('apk-version-name').value,
+        min_version: Number(document.getElementById('apk-min-version').value || '0'),
+        notes: document.getElementById('apk-notes').value,
+        apk_name: file.name,
+        apk_sha256: sha,
+        apk_size: file.size
+      };
+      const response = await fetch('/admin/v1/apk/draft', {
+        method: 'POST',
+        credentials: 'same-origin',
+        headers: {'Content-Type': 'application/json', 'X-CSRF-Token': csrfToken},
+        body: JSON.stringify(payload)
+      });
+      if (!response.ok) { alert(await response.text()); return; }
+      const result = await response.json();
+      document.getElementById('apk-manifest-json').value = result.manifest_json;
+      document.getElementById('apk-publish-note').textContent = 'Manifest seq ' + result.seq + ' сформирован. Подпишите эту строку offline и вставьте minisig.';
+    }
+    async function publishApk() {
+      const file = document.getElementById('apk-file').files[0];
+      if (!file) { alert('Выберите APK'); return; }
+      const manifest = document.getElementById('apk-manifest-json').value.trim();
+      const minisig = document.getElementById('apk-manifest-minisig').value.trim();
+      if (!manifest || !minisig) { alert('Нужны manifest_json и minisig'); return; }
+      if (!window.confirm('Опубликовать APK в платформенный update-канал?')) return;
+      const form = new FormData();
+      form.append('apk', file, file.name);
+      form.append('manifest_json', manifest);
+      form.append('manifest_minisig', minisig);
+      const response = await fetch('/admin/v1/apk/publish', {
+        method: 'POST',
+        credentials: 'same-origin',
+        headers: {'X-CSRF-Token': csrfToken},
+        body: form
+      });
+      if (!response.ok) { alert(await response.text()); return; }
+      window.location.reload();
+    }
+    function saveBotSettings(event) {
+      event.preventDefault();
+      const token = document.getElementById('bot-token').value;
+      const owner_id = Number(document.getElementById('bot-owner-id').value);
+      postJSON('/admin/v1/bot/set-token', {token, owner_id}, '');
+    }
+    document.addEventListener('DOMContentLoaded', () => setBootstrapExpiryPreset('30'));
+  </script>
+</body>
+</html>
+{{end}}
+
+{{define "login"}}
+<section class="panel login">
+  <h1>Вход владельца</h1>
+  <p class="muted">Введите admin-секрет оркестратора. После входа будет создана временная сессия.</p>
+  <div id="login-notice" class="notice"></div>
+  <form onsubmit="loginOwner(event)">
+    <label>Admin-секрет</label>
+    <input id="owner-secret" type="password" autocomplete="current-password" required autofocus>
+    <div style="margin-top:12px"><button type="submit">Войти</button></div>
+  </form>
+</section>
+{{end}}
+
+{{define "change_password"}}
+<section class="panel login">
+  <h1>Смена пароля</h1>
+  <p class="muted">Начальный пароль действителен только для первого входа. Задайте новый admin-пароль, после этого будет создана обычная сессия.</p>
+  <div id="change-password-notice" class="notice"></div>
+  <form onsubmit="changePassword(event)">
+    <label>Текущий пароль</label>
+    <input id="current-secret" type="password" autocomplete="current-password" required autofocus>
+    <label>Новый пароль</label>
+    <input id="new-secret" type="password" autocomplete="new-password" required>
+    <label>Повтор нового пароля</label>
+    <input id="new-secret-repeat" type="password" autocomplete="new-password" required>
+    <div style="margin-top:12px"><button type="submit">Сменить пароль</button></div>
+  </form>
+</section>
+{{end}}
+
+{{define "dashboard"}}
+<h1>Обзор</h1>
+<section class="grid">
+  <div class="metric"><span class="muted">Workers активны</span><b>{{.WorkerActive}} / {{.WorkerTotal}}</b></div>
+  <div class="metric"><span class="muted">Устройства approved</span><b>{{.DeviceApproved}} / {{.DeviceTotal}}</b></div>
+  <div class="metric"><span class="muted">Client-config seq</span><b>{{.ConfigSeq}}</b></div>
+  <div class="metric"><span class="muted">Здоровье</span><b class="{{if eq .Health "ok"}}ok{{else}}bad{{end}}">{{if eq .Health "ok"}}OK{{else}}Нужно внимание{{end}}</b></div>
+</section>
+<section class="panel">
+  <h2>Текущий pipeline</h2>
+  <p>Изменения в конфигурации подписываются ORCH, worker подтягивает новый seq и обновляет <code>/tw/config.json</code>. Public-клиент применяет новый config горячо через poll внутри туннеля.</p>
+  <p class="muted">Сессия действует до {{.SessionExpires}} · снимок {{.Now}}</p>
+</section>
+{{end}}
+
+{{define "workers"}}
+<h1>Workers</h1>
+<table>
+  <thead><tr><th>ID</th><th>Статус</th><th>Seq</th><th>Egress</th><th>Policy</th><th>Протоколы</th><th>Действия</th></tr></thead>
+  <tbody>
+  {{range .Workers}}
+    <tr>
+      <td><code>{{short .ID 12}}</code><br><span class="muted">{{dash .LastSeen}}</span></td>
+      <td>{{if .Enabled}}<span class="ok">enabled</span>{{else}}<span class="bad">disabled</span>{{end}}<br><span class="muted">{{.Status}}</span></td>
+      <td>{{.AppliedSeq}} / {{.DesiredSeq}}</td>
+      <td>{{dash .Egress}}</td>
+      <td>priority {{.Priority}}<br>weight {{.Weight}}</td>
+      <td>
+        <label class="check"><input type="checkbox" {{if .Reality}}checked{{end}} onchange="setProtocol('{{.ID}}','reality',this.checked)"> REALITY</label>
+        <label class="check"><input type="checkbox" {{if .AWG}}checked{{end}} onchange="setProtocol('{{.ID}}','awg',this.checked)"> AWG</label>
+      </td>
+      <td class="actions">
+        {{if .Enabled}}
+          <button class="secondary" onclick="setWorkerEnabled('{{.ID}}', false)">Отключить</button>
+        {{else}}
+          <button onclick="setWorkerEnabled('{{.ID}}', true)">Включить</button>
+        {{end}}
+      </td>
+    </tr>
+  {{else}}
+    <tr><td colspan="7" class="muted">Workers пока нет.</td></tr>
+  {{end}}
+  </tbody>
+</table>
+{{end}}
+
+{{define "devices"}}
+<h1>Устройства</h1>
+<section class="panel">
+  <div class="toolbar">
+    <div>
+      <h2>Новое устройство</h2>
+      <p class="muted">Создаёт одноразовый bootstrap payload для импорта в Android-приложение.</p>
+    </div>
+    <button onclick="toggleBootstrapForm()">＋ Новое устройство</button>
+  </div>
+  <form id="bootstrap-form" style="display:none; margin-top:12px" onsubmit="createBootstrap(event)">
+    <div class="grid">
+      <label>Срок действия
+        <select id="bootstrap-expiry-preset" onchange="setBootstrapExpiryPreset(this.value)">
+          <option value="7">7 дней</option>
+          <option value="30" selected>30 дней</option>
+          <option value="365">1 год</option>
+          <option value="none">Без срока до 2030-01-01</option>
+        </select>
+      </label>
+      <label>Expires
+        <input id="bootstrap-expires" type="datetime-local" required>
+      </label>
+      <label>Заметка
+        <input id="bootstrap-note" type="text" placeholder="например: телефон Анны">
+      </label>
+    </div>
+    <div class="actions" style="margin-top:12px">
+      <button type="submit">Создать bootstrap</button>
+    </div>
+  </form>
+  <div id="bootstrap-notice" class="notice"></div>
+  <div id="bootstrap-result" class="bootstrap-result">
+    <div class="bootstrap-result-grid">
+      <div>
+        <div class="qr-box"><img id="bootstrap-qr" alt="Bootstrap QR"></div>
+        <p class="muted">QR кодирует Base64-строку bootstrap. Expires: <span id="bootstrap-expires-out"></span></p>
+      </div>
+      <div>
+        <h2>Импорт в приложении</h2>
+        <p class="muted">Вставьте Base64-строку, откройте файл .json, или Android «Поделиться» → TrafficWrapper.</p>
+        <label>Base64</label>
+        <div class="copy-row">
+          <textarea id="bootstrap-base64" rows="4" readonly></textarea>
+          <button class="secondary" onclick="copyText('bootstrap-base64')">Копировать</button>
+        </div>
+        <label>JSON</label>
+        <div class="copy-row">
+          <textarea id="bootstrap-json" rows="10" readonly></textarea>
+          <div class="actions">
+            <button class="secondary" onclick="copyText('bootstrap-json')">Копировать</button>
+            <button class="secondary" onclick="downloadBootstrapJSON()">Скачать .json</button>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+<table>
+  <thead><tr><th>Device ID</th><th>Статус</th><th>Версия</th><th>Live</th><th>События</th><th>Internal IP</th><th>Enroll</th><th>Действия</th></tr></thead>
+  <tbody>
+  {{range .Devices}}
+    <tr>
+      <td><code>{{short .ID 16}}</code><br><span class="muted">seq {{.ConfigSeq}}</span></td>
+      <td>{{.Status}}</td>
+      <td>{{dash .ClientVersion}}<br><span class="muted">{{dash .LiveVersion}}</span><br><span class="muted">{{dash .Model}}</span></td>
+      <td>
+        {{if .TelemetryOn}}
+          <b>{{dash .LiveRoute}}</b><br>
+          {{if eq .LiveHealth "stable"}}<span class="ok">stable</span>{{else if eq .LiveHealth "healthy"}}<span class="ok">healthy</span>{{else}}<span class="bad">{{dash .LiveHealth}}</span>{{end}}
+          · carry={{if .LiveCarry}}yes{{else}}no{{end}}<br>
+          <span class="muted">{{dash .LiveLastSeen}} · worker {{short .LiveWorkerID 8}}</span>
+          {{if .LiveError}}<br><span class="bad">{{.LiveError}}</span>{{end}}
+        {{else}}
+          <span class="muted">телеметрия off / нет данных</span>
+        {{end}}
+      </td>
+      <td>
+        {{range .Recent}}
+          <code>{{.Kind}}</code> {{dash .Status}} {{dash .Route}}{{if .Error}} <span class="bad">{{.Error}}</span>{{end}}<br>
+        {{else}}
+          <span class="muted">-</span>
+        {{end}}
+      </td>
+      <td>{{dash .InternalIP}}</td>
+      <td>{{dash .EnrolledAt}}</td>
+      <td>{{if ne .Status "revoked"}}<button class="danger" onclick="revokeDevice('{{.ID}}')">Отозвать</button>{{else}}<span class="muted">отозвано</span>{{end}}</td>
+    </tr>
+  {{else}}
+    <tr><td colspan="8" class="muted">Устройств пока нет.</td></tr>
+  {{end}}
+  </tbody>
+</table>
+{{end}}
+
+{{define "config"}}
+<h1>Конфигурация</h1>
+<section class="panel">
+  <p>Текущий client-config seq: <b>{{.ConfigSeq}}</b>. Изменения priority/weight/protocols после применения подписываются и уходят в worker distributor.</p>
+</section>
+<table>
+  <thead><tr><th>Worker</th><th>Включён</th><th>Priority</th><th>Weight</th><th>Протоколы</th><th>Seq</th><th>Egress</th></tr></thead>
+  <tbody>
+  {{range .Workers}}
+    <tr data-worker-id="{{.ID}}">
+      <td><code>{{short .ID 12}}</code><br><span class="muted">{{.Status}}</span></td>
+      <td><input data-field="enabled" type="checkbox" {{if .Enabled}}checked{{end}}></td>
+      <td><input data-field="priority" type="number" min="0" value="{{.Priority}}"></td>
+      <td><input data-field="weight" type="number" min="0" max="100" value="{{.Weight}}"></td>
+      <td>
+        <label class="check"><input data-field="reality" type="checkbox" {{if .Reality}}checked{{end}}> REALITY</label>
+        <label class="check"><input data-field="awg" type="checkbox" {{if .AWG}}checked{{end}}> AWG</label>
+      </td>
+      <td>{{.AppliedSeq}} / {{.DesiredSeq}}</td>
+      <td>{{dash .Egress}}</td>
+    </tr>
+  {{else}}
+    <tr><td colspan="7" class="muted">Нет workers для редактирования.</td></tr>
+  {{end}}
+  </tbody>
+</table>
+<div class="actions" style="margin-top:14px">
+  <button onclick="applyConfig()">Применить и запушить</button>
+</div>
+<section class="panel" style="margin-top:16px">
+  <h2>Публикация APK</h2>
+  <p class="muted">ORCH не подписывает APK и не держит APK-signing key. Загрузите уже подписанный APK, сформируйте manifest, подпишите manifest offline update-ключом и вставьте minisig.</p>
+  <div class="grid">
+    <label>APK <input id="apk-file" type="file" accept=".apk"></label>
+    <label>version code <input id="apk-version-code" type="number" min="1"></label>
+    <label>version name <input id="apk-version-name" type="text"></label>
+    <label>min version <input id="apk-min-version" type="number" min="0" value="0"></label>
+  </div>
+  <label>Заметки<br><textarea id="apk-notes" rows="2" style="width:100%"></textarea></label>
+  <div class="actions" style="margin-top:10px">
+    <button class="secondary" onclick="draftApkManifest()">Сформировать manifest для подписи</button>
+  </div>
+  <p id="apk-publish-note" class="muted"></p>
+  <label>manifest_json<br><textarea id="apk-manifest-json" rows="6" style="width:100%; font-family:monospace"></textarea></label>
+  <label>manifest minisig<br><textarea id="apk-manifest-minisig" rows="4" style="width:100%; font-family:monospace"></textarea></label>
+  <div class="actions" style="margin-top:10px">
+    <button onclick="publishApk()">Опубликовать APK</button>
+  </div>
+</section>
+{{end}}
+
+{{define "settings"}}
+<h1>Настройки</h1>
+<section class="panel">
+  <h2>Telegram-бот</h2>
+  <p class="muted">Бот опционален. Токен сохраняется зашифрованно, значение не показывается повторно.</p>
+  <p>Статус:
+    {{if .BotConfigured}}
+      <span class="ok">настроен</span> · owner_id {{.BotOwnerID}} · {{.BotUpdatedAt}}
+    {{else}}
+      <span class="bad">не настроен</span>
+    {{end}}
+  </p>
+  <form onsubmit="saveBotSettings(event)">
+    <label>Bot token</label>
+    <input id="bot-token" type="password" autocomplete="off" required>
+    <label>Owner Telegram ID</label>
+    <input id="bot-owner-id" type="number" min="1" required>
+    <div style="margin-top:12px"><button type="submit">Сохранить токен</button></div>
+  </form>
+</section>
+<section class="panel">
+  <h2>Admin-пароль</h2>
+  <p class="muted">Для headless-сценариев используйте CLI только через stdin/env/file. Не передавайте секреты открытым аргументом командной строки.</p>
+</section>
+{{end}}

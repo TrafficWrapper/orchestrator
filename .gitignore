@@ -1,0 +1,35 @@
+# Local state and secrets
+.env
+.env.*
+!.env.example
+*-state/
+orch-state/
+worker-state/
+*.key
+*.pem
+*.crt
+*.csr
+*.p12
+*.jks
+*.keystore
+*.minisig.secret
+
+# Android / Gradle / Go build output
+.gradle/
+.gradle-cache/
+.kotlin/
+.go-cache/
+.artifacts/
+client/app/build/
+client/app/libs/*.aar
+client/app/libs/*.jar
+client/app/src/main/jniLibs/
+build/update-release/
+*.apk
+*.aab
+
+# Editor / OS
+.idea/
+.vscode/
+*.swp
+.DS_Store
