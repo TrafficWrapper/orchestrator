@@ -1,5 +1,7 @@
 # TrafficWrapper Orchestrator
 
+[![CI](https://github.com/TrafficWrapper/orchestrator/actions/workflows/ci.yml/badge.svg)](https://github.com/TrafficWrapper/orchestrator/actions/workflows/ci.yml)
+
 [Русский](README.ru.md)
 
 Control plane for the TrafficWrapper platform. It approves workers, enrolls
@@ -14,6 +16,30 @@ TrafficWrapper is split into three repositories:
 
 The normal workflow is: start the orchestrator, enroll one or more workers, then
 build/install the app and import a bootstrap payload from the orchestrator.
+
+Architecture and threat-model notes live in [ARCHITECTURE.md](ARCHITECTURE.md)
+and [THREAT_MODEL.md](THREAT_MODEL.md).
+
+## Start Here: End-to-End Flow
+
+1. Start the orchestrator with Docker Compose and open the admin UI at
+   `ORCH_PUBLIC_URL`.
+2. Copy the orchestrator public key with
+   `docker compose exec orchestrator orchestrator public-key`, then create a
+   worker enrollment token in the admin UI or with `/admin/v1/token/create`.
+3. Start a worker with `ORCH_STATIC_PUBLIC_KEY=<orchestrator public-key>`,
+   `ENROLL_TOKEN=<worker token>`, `ORCH_URL=<orchestrator URL>`, and
+   `ORCH_INSECURE_TLS=1` only for self-signed development TLS. Set a real
+   `CAMOUFLAGE_DOMAIN` before starting REALITY.
+4. Approve the pending worker in the orchestrator admin UI.
+5. Open **Devices** -> **+ New device** and create a one-time device bootstrap
+   payload. Save the QR, Base64, or JSON shown on that page.
+6. Install the Android APK from the app repository release channel or your own
+   signed build.
+7. Import the bootstrap payload in the app and confirm the parsed
+   `orchestrator_url` and `config_pubkey_pin`.
+8. Connect. The app fetches the signed client config and automatically selects a
+   worker and route.
 
 ## Requirements
 
@@ -175,12 +201,10 @@ platform:
   initial bootstrap only; for later owner-published APKs, start with your own
   offline update key and `ORCH_UPDATE_PUBKEY`.
 
-A ready-to-install public APK is available in the app repository release:
-<https://github.com/TrafficWrapper/app/releases/tag/v0.1.8>.
-
-- File: `TrafficWrapper-app-v0.1.8.apk`
-- APK SHA-256: `d47c6e400820510d6079973820555dd18fe876a97526e52ee4e24360d2292a9c`
-- Signing certificate SHA-256: `bb8fcd34383b32c595c7d28a09cf7b89b473b86b632f3c1f5e722b4fa36e97d8`
+A ready-to-install public APK is available from the app repository release
+channel: <https://github.com/TrafficWrapper/app/releases/latest>. Treat the app
+README and the release assets as the source of truth for the current APK file
+name, version code, SHA-256, and signing certificate fingerprint.
 
 ## Telegram Bot
 
