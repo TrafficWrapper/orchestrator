@@ -215,7 +215,7 @@ func deviceID(identityPub, noisePub string) string {
 		key = strings.TrimSpace(noisePub)
 	}
 	sum := sha256.Sum256([]byte(key))
-	return hex.EncodeToString(sum[:8])
+	return "twpk_" + hex.EncodeToString(sum[:])[:32]
 }
 
 func randomTokenSecret() (string, error) {

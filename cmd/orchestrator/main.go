@@ -614,10 +614,7 @@ func (s *server) handleDeviceEnroll(peer []byte, raw []byte) (any, error) {
 	if strings.TrimSpace(req.AWGPublicKey) == "" {
 		return deviceEnrollResponse{OK: false, Error: "awg_public_key is required"}, nil
 	}
-	id := strings.TrimSpace(req.DeviceID)
-	if id == "" {
-		id = deviceID(req.IdentityPubKey, noisePub)
-	}
+	id := deviceID(req.IdentityPubKey, noisePub)
 	workers, err := s.store.workers()
 	if err != nil {
 		return nil, err

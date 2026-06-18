@@ -78,6 +78,12 @@ func TestDeviceEnrollConsumesBootstrapOnceAndReturnsClientConfig(t *testing.T) {
 	if resp.RealityUUID == "" || resp.InternalIP == "" || resp.PSK2 == "" || resp.ServerAWGPublic != "awgpub" {
 		t.Fatalf("missing per-device credentials: %+v", resp)
 	}
+	if want := deviceID("identity-pub", ""); resp.DeviceID != want {
+		t.Fatalf("device id not derived from identity public key: got %q want %q", resp.DeviceID, want)
+	}
+	if resp.DeviceID == "android-id" || !strings.HasPrefix(resp.DeviceID, "twpk_") {
+		t.Fatalf("device id leaked request/android id: %q", resp.DeviceID)
+	}
 	if got, want := sha256Hex(resp.ClientBundle.ConfigJSON), resp.ClientBundle.ConfigSHA256; got != want {
 		t.Fatalf("config sha mismatch: got %s want %s", got, want)
 	}
@@ -234,6 +240,12 @@ func TestWorkerTelemetryRequiresDeviceSignatureAndStoresSnapshot(t *testing.T) {
 	enroll := enrollRaw.(deviceEnrollResponse)
 	if !enroll.OK {
 		t.Fatalf("enroll failed: %s", enroll.Error)
+	}
+	if want := deviceID(identityPub, ""); enroll.DeviceID != want {
+		t.Fatalf("telemetry enroll device id mismatch: got %q want %q", enroll.DeviceID, want)
+	}
+	if enroll.DeviceID == "a15-public" || !strings.HasPrefix(enroll.DeviceID, "twpk_") {
+		t.Fatalf("telemetry device id leaked android id: %q", enroll.DeviceID)
 	}
 	payload := []byte(`{"did":"` + enroll.DeviceID + `","ver":"public-1.0.5","vc":1005,"sent_at":1710000000000,"events":[{"k":"heartbeat","t":1710000000000,"mono":123000,"active_route":"REALITY2","healthy":true,"stable":true,"rl2_carry":true}]}`)
 	headers := signedTelemetryHeadersForTest(t, identityKey, enroll.DeviceID, identityPub, payload)
@@ -846,6 +858,7 @@ func enrollDeviceForTest(t *testing.T, s *server, token string) deviceEnrollResp
 	t.Helper()
 	raw, _ := json.Marshal(deviceEnrollRequest{
 		BootstrapToken:  token,
+		DeviceID:        "android-id",
 		IdentityPubKey:  "identity-pub",
 		IdentityKeyType: "ed25519",
 		AndroidID:       "android-id",
