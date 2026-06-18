@@ -21,8 +21,9 @@ TrafficWrapper разделён на три репозитория:
 [THREAT_MODEL.md](THREAT_MODEL.ru.md).
 
 Операционные и contributor guides: [FAQ.ru.md](FAQ.ru.md),
-[TROUBLESHOOTING.ru.md](TROUBLESHOOTING.ru.md),
-[DEVELOPMENT.ru.md](DEVELOPMENT.ru.md) и [RUNBOOK.ru.md](RUNBOOK.ru.md).
+[TROUBLESHOOTING.ru.md](TROUBLESHOOTING.ru.md) и [RUNBOOK.ru.md](RUNBOOK.ru.md).
+Заметки по local development stand находятся в organization
+[CONTRIBUTING.ru.md](https://github.com/TrafficWrapper/.github/blob/main/CONTRIBUTING.ru.md#local-development-stand).
 
 ## Начните здесь: сквозной сценарий
 

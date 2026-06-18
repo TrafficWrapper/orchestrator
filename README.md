@@ -21,8 +21,9 @@ Architecture and threat-model notes live in [ARCHITECTURE.md](ARCHITECTURE.md)
 and [THREAT_MODEL.md](THREAT_MODEL.md).
 
 Operational and contributor guides: [FAQ.md](FAQ.md),
-[TROUBLESHOOTING.md](TROUBLESHOOTING.md), [DEVELOPMENT.md](DEVELOPMENT.md), and
-[RUNBOOK.md](RUNBOOK.md).
+[TROUBLESHOOTING.md](TROUBLESHOOTING.md), and [RUNBOOK.md](RUNBOOK.md).
+Local development stand notes live in the organization
+[CONTRIBUTING.md](https://github.com/TrafficWrapper/.github/blob/main/CONTRIBUTING.md#local-development-stand).
 
 ## Start Here: End-to-End Flow
 
