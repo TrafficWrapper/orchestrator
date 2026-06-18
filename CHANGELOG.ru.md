@@ -13,7 +13,7 @@ public releases.
 ### Added
 
 - Канонические troubleshooting, FAQ, development и owner runbook docs.
-- Repository CODEOWNERS и secret-scan workflow для contributor PR hygiene.
+- Secret-scan workflow для contributor PR hygiene.
 
 ## [0.1.0] - 2026-06-18
 
