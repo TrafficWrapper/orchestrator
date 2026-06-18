@@ -1,5 +1,7 @@
 # TrafficWrapper Threat Model
 
+[Русский](THREAT_MODEL.ru.md)
+
 TrafficWrapper is self-hosted. Operators control their infrastructure choices and
 must avoid publishing deployment-specific identifiers in public issues, pull
 requests, logs, screenshots, or examples.

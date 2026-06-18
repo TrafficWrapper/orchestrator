@@ -1,5 +1,7 @@
 # TrafficWrapper Architecture
 
+[Русский](ARCHITECTURE.ru.md)
+
 This document describes the public self-hosted TrafficWrapper platform. The
 orchestrator repository is the canonical entry point; worker and app repositories
 contain component-specific notes that link back here.
