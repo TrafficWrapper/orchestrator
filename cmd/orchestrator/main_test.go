@@ -498,6 +498,13 @@ func TestWorkerTelemetryRequiresDeviceSignatureAndStoresSnapshot(t *testing.T) {
 	if rec.ClientVersion != "public-1.0.5" || rec.Route != "REALITY-RU" || rec.Health != "stable" || !rec.Carry {
 		t.Fatalf("bad telemetry snapshot: %+v", rec)
 	}
+	deviceAfterTelemetry, err := s.store.device(enroll.DeviceID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if deviceAfterTelemetry.ClientVersion != "public-1.0.5" {
+		t.Fatalf("telemetry did not self-heal device client version: %q", deviceAfterTelemetry.ClientVersion)
+	}
 
 	headers["X-TW-Sig"] = base64.StdEncoding.EncodeToString([]byte("bad-signature"))
 	badReq, _ := json.Marshal(workerTelemetryRequest{

@@ -64,24 +64,28 @@ type webWorker struct {
 }
 
 type webDevice struct {
-	ID            string
-	Alias         string
-	Status        string
-	ClientVersion string
-	Model         string
-	AndroidID     string
-	EnrolledAt    string
-	InternalIP    string
-	ConfigSeq     int64
-	TelemetryOn   bool
-	LiveVersion   string
-	LiveRoute     string
-	LiveHealth    string
-	LiveCarry     bool
-	LiveLastSeen  string
-	LiveWorkerID  string
-	LiveError     string
-	Recent        []telemetryEvent
+	ID               string
+	Alias            string
+	Status           string
+	ClientVersion    string
+	Model            string
+	AndroidID        string
+	EnrolledAt       string
+	InternalIP       string
+	ConfigSeq        int64
+	TelemetryOn      bool
+	LiveVersion      string
+	InstalledVersion string
+	VersionSource    string
+	UpdateAvailable  bool
+	PublishedVersion string
+	LiveRoute        string
+	LiveHealth       string
+	LiveCarry        bool
+	LiveLastSeen     string
+	LiveWorkerID     string
+	LiveError        string
+	Recent           []telemetryEvent
 }
 
 func (s *server) registerWebRoutes(mux *http.ServeMux) {
@@ -287,17 +291,23 @@ func (s *server) webData(templateName, title, path string, session adminSession)
 	}
 	for _, device := range devices {
 		live, hasLive := telemetry[device.ID]
+		installedVersion, versionSource := resolveInstalledVersion(device, live, hasLive)
+		updateAvailable, publishedVersion := computeUpdateAvailable(hasLive, live.ClientVC, apkPublished, apkRelease)
 		item := webDevice{
-			ID:            device.ID,
-			Alias:         device.Alias,
-			Status:        device.Status,
-			ClientVersion: device.ClientVersion,
-			Model:         device.Model,
-			AndroidID:     device.AndroidID,
-			EnrolledAt:    device.CreatedAt.UTC().Format(time.RFC3339),
-			InternalIP:    device.InternalIP,
-			ConfigSeq:     device.ConfigSeq,
-			TelemetryOn:   hasLive,
+			ID:               device.ID,
+			Alias:            device.Alias,
+			Status:           device.Status,
+			ClientVersion:    device.ClientVersion,
+			Model:            device.Model,
+			AndroidID:        device.AndroidID,
+			EnrolledAt:       device.CreatedAt.UTC().Format(time.RFC3339),
+			InternalIP:       device.InternalIP,
+			ConfigSeq:        device.ConfigSeq,
+			TelemetryOn:      hasLive,
+			InstalledVersion: installedVersion,
+			VersionSource:    versionSource,
+			UpdateAvailable:  updateAvailable,
+			PublishedVersion: publishedVersion,
 		}
 		if hasLive {
 			item.LiveVersion = live.ClientVersion
@@ -341,6 +351,28 @@ func configSyncText(worker workerRecord) string {
 		return "конфиг актуален"
 	}
 	return "отстаёт (applied " + strconv.FormatInt(worker.AppliedSeq, 10) + " / desired " + strconv.FormatInt(worker.DesiredSeq, 10) + ")"
+}
+
+func resolveInstalledVersion(device deviceRecord, live telemetrySnapshotRecord, hasLive bool) (string, string) {
+	if hasLive {
+		if version := strings.TrimSpace(live.ClientVersion); version != "" {
+			return version, "telemetry"
+		}
+		if live.ClientVC > 0 {
+			return "vc " + strconv.FormatInt(live.ClientVC, 10), "telemetry"
+		}
+	}
+	if version := strings.TrimSpace(device.ClientVersion); version != "" {
+		return version, "enroll"
+	}
+	return "", ""
+}
+
+func computeUpdateAvailable(hasLive bool, liveVC int64, apkPublished bool, release apkReleaseRecord) (bool, string) {
+	if !apkPublished || !hasLive || liveVC <= 0 || liveVC >= release.VersionCode {
+		return false, ""
+	}
+	return true, release.VersionName
 }
 
 func apkSyncState(worker workerRecord, release apkReleaseRecord, published bool) string {

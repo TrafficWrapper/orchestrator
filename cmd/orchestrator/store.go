@@ -631,6 +631,43 @@ func (s *orchStore) setTelemetrySnapshot(rec telemetrySnapshotRecord) error {
 	})
 }
 
+func (s *orchStore) updateDeviceClientVersionFromTelemetry(id, version string) (bool, error) {
+	id = strings.TrimSpace(id)
+	version = strings.TrimSpace(version)
+	if id == "" {
+		return false, errors.New("device id is required")
+	}
+	if version == "" {
+		return false, nil
+	}
+	changed := false
+	err := s.db.Update(func(tx *bolt.Tx) error {
+		b := tx.Bucket(bucketDevices)
+		raw := b.Get([]byte(id))
+		if raw == nil {
+			return errors.New("device not found")
+		}
+		var rec deviceRecord
+		if err := s.openJSON(raw, &rec); err != nil {
+			return err
+		}
+		if strings.TrimSpace(rec.ClientVersion) == version {
+			return nil
+		}
+		rec.ClientVersion = version
+		sealed, err := s.sealJSON(rec)
+		if err != nil {
+			return err
+		}
+		if err := b.Put([]byte(rec.ID), sealed); err != nil {
+			return err
+		}
+		changed = true
+		return nil
+	})
+	return changed, err
+}
+
 func (s *orchStore) telemetrySnapshots() (map[string]telemetrySnapshotRecord, error) {
 	out := map[string]telemetrySnapshotRecord{}
 	err := s.db.View(func(tx *bolt.Tx) error {

@@ -789,6 +789,9 @@ func (s *server) handleWorkerTelemetry(peer []byte, raw []byte) (any, error) {
 	if err := s.store.setTelemetrySnapshot(snapshot); err != nil {
 		return nil, err
 	}
+	if _, err := s.store.updateDeviceClientVersionFromTelemetry(device.ID, snapshot.ClientVersion); err != nil {
+		return nil, err
+	}
 	return map[string]any{"ok": true}, nil
 }
 
@@ -2201,20 +2204,30 @@ func (s *server) handleAdminDevices(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
+	apkRelease, apkPublished, err := s.store.currentAPKRelease()
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
 	items := make([]any, 0, len(devices))
 	for _, device := range devices {
 		live, hasLive := telemetry[device.ID]
+		installedVersion, versionSource := resolveInstalledVersion(device, live, hasLive)
+		updateAvailable, _ := computeUpdateAvailable(hasLive, live.ClientVC, apkPublished, apkRelease)
 		items = append(items, map[string]any{
-			"device_id":      device.ID,
-			"alias":          device.Alias,
-			"status":         device.Status,
-			"client_version": device.ClientVersion,
-			"model":          device.Model,
-			"android_id":     device.AndroidID,
-			"enrolled_at":    device.CreatedAt.Format(time.RFC3339),
-			"internal_ip":    device.InternalIP,
-			"config_seq":     device.ConfigSeq,
-			"telemetry":      adminTelemetryPayload(live, hasLive),
+			"device_id":                device.ID,
+			"alias":                    device.Alias,
+			"status":                   device.Status,
+			"client_version":           device.ClientVersion, // enroll-time snapshot kept for API compatibility
+			"installed_version":        installedVersion,
+			"installed_version_source": versionSource,
+			"update_available":         updateAvailable,
+			"model":                    device.Model,
+			"android_id":               device.AndroidID,
+			"enrolled_at":              device.CreatedAt.Format(time.RFC3339),
+			"internal_ip":              device.InternalIP,
+			"config_seq":               device.ConfigSeq,
+			"telemetry":                adminTelemetryPayload(live, hasLive),
 		})
 	}
 	writeJSON(w, map[string]any{"ok": true, "devices": items})

@@ -640,9 +640,13 @@
           <code>{{short .ID 16}}</code>
         {{end}}
         <br><span class="muted">seq {{.ConfigSeq}}</span>
+        <br><span class="muted">{{dash .Model}}</span>
       </td>
       <td>{{.Status}}</td>
-      <td>{{dash .ClientVersion}}{{if and .LiveVersion (ne .LiveVersion .ClientVersion)}}<br><span class="muted">{{.LiveVersion}}</span>{{end}}<br><span class="muted">{{dash .Model}}</span></td>
+      <td>
+        {{dash .InstalledVersion}}{{if eq .VersionSource "enroll"}} <span class="muted">(при регистрации)</span>{{end}}
+        {{if .UpdateAvailable}}<br><span class="muted">↑ обновление: {{.PublishedVersion}}</span>{{end}}
+      </td>
       <td>
         {{if .TelemetryOn}}
           <b>{{dash .LiveRoute}}</b><br>
