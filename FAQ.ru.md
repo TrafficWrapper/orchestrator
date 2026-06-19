@@ -4,7 +4,7 @@
 
 ## Что такое TrafficWrapper?
 
-TrafficWrapper — публичная self-hosted anti-censorship tunnel platform. Она
+TrafficWrapper — публичная self-hosted private transport platform. Она
 состоит из orchestrator control plane, worker data-plane nodes и Android public
 client.
 

@@ -5,7 +5,7 @@
 [English](README.md)
 
 TrafficWrapper — open-source self-hosted платформа private transport для
-небольших operator deployments и anti-censorship transport research. Она
+небольших operator deployments и transport-obfuscation research. Она
 разделяет control plane, worker data plane и Android client, чтобы operator
 владел deployment keys, worker endpoints, bootstrap payloads и update policy.
 
