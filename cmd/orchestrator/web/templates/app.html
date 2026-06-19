@@ -200,6 +200,10 @@
         : 'Отозвать доступ и удалить запись устройства ' + id + ' безвозвратно?';
       postJSON('/admin/v1/delete-device', {id}, text);
     }
+    function setDeviceAlias(button, id) {
+      const input = button.closest('td').querySelector('[data-device-alias]');
+      postJSON('/admin/v1/device-alias', {id, alias: input ? input.value : ''}, '');
+    }
     function toggleBootstrapForm() {
       const form = document.getElementById('bootstrap-form');
       if (!form) return;
@@ -558,13 +562,20 @@
   </div>
 </section>
 <table>
-  <thead><tr><th>Device ID</th><th>Статус</th><th>Версия</th><th>Live</th><th>События</th><th>Internal IP</th><th>Enroll</th><th>Действия</th></tr></thead>
+  <thead><tr><th>Устройство</th><th>Статус</th><th>Версия</th><th>Live</th><th>События</th><th>Internal IP</th><th>Enroll</th><th>Действия</th></tr></thead>
   <tbody>
   {{range .Devices}}
     <tr>
-      <td><code>{{short .ID 16}}</code><br><span class="muted">seq {{.ConfigSeq}}</span></td>
+      <td>
+        {{if .Alias}}
+          <b>{{.Alias}}</b><br><code class="muted">{{short .ID 16}}</code>
+        {{else}}
+          <code>{{short .ID 16}}</code>
+        {{end}}
+        <br><span class="muted">seq {{.ConfigSeq}}</span>
+      </td>
       <td>{{.Status}}</td>
-      <td>{{dash .ClientVersion}}<br><span class="muted">{{dash .LiveVersion}}</span><br><span class="muted">{{dash .Model}}</span></td>
+      <td>{{dash .ClientVersion}}{{if and .LiveVersion (ne .LiveVersion .ClientVersion)}}<br><span class="muted">{{.LiveVersion}}</span>{{end}}<br><span class="muted">{{dash .Model}}</span></td>
       <td>
         {{if .TelemetryOn}}
           <b>{{dash .LiveRoute}}</b><br>
@@ -586,6 +597,8 @@
       <td>{{dash .InternalIP}}</td>
       <td>{{dash .EnrolledAt}}</td>
       <td class="actions">
+        <input data-device-alias type="text" maxlength="64" placeholder="Имя устройства" value="{{.Alias}}">
+        <button class="secondary" onclick="setDeviceAlias(this,'{{.ID}}')">Задать имя</button>
         {{if ne .Status "revoked"}}
           <button class="danger" onclick="revokeDevice('{{.ID}}')">Отозвать</button>
           <button class="secondary" onclick="deleteDevice('{{.ID}}','{{.Status}}')">Удалить</button>

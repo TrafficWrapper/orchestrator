@@ -65,6 +65,7 @@ type webWorker struct {
 
 type webDevice struct {
 	ID            string
+	Alias         string
 	Status        string
 	ClientVersion string
 	Model         string
@@ -288,6 +289,7 @@ func (s *server) webData(templateName, title, path string, session adminSession)
 		live, hasLive := telemetry[device.ID]
 		item := webDevice{
 			ID:            device.ID,
+			Alias:         device.Alias,
 			Status:        device.Status,
 			ClientVersion: device.ClientVersion,
 			Model:         device.Model,

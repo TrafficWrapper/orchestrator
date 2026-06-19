@@ -72,6 +72,7 @@ type workerRecord struct {
 
 type deviceRecord struct {
 	ID              string       `json:"id"`
+	Alias           string       `json:"alias,omitempty"`
 	Status          string       `json:"status"`
 	NoisePublicKey  string       `json:"noise_public_key"`
 	IdentityPubKey  string       `json:"identity_pubkey"`
@@ -683,6 +684,60 @@ func (s *orchStore) revokeDevice(id string) error {
 		}
 		return s.bumpWorkerSeqsTx(tx)
 	})
+}
+
+func (s *orchStore) setDeviceAlias(id, alias string) (deviceRecord, error) {
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return deviceRecord{}, errors.New("device id is required")
+	}
+	alias, err := sanitizeDeviceAlias(alias)
+	if err != nil {
+		return deviceRecord{}, err
+	}
+	var out deviceRecord
+	err = s.db.Update(func(tx *bolt.Tx) error {
+		db := tx.Bucket(bucketDevices)
+		raw := db.Get([]byte(id))
+		if raw == nil {
+			return errors.New("device not found")
+		}
+		var rec deviceRecord
+		if err := s.openJSON(raw, &rec); err != nil {
+			return err
+		}
+		rec.Alias = alias
+		sealed, err := s.sealJSON(rec)
+		if err != nil {
+			return err
+		}
+		if err := db.Put([]byte(rec.ID), sealed); err != nil {
+			return err
+		}
+		out = rec
+		return nil
+	})
+	return out, err
+}
+
+func sanitizeDeviceAlias(value string) (string, error) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return "", nil
+	}
+	var b strings.Builder
+	count := 0
+	for _, r := range value {
+		if r < 0x20 || r == 0x7f {
+			continue
+		}
+		count++
+		if count > 64 {
+			return "", errors.New("alias must be 64 characters or less")
+		}
+		b.WriteRune(r)
+	}
+	return strings.TrimSpace(b.String()), nil
 }
 
 func (s *orchStore) deleteDevice(id string) error {

@@ -380,6 +380,7 @@ func runServe(cfg orchConfig) error {
 	mux.HandleFunc("/admin/v1/approve-worker", s.handleAdminApproveWorker)
 	mux.HandleFunc("/admin/v1/revoke-device", s.handleAdminRevokeDevice)
 	mux.HandleFunc("/admin/v1/delete-device", s.handleAdminDeleteDevice)
+	mux.HandleFunc("/admin/v1/device-alias", s.handleAdminDeviceAlias)
 	mux.HandleFunc("/admin/v1/workers", s.handleAdminWorkers)
 	mux.HandleFunc("/admin/v1/workers/set-enabled", s.handleAdminWorkerSetEnabled)
 	mux.HandleFunc("/admin/v1/workers/protocol", s.handleAdminWorkerProtocol)
@@ -2076,6 +2077,30 @@ func (s *server) handleAdminDeleteDevice(w http.ResponseWriter, r *http.Request)
 	fmt.Fprintf(w, "device_deleted id=%s\n", req.ID)
 }
 
+func (s *server) handleAdminDeviceAlias(w http.ResponseWriter, r *http.Request) {
+	if !s.requireAdmin(w, r) {
+		return
+	}
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var req struct {
+		ID    string `json:"id"`
+		Alias string `json:"alias"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	rec, err := s.store.setDeviceAlias(req.ID, req.Alias)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	writeJSON(w, map[string]any{"ok": true, "device_id": rec.ID, "alias": rec.Alias})
+}
+
 func (s *server) handleAdminWorkers(w http.ResponseWriter, r *http.Request) {
 	if !s.requireAdmin(w, r) {
 		return
@@ -2179,6 +2204,7 @@ func (s *server) handleAdminDevices(w http.ResponseWriter, r *http.Request) {
 		live, hasLive := telemetry[device.ID]
 		items = append(items, map[string]any{
 			"device_id":      device.ID,
+			"alias":          device.Alias,
 			"status":         device.Status,
 			"client_version": device.ClientVersion,
 			"model":          device.Model,

@@ -239,6 +239,139 @@ func TestAdminDeleteDeviceRequiresCSRFAndPurgesActiveDevice(t *testing.T) {
 	}
 }
 
+func TestAdminDeviceAliasRequiresCSRFAndSanitizes(t *testing.T) {
+	s := newTestServer(t)
+	addApprovedWorker(t, s)
+	if err := s.store.setAdminPassword("owner-secret"); err != nil {
+		t.Fatal(err)
+	}
+	secret := "device-alias-bootstrap-secret"
+	if _, err := s.store.createBootstrapToken(
+		secret,
+		time.Now().Add(time.Hour),
+		json.RawMessage(`{"devices":1}`),
+		[]string{"https://worker.example/tw"},
+	); err != nil {
+		t.Fatal(err)
+	}
+	enroll := enrollDeviceForTest(t, s, secret)
+	if !enroll.OK {
+		t.Fatalf("enroll failed: %s", enroll.Error)
+	}
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/admin/v1/login", s.handleAdminLogin)
+	mux.HandleFunc("/admin/v1/device-alias", s.handleAdminDeviceAlias)
+	mux.HandleFunc("/admin/v1/devices", s.handleAdminDevices)
+	ts := httptest.NewServer(mux)
+	defer ts.Close()
+
+	rawLogin, _ := json.Marshal(map[string]string{"secret": "owner-secret"})
+	loginReq, _ := http.NewRequest(http.MethodPost, ts.URL+"/admin/v1/login", bytes.NewReader(rawLogin))
+	loginReq.Header.Set("content-type", "application/json")
+	loginResp, err := http.DefaultClient.Do(loginReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	loginBody, _ := io.ReadAll(io.LimitReader(loginResp.Body, 1<<20))
+	_ = loginResp.Body.Close()
+	var login struct {
+		SessionToken string `json:"session_token"`
+		CSRFToken    string `json:"csrf_token"`
+	}
+	if loginResp.StatusCode != http.StatusOK || len(loginResp.Cookies()) == 0 {
+		t.Fatalf("login status=%d body=%s cookies=%d", loginResp.StatusCode, string(loginBody), len(loginResp.Cookies()))
+	}
+	if err := json.Unmarshal(loginBody, &login); err != nil {
+		t.Fatal(err)
+	}
+	cookie := loginResp.Cookies()[0]
+
+	rawAlias, _ := json.Marshal(map[string]string{"id": enroll.DeviceID, "alias": "  Kitchen\u0007 phone  "})
+	noCSRFReq, _ := http.NewRequest(http.MethodPost, ts.URL+"/admin/v1/device-alias", bytes.NewReader(rawAlias))
+	noCSRFReq.Header.Set("content-type", "application/json")
+	noCSRFReq.AddCookie(cookie)
+	noCSRFResp, err := http.DefaultClient.Do(noCSRFReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = noCSRFResp.Body.Close()
+	if noCSRFResp.StatusCode != http.StatusForbidden {
+		t.Fatalf("alias without csrf status=%d", noCSRFResp.StatusCode)
+	}
+	if rec, err := s.store.device(enroll.DeviceID); err != nil || rec.Alias != "" {
+		t.Fatalf("alias changed without csrf: rec=%+v err=%v", rec, err)
+	}
+
+	aliasReq, _ := http.NewRequest(http.MethodPost, ts.URL+"/admin/v1/device-alias", bytes.NewReader(rawAlias))
+	aliasReq.Header.Set("content-type", "application/json")
+	aliasReq.Header.Set("x-csrf-token", login.CSRFToken)
+	aliasReq.AddCookie(cookie)
+	aliasResp, err := http.DefaultClient.Do(aliasReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	aliasBody, _ := io.ReadAll(io.LimitReader(aliasResp.Body, 1<<20))
+	_ = aliasResp.Body.Close()
+	if aliasResp.StatusCode != http.StatusOK {
+		t.Fatalf("alias status=%d body=%s", aliasResp.StatusCode, string(aliasBody))
+	}
+	rec, err := s.store.device(enroll.DeviceID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rec.Alias != "Kitchen phone" {
+		t.Fatalf("alias was not sanitized/saved: %q", rec.Alias)
+	}
+
+	devicesReq, _ := http.NewRequest(http.MethodGet, ts.URL+"/admin/v1/devices", nil)
+	devicesReq.Header.Set("authorization", "Bearer "+login.SessionToken)
+	devicesResp, err := http.DefaultClient.Do(devicesReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	devicesBody, _ := io.ReadAll(io.LimitReader(devicesResp.Body, 1<<20))
+	_ = devicesResp.Body.Close()
+	if devicesResp.StatusCode != http.StatusOK || !bytes.Contains(devicesBody, []byte(`"alias":"Kitchen phone"`)) {
+		t.Fatalf("alias not visible in devices API status=%d body=%s", devicesResp.StatusCode, string(devicesBody))
+	}
+
+	resetRaw, _ := json.Marshal(map[string]string{"id": enroll.DeviceID, "alias": ""})
+	resetReq, _ := http.NewRequest(http.MethodPost, ts.URL+"/admin/v1/device-alias", bytes.NewReader(resetRaw))
+	resetReq.Header.Set("content-type", "application/json")
+	resetReq.Header.Set("x-csrf-token", login.CSRFToken)
+	resetReq.AddCookie(cookie)
+	resetResp, err := http.DefaultClient.Do(resetReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resetResp.Body.Close()
+	if resetResp.StatusCode != http.StatusOK {
+		t.Fatalf("reset alias status=%d", resetResp.StatusCode)
+	}
+	rec, err = s.store.device(enroll.DeviceID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rec.Alias != "" {
+		t.Fatalf("alias was not reset: %q", rec.Alias)
+	}
+
+	longRaw, _ := json.Marshal(map[string]string{"id": enroll.DeviceID, "alias": strings.Repeat("x", 65)})
+	longReq, _ := http.NewRequest(http.MethodPost, ts.URL+"/admin/v1/device-alias", bytes.NewReader(longRaw))
+	longReq.Header.Set("content-type", "application/json")
+	longReq.Header.Set("x-csrf-token", login.CSRFToken)
+	longReq.AddCookie(cookie)
+	longResp, err := http.DefaultClient.Do(longReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = longResp.Body.Close()
+	if longResp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("long alias status=%d", longResp.StatusCode)
+	}
+}
+
 func TestDeviceEnrollHTTPNoiseEndToEnd(t *testing.T) {
 	s := newTestServer(t)
 	static, err := protocol.GenerateKeypair()
