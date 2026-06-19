@@ -68,6 +68,25 @@ Keep these roots isolated. Do not reuse the update key as a config key. Do not
 store release keystores, minisign private keys, `.env`, `orch-state/`, or
 `worker-state/` in Git.
 
+## Update Channel Time-Trust Tradeoffs
+
+- **Trusted-time fallback to device system time.** Manifest expiry and timestamp
+  checks prefer trusted time from SNTP plus a monotonic anchor. If SNTP is
+  unavailable and a fresh install has no monotonic anchor yet, the client
+  deliberately falls back to the device system clock. This favors availability:
+  otherwise a fresh client behind NTP blocking could not update at all. The
+  tradeoff is that a device with spoofed system time and blocked NTP can bypass
+  manifest expiry or future-time checks. Mitigations remain in force: updates
+  still require a valid minisign signature from the pinned update key,
+  anti-rollback by sequence number, and matching APK signing certificate; time
+  validation is an additional layer, not the only barrier.
+- **Signed manifest timestamps can advance the trusted anchor.** Trusted time is
+  derived as the maximum of the stored monotonic anchor and the issued/timestamp
+  value from a verified manifest. A validly signed manifest can therefore move
+  the anchor forward. Mitigations: only cryptographically verified manifests are
+  considered, and the future guard rejects timestamps more than 24 hours ahead
+  of current trusted time.
+
 ## Unsafe Defaults
 
 `example.com`, `example.org`, generated seed update keys, default local

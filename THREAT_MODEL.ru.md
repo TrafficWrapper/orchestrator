@@ -69,6 +69,25 @@ TrafficWrapper намеренно разделяет четыре key roots:
 Не храните release keystores, minisign private keys, `.env`, `orch-state/` или
 `worker-state/` в Git.
 
+## Tradeoff'ы доверенного времени update-канала
+
+- **Fallback trusted time на системные часы устройства.** Проверки manifest
+  expiry и timestamp предпочитают trusted time из SNTP плюс monotonic anchor.
+  Если SNTP недоступен и у fresh install ещё нет monotonic anchor, клиент
+  сознательно fallback'ится на системные часы устройства. Это выбор в пользу
+  availability: иначе fresh client за NTP-blocking не смог бы обновиться вообще.
+  Tradeoff: устройство с подделанными системными часами и заблокированным NTP
+  может обойти manifest expiry или future-time checks. Mitigations остаются в
+  силе: updates всё равно требуют valid minisign signature от pinned update key,
+  anti-rollback по sequence number и совпадение APK signing certificate;
+  time validation является дополнительным слоем, а не единственным барьером.
+- **Подписанные manifest timestamps могут двигать trusted anchor вперёд.**
+  Trusted time вычисляется как максимум сохранённого monotonic anchor и
+  issued/timestamp value из verified manifest. Поэтому validly signed manifest
+  может сдвинуть anchor вперёд. Mitigations: учитываются только
+  cryptographically verified manifests, а future guard отклоняет timestamps
+  больше чем на 24 часа впереди current trusted time.
+
 ## Небезопасные defaults
 
 `example.com`, `example.org`, generated seed update keys, default local
