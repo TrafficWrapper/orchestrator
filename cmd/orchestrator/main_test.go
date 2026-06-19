@@ -609,6 +609,95 @@ func TestFirstRunPasswordMustChangeFlow(t *testing.T) {
 	}
 }
 
+func TestAdminPasswordChangeWithRegularSessionRequiresCurrentSecretAndCSRF(t *testing.T) {
+	s := newTestServer(t)
+	if err := s.store.setAdminPassword("old-owner-secret"); err != nil {
+		t.Fatal(err)
+	}
+	mux := http.NewServeMux()
+	mux.HandleFunc("/admin/v1/login", s.handleAdminLogin)
+	mux.HandleFunc("/admin/v1/password/change", s.handleAdminPasswordChange)
+	ts := httptest.NewServer(mux)
+	defer ts.Close()
+
+	rawLogin, _ := json.Marshal(map[string]string{"secret": "old-owner-secret"})
+	loginReq, _ := http.NewRequest(http.MethodPost, ts.URL+"/admin/v1/login", bytes.NewReader(rawLogin))
+	loginReq.Header.Set("content-type", "application/json")
+	loginResp, err := http.DefaultClient.Do(loginReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	loginBody, _ := io.ReadAll(io.LimitReader(loginResp.Body, 1<<20))
+	_ = loginResp.Body.Close()
+	if loginResp.StatusCode != http.StatusOK {
+		t.Fatalf("login status=%d body=%s", loginResp.StatusCode, string(loginBody))
+	}
+	var login struct {
+		OK         bool   `json:"ok"`
+		MustChange bool   `json:"must_change"`
+		CSRFToken  string `json:"csrf_token"`
+	}
+	if err := json.Unmarshal(loginBody, &login); err != nil {
+		t.Fatal(err)
+	}
+	if !login.OK || login.MustChange || login.CSRFToken == "" || len(loginResp.Cookies()) == 0 {
+		t.Fatalf("bad regular login: %+v cookies=%d", login, len(loginResp.Cookies()))
+	}
+	cookie := loginResp.Cookies()[0]
+
+	badRaw, _ := json.Marshal(map[string]string{"current_secret": "wrong-secret", "new_secret": "new-owner-secret"})
+	badReq, _ := http.NewRequest(http.MethodPost, ts.URL+"/admin/v1/password/change", bytes.NewReader(badRaw))
+	badReq.Header.Set("content-type", "application/json")
+	badReq.Header.Set("x-csrf-token", login.CSRFToken)
+	badReq.AddCookie(cookie)
+	badResp, err := http.DefaultClient.Do(badReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = badResp.Body.Close()
+	if badResp.StatusCode < 400 {
+		t.Fatalf("wrong current secret accepted: status=%d", badResp.StatusCode)
+	}
+
+	goodRaw, _ := json.Marshal(map[string]string{"current_secret": "old-owner-secret", "new_secret": "new-owner-secret"})
+	noCSRFReq, _ := http.NewRequest(http.MethodPost, ts.URL+"/admin/v1/password/change", bytes.NewReader(goodRaw))
+	noCSRFReq.Header.Set("content-type", "application/json")
+	noCSRFReq.AddCookie(cookie)
+	noCSRFResp, err := http.DefaultClient.Do(noCSRFReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = noCSRFResp.Body.Close()
+	if noCSRFResp.StatusCode != http.StatusForbidden {
+		t.Fatalf("missing csrf status=%d", noCSRFResp.StatusCode)
+	}
+
+	goodReq, _ := http.NewRequest(http.MethodPost, ts.URL+"/admin/v1/password/change", bytes.NewReader(goodRaw))
+	goodReq.Header.Set("content-type", "application/json")
+	goodReq.Header.Set("x-csrf-token", login.CSRFToken)
+	goodReq.AddCookie(cookie)
+	goodResp, err := http.DefaultClient.Do(goodReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	goodBody, _ := io.ReadAll(io.LimitReader(goodResp.Body, 1<<20))
+	_ = goodResp.Body.Close()
+	if goodResp.StatusCode != http.StatusOK {
+		t.Fatalf("change status=%d body=%s", goodResp.StatusCode, string(goodBody))
+	}
+	oldOK, _, err := s.store.verifyAdminPassword("old-owner-secret")
+	if err != nil {
+		t.Fatal(err)
+	}
+	newOK, mustChange, err := s.store.verifyAdminPassword("new-owner-secret")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if oldOK || !newOK || mustChange {
+		t.Fatalf("password state oldOK=%t newOK=%t mustChange=%t", oldOK, newOK, mustChange)
+	}
+}
+
 func TestWebBotTokenSettingsUsesSessionCSRFAndEncryptedStore(t *testing.T) {
 	s := newTestServer(t)
 	if err := s.store.setAdminPassword("owner-secret"); err != nil {

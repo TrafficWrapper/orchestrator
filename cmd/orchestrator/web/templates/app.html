@@ -83,7 +83,7 @@
     {{end}}
   </main>
   <script>
-    const csrfToken = document.querySelector('meta[name="csrf-token"]')?.content || '';
+    let csrfToken = document.querySelector('meta[name="csrf-token"]')?.content || '';
     async function postJSON(path, payload, confirmText) {
       if (confirmText && !window.confirm(confirmText)) return;
       const response = await fetch(path, {
@@ -149,6 +149,41 @@
         return;
       }
       window.location.href = '/';
+    }
+    async function changeAdminPassword(event) {
+      event.preventDefault();
+      const notice = document.getElementById('admin-password-notice');
+      notice.className = 'notice';
+      notice.style.display = 'block';
+      notice.textContent = 'Сохраняем новый пароль...';
+      const current_secret = document.getElementById('admin-current-secret').value;
+      const new_secret = document.getElementById('admin-new-secret').value;
+      const repeat = document.getElementById('admin-new-secret-repeat').value;
+      if (new_secret !== repeat) {
+        notice.className = 'notice error';
+        notice.textContent = 'Новый пароль и повтор не совпадают.';
+        return;
+      }
+      const response = await fetch('/admin/v1/password/change', {
+        method: 'POST',
+        credentials: 'same-origin',
+        headers: {'Content-Type': 'application/json', 'X-CSRF-Token': csrfToken},
+        body: JSON.stringify({current_secret, new_secret})
+      });
+      if (!response.ok) {
+        notice.className = 'notice error';
+        notice.textContent = await response.text();
+        return;
+      }
+      const result = await response.json();
+      if (result.csrf_token) {
+        csrfToken = result.csrf_token;
+        const meta = document.querySelector('meta[name="csrf-token"]');
+        if (meta) meta.setAttribute('content', csrfToken);
+      }
+      event.target.reset();
+      notice.className = 'notice ok';
+      notice.textContent = 'Admin-пароль изменён. Текущая сессия обновлена.';
     }
     function setWorkerEnabled(id, enabled) {
       postJSON('/admin/v1/workers/set-enabled', {id, enabled}, enabled ? '' : 'Отключить worker из выдаваемой конфигурации?');
@@ -580,6 +615,16 @@
 </section>
 <section class="panel">
   <h2>Admin-пароль</h2>
+  <div id="admin-password-notice" class="notice"></div>
+  <form onsubmit="changeAdminPassword(event)">
+    <label>Текущий пароль</label>
+    <input id="admin-current-secret" type="password" autocomplete="current-password" required>
+    <label>Новый пароль</label>
+    <input id="admin-new-secret" type="password" autocomplete="new-password" required>
+    <label>Повтор нового пароля</label>
+    <input id="admin-new-secret-repeat" type="password" autocomplete="new-password" required>
+    <div style="margin-top:12px"><button type="submit">Сменить пароль</button></div>
+  </form>
   <p class="muted">Для headless-сценариев используйте CLI только через stdin/env/file. Не передавайте секреты открытым аргументом командной строки.</p>
 </section>
 {{end}}
