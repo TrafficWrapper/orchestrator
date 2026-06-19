@@ -19,15 +19,6 @@ Back up each root separately. Store private material offline or in
 owner-controlled secret storage. Do not commit `.env`, `orch-state/`,
 `worker-state/`, release keystores, or minisign private keys.
 
-## Operational identity and donations
-
-Donation addresses, side domains, build hosts, package signing identities, and
-support accounts can deanonymize a deployment or maintainer identity. Treat them
-as infrastructure metadata. Use isolated addresses and accounts when you need
-separation from personal infrastructure, and avoid publishing payment metadata,
-real domains, IP addresses, SNI values, or account handles in public issues and
-support threads.
-
 ## Rotate the config-signing key
 
 The config-signing key is held by the signer process and reached through
