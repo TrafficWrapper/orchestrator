@@ -20,6 +20,10 @@
     h2 { margin:0 0 12px; font-size:18px; }
     .panel { background:var(--panel); border:1px solid var(--line); border-radius:8px; padding:16px; margin-bottom:16px; }
     .grid { display:grid; gap:12px; grid-template-columns:repeat(auto-fit,minmax(180px,1fr)); }
+    .apk-grid { display:grid; gap:12px; grid-template-columns:minmax(220px,2fr) minmax(130px,1fr) minmax(160px,1fr) minmax(160px,1fr); align-items:start; }
+    .apk-grid label { display:flex; flex-direction:column; gap:6px; }
+    .apk-grid input[type="number"], .apk-grid input[type="text"] { width:100%; box-sizing:border-box; }
+    .hint { display:block; margin-top:2px; font-size:12px; color:var(--muted); line-height:1.35; }
     .metric { background:var(--panel); border:1px solid var(--line); border-radius:8px; padding:14px; }
     .metric b { display:block; font-size:24px; }
     .muted { color:var(--muted); }
@@ -84,6 +88,7 @@
   </main>
   <script>
     let csrfToken = document.querySelector('meta[name="csrf-token"]')?.content || '';
+    let apkServerSigningAvailable = false;
     async function postJSON(path, payload, confirmText) {
       if (confirmText && !window.confirm(confirmText)) return;
       const response = await fetch(path, {
@@ -334,6 +339,53 @@
       const digest = await crypto.subtle.digest('SHA-256', buffer);
       return Array.from(new Uint8Array(digest)).map(b => b.toString(16).padStart(2, '0')).join('');
     }
+    function syncApkSigningMode() {
+      const toggle = document.getElementById('apk-server-signing');
+      const autoBlock = document.getElementById('apk-auto-publish-block');
+      const offlineBlock = document.getElementById('apk-offline-publish-block');
+      const modeNote = document.getElementById('apk-signing-mode-note');
+      if (!toggle || !autoBlock || !offlineBlock) return;
+      toggle.disabled = !apkServerSigningAvailable;
+      if (!apkServerSigningAvailable) toggle.checked = false;
+      const serverMode = apkServerSigningAvailable && toggle.checked;
+      autoBlock.style.display = serverMode ? 'block' : 'none';
+      offlineBlock.style.display = serverMode ? 'none' : 'block';
+      if (modeNote) {
+        modeNote.textContent = serverMode
+          ? 'Серверная подпись удобна, но update-ключ хранится на сервере: при компрометации сервера возможна подмена обновлений. Для повышенной безопасности держите update-ключ offline и подписывайте manifest вручную.'
+          : 'Offline-режим: ORCH формирует manifest, а minisig вставляется после подписи внешним update-ключом.';
+      }
+    }
+    async function inspectSelectedApk() {
+      const file = document.getElementById('apk-file').files[0];
+      const note = document.getElementById('apk-inspect-note');
+      if (!file || !note) return;
+      note.className = 'muted';
+      note.textContent = 'Читаем versionCode/versionName из APK...';
+      const form = new FormData();
+      form.append('apk', file, file.name);
+      const response = await fetch('/admin/v1/apk/inspect', {
+        method: 'POST',
+        credentials: 'same-origin',
+        headers: {'X-CSRF-Token': csrfToken},
+        body: form
+      });
+      if (!response.ok) {
+        note.className = 'bad';
+        note.textContent = await response.text();
+        return;
+      }
+      const result = await response.json();
+      if (result.version_detected) {
+        document.getElementById('apk-version-code').value = result.version_code || '';
+        document.getElementById('apk-version-name').value = result.version_name || '';
+        note.className = 'muted';
+        note.textContent = 'APK: versionCode ' + result.version_code + ', versionName ' + result.version_name + ', sha256 ' + String(result.apk_sha256 || '').slice(0, 12) + '...';
+      } else {
+        note.className = 'bad';
+        note.textContent = 'Не удалось прочитать версию APK: ' + (result.version_error || 'unknown') + '. Заполните version code/name вручную.';
+      }
+    }
     async function draftApkManifest() {
       const file = document.getElementById('apk-file').files[0];
       if (!file) { alert('Выберите APK'); return; }
@@ -361,14 +413,25 @@
     async function publishApk() {
       const file = document.getElementById('apk-file').files[0];
       if (!file) { alert('Выберите APK'); return; }
+      const serverMode = apkServerSigningAvailable && document.getElementById('apk-server-signing')?.checked;
       const manifest = document.getElementById('apk-manifest-json').value.trim();
       const minisig = document.getElementById('apk-manifest-minisig').value.trim();
-      if (!manifest || !minisig) { alert('Нужны manifest_json и minisig'); return; }
-      if (!window.confirm('Опубликовать APK в платформенный update-канал?')) return;
+      if (!serverMode && (!manifest || !minisig)) { alert('Нужны manifest_json и minisig'); return; }
+      const question = serverMode
+        ? 'Опубликовать APK и подписать manifest серверным update.key?'
+        : 'Опубликовать APK в платформенный update-канал?';
+      if (!window.confirm(question)) return;
       const form = new FormData();
       form.append('apk', file, file.name);
-      form.append('manifest_json', manifest);
-      form.append('manifest_minisig', minisig);
+      form.append('version_code', document.getElementById('apk-version-code').value || '');
+      form.append('version_name', document.getElementById('apk-version-name').value || '');
+      form.append('min_version', document.getElementById('apk-min-version').value || '0');
+      form.append('notes', document.getElementById('apk-notes').value || '');
+      form.append('apk_name', file.name);
+      if (!serverMode) {
+        form.append('manifest_json', manifest);
+        form.append('manifest_minisig', minisig);
+      }
       const response = await fetch('/admin/v1/apk/publish', {
         method: 'POST',
         credentials: 'same-origin',
@@ -389,6 +452,10 @@
         return;
       }
       const status = await response.json();
+      apkServerSigningAvailable = !!status.server_update_key;
+      const toggle = document.getElementById('apk-server-signing');
+      if (toggle) toggle.checked = apkServerSigningAvailable;
+      syncApkSigningMode();
       const release = status.release;
       box.style.display = 'block';
       if (!release) {
@@ -646,23 +713,36 @@
 </div>
 <section class="panel" style="margin-top:16px">
   <h2>Публикация APK</h2>
-  <p class="muted">ORCH не подписывает APK и не держит APK-signing key. Загрузите уже подписанный APK, сформируйте manifest, подпишите manifest offline update-ключом и вставьте minisig.</p>
+  <p class="muted">Загрузите уже подписанный APK. ORCH публикует APK и подписанный update-manifest; сам APK-signing key остаётся вне ORCH.</p>
   <div id="apk-current-release" class="notice"></div>
-  <div class="grid">
-    <label>APK <input id="apk-file" type="file" accept=".apk"></label>
-    <label>version code <input id="apk-version-code" type="number" min="1"></label>
-    <label>version name <input id="apk-version-name" type="text"></label>
-    <label>min version <input id="apk-min-version" type="number" min="0" value="0"></label>
+  <div class="apk-grid">
+    <label>APK <input id="apk-file" type="file" accept=".apk" onchange="inspectSelectedApk()"></label>
+    <label>version code <input id="apk-version-code" type="number" min="1" placeholder="из APK"></label>
+    <label>version name <input id="apk-version-name" type="text" placeholder="из APK"></label>
+    <label>min version
+      <input id="apk-min-version" type="number" min="0" value="0">
+      <span class="hint">Минимальный versionCode, с которым работает сеть. Устройства с версией ниже получают mandatory update. 0 = без принуждения.</span>
+    </label>
   </div>
+  <p id="apk-inspect-note" class="muted">Выберите APK, чтобы ORCH прочитал versionCode/versionName из AndroidManifest.xml.</p>
   <label>Заметки<br><textarea id="apk-notes" rows="2" style="width:100%"></textarea></label>
   <div class="actions" style="margin-top:10px">
-    <button class="secondary" onclick="draftApkManifest()">Сформировать manifest для подписи</button>
+    <label class="check"><input id="apk-server-signing" type="checkbox" onchange="syncApkSigningMode()"> Подписать на сервере (update.key на сервере)</label>
   </div>
-  <p id="apk-publish-note" class="muted"></p>
-  <label>manifest_json<br><textarea id="apk-manifest-json" rows="6" style="width:100%; font-family:monospace"></textarea></label>
-  <label>manifest minisig<br><textarea id="apk-manifest-minisig" rows="4" style="width:100%; font-family:monospace"></textarea></label>
-  <div class="actions" style="margin-top:10px">
+  <p id="apk-signing-mode-note" class="muted"></p>
+  <div id="apk-auto-publish-block" class="actions" style="margin-top:10px; display:none">
     <button onclick="publishApk()">Опубликовать APK</button>
+  </div>
+  <div id="apk-offline-publish-block" style="display:none">
+    <div class="actions" style="margin-top:10px">
+      <button class="secondary" onclick="draftApkManifest()">Сформировать manifest для подписи</button>
+    </div>
+    <p id="apk-publish-note" class="muted"></p>
+    <label>manifest_json<br><textarea id="apk-manifest-json" rows="6" style="width:100%; font-family:monospace"></textarea></label>
+    <label>manifest minisig<br><textarea id="apk-manifest-minisig" rows="4" style="width:100%; font-family:monospace"></textarea></label>
+    <div class="actions" style="margin-top:10px">
+      <button onclick="publishApk()">Опубликовать APK</button>
+    </div>
   </div>
 </section>
 {{end}}

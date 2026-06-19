@@ -1,6 +1,7 @@
 package main
 
 import (
+	"archive/zip"
 	"bytes"
 	"crypto/ecdsa"
 	"crypto/elliptic"
@@ -8,6 +9,7 @@ import (
 	"crypto/sha256"
 	"crypto/x509"
 	"encoding/base64"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"io"
@@ -1078,6 +1080,92 @@ func TestAdminAPKPublishStoresArtifactAndRejectsRollback(t *testing.T) {
 	}
 }
 
+func TestAPKVersionMetadataExtractedFromBinaryManifestZip(t *testing.T) {
+	apk := buildTestAPKWithManifest(t, 1010, "0.1.10")
+	path := filepath.Join(t.TempDir(), "app.apk")
+	if err := os.WriteFile(path, apk, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	file, err := os.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close()
+	info, err := file.Stat()
+	if err != nil {
+		t.Fatal(err)
+	}
+	version, err := inspectAPKVersion(file, info.Size())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if version.VersionCode != 1010 || version.VersionName != "0.1.10" {
+		t.Fatalf("bad apk version: %+v", version)
+	}
+}
+
+func TestAdminAPKPublishAutoSignsWithServerUpdateKey(t *testing.T) {
+	pub, priv, err := minisign.GenerateKey(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := newTestServer(t)
+	s.cfg.UpdatePublicKey = mustText(pub)
+	privText, err := priv.MarshalText()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(s.cfg.StateDir, "update.key"), privText, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	addApprovedWorker(t, s)
+	if err := s.store.setAdminPassword("owner-secret"); err != nil {
+		t.Fatal(err)
+	}
+	mux := http.NewServeMux()
+	mux.HandleFunc("/admin/v1/login", s.handleAdminLogin)
+	mux.HandleFunc("/admin/v1/apk/status", s.handleAdminAPKStatus)
+	mux.HandleFunc("/admin/v1/apk/publish", s.handleAdminAPKPublish)
+	ts := httptest.NewServer(mux)
+	defer ts.Close()
+
+	var login struct {
+		OK           bool   `json:"ok"`
+		SessionToken string `json:"session_token"`
+	}
+	postJSONForTest(t, ts.URL+"/admin/v1/login", map[string]string{"secret": "owner-secret"}, &login)
+	var status struct {
+		OK              bool `json:"ok"`
+		ServerUpdateKey bool `json:"server_update_key"`
+	}
+	adminJSONForTest(t, http.MethodGet, ts.URL+"/admin/v1/apk/status", login.SessionToken, nil, &status)
+	if !status.OK || !status.ServerUpdateKey {
+		t.Fatalf("server update key not advertised: %+v", status)
+	}
+
+	apk := buildTestAPKWithManifest(t, 1011, "0.1.11")
+	publishResp := postAPKAutoPublishForTest(t, ts.URL+"/admin/v1/apk/publish", login.SessionToken, apk, map[string]string{
+		"min_version": "1009",
+		"notes":       "auto",
+	})
+	if !publishResp.OK || publishResp.Release.Seq != 1 {
+		t.Fatalf("bad auto publish response: %+v", publishResp)
+	}
+	if publishResp.Release.VersionCode != 1011 || publishResp.Release.VersionName != "0.1.11" || publishResp.Release.MinVersion != 1009 {
+		t.Fatalf("bad auto release metadata: %+v", publishResp.Release)
+	}
+	artifact, err := s.loadUpdateArtifact()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if artifact == nil {
+		t.Fatal("missing update artifact")
+	}
+	if err := verifyManifestSignature(artifact.ManifestJSON, artifact.ManifestMinisig, s.cfg.UpdatePublicKey); err != nil {
+		t.Fatalf("auto minisig did not verify: %v", err)
+	}
+}
+
 func TestAdminAPKDownloadRequiresAuthAndServesCurrentRelease(t *testing.T) {
 	s := newTestServer(t)
 	if err := s.store.setAdminPassword("owner-secret"); err != nil {
@@ -1476,6 +1564,173 @@ func postAPKPublishRequestForTest(t *testing.T, url, token string, apk []byte, m
 		t.Fatal(err)
 	}
 	return resp
+}
+
+func postAPKAutoPublishForTest(t *testing.T, url, token string, apk []byte, fields map[string]string) struct {
+	OK      bool             `json:"ok"`
+	Release apkReleaseRecord `json:"release"`
+} {
+	t.Helper()
+	var out struct {
+		OK      bool             `json:"ok"`
+		Release apkReleaseRecord `json:"release"`
+	}
+	var body bytes.Buffer
+	writer := multipart.NewWriter(&body)
+	part, err := writer.CreateFormFile("apk", "app-public-test.apk")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := part.Write(apk); err != nil {
+		t.Fatal(err)
+	}
+	for key, value := range fields {
+		if err := writer.WriteField(key, value); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	req, err := http.NewRequest(http.MethodPost, url, &body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("content-type", writer.FormDataContentType())
+	req.Header.Set("authorization", "Bearer "+token)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if resp.StatusCode >= 300 {
+		t.Fatalf("auto publish http %d: %s", resp.StatusCode, strings.TrimSpace(string(raw)))
+	}
+	if err := json.Unmarshal(raw, &out); err != nil {
+		t.Fatal(err)
+	}
+	return out
+}
+
+func buildTestAPKWithManifest(t *testing.T, versionCode int64, versionName string) []byte {
+	t.Helper()
+	var out bytes.Buffer
+	zw := zip.NewWriter(&out)
+	manifest, err := zw.Create("AndroidManifest.xml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := manifest.Write(buildTestBinaryManifest(t, versionCode, versionName)); err != nil {
+		t.Fatal(err)
+	}
+	if err := zw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return out.Bytes()
+}
+
+func buildTestBinaryManifest(t *testing.T, versionCode int64, versionName string) []byte {
+	t.Helper()
+	pool := buildTestAXMLStringPool(t, []string{
+		"manifest",
+		"http://schemas.android.com/apk/res/android",
+		"versionCode",
+		"versionName",
+		versionName,
+	})
+	start := buildTestAXMLManifestStart(t, versionCode)
+	total := 8 + len(pool) + len(start)
+	var out bytes.Buffer
+	writeTestChunkHeader(&out, 0x0003, 8, uint32(total))
+	out.Write(pool)
+	out.Write(start)
+	return out.Bytes()
+}
+
+func buildTestAXMLStringPool(t *testing.T, values []string) []byte {
+	t.Helper()
+	var data bytes.Buffer
+	offsets := make([]uint32, 0, len(values))
+	for _, value := range values {
+		if len(value) > 127 {
+			t.Fatalf("test string too long: %q", value)
+		}
+		offsets = append(offsets, uint32(data.Len()))
+		data.WriteByte(byte(len([]rune(value))))
+		data.WriteByte(byte(len(value)))
+		data.WriteString(value)
+		data.WriteByte(0)
+	}
+	for data.Len()%4 != 0 {
+		data.WriteByte(0)
+	}
+	headerSize := uint32(28)
+	stringsStart := headerSize + uint32(len(values))*4
+	chunkSize := stringsStart + uint32(data.Len())
+	var out bytes.Buffer
+	writeTestChunkHeader(&out, 0x0001, uint16(headerSize), chunkSize)
+	writeTestU32(&out, uint32(len(values)))
+	writeTestU32(&out, 0)
+	writeTestU32(&out, 0x00000100)
+	writeTestU32(&out, stringsStart)
+	writeTestU32(&out, 0)
+	for _, offset := range offsets {
+		writeTestU32(&out, offset)
+	}
+	out.Write(data.Bytes())
+	return out.Bytes()
+}
+
+func buildTestAXMLManifestStart(t *testing.T, versionCode int64) []byte {
+	t.Helper()
+	if versionCode <= 0 || versionCode > int64(^uint32(0)) {
+		t.Fatalf("bad version code: %d", versionCode)
+	}
+	const chunkSize = 36 + 20*2
+	var out bytes.Buffer
+	writeTestChunkHeader(&out, 0x0102, 36, chunkSize)
+	writeTestU32(&out, 1)
+	writeTestU32(&out, ^uint32(0))
+	writeTestU32(&out, ^uint32(0))
+	writeTestU32(&out, 0)
+	writeTestU16(&out, 20)
+	writeTestU16(&out, 20)
+	writeTestU16(&out, 2)
+	writeTestU16(&out, 0)
+	writeTestU16(&out, 0)
+	writeTestU16(&out, 0)
+	writeTestAXMLAttr(&out, 1, 2, ^uint32(0), 0x10, uint32(versionCode))
+	writeTestAXMLAttr(&out, 1, 3, 4, 0x03, 4)
+	return out.Bytes()
+}
+
+func writeTestAXMLAttr(out *bytes.Buffer, ns, name, rawValue uint32, dataType byte, data uint32) {
+	writeTestU32(out, ns)
+	writeTestU32(out, name)
+	writeTestU32(out, rawValue)
+	writeTestU16(out, 8)
+	out.WriteByte(0)
+	out.WriteByte(dataType)
+	writeTestU32(out, data)
+}
+
+func writeTestChunkHeader(out *bytes.Buffer, chunkType, headerSize uint16, chunkSize uint32) {
+	writeTestU16(out, chunkType)
+	writeTestU16(out, headerSize)
+	writeTestU32(out, chunkSize)
+}
+
+func writeTestU16(out *bytes.Buffer, value uint16) {
+	var raw [2]byte
+	binary.LittleEndian.PutUint16(raw[:], value)
+	out.Write(raw[:])
+}
+
+func writeTestU32(out *bytes.Buffer, value uint32) {
+	var raw [4]byte
+	binary.LittleEndian.PutUint32(raw[:], value)
+	out.Write(raw[:])
 }
 
 type fakeSigner struct{}

@@ -389,6 +389,7 @@ func runServe(cfg orchConfig) error {
 	mux.HandleFunc("/admin/v1/config/edit", s.handleAdminConfigEdit)
 	mux.HandleFunc("/admin/v1/apk/status", s.handleAdminAPKStatus)
 	mux.HandleFunc("/admin/v1/apk/download", s.handleAdminAPKDownload)
+	mux.HandleFunc("/admin/v1/apk/inspect", s.handleAdminAPKInspect)
 	mux.HandleFunc("/admin/v1/apk/draft", s.handleAdminAPKDraft)
 	mux.HandleFunc("/admin/v1/apk/publish", s.handleAdminAPKPublish)
 	mux.HandleFunc("/admin/v1/status", s.handleAdminStatus)
@@ -1730,6 +1731,7 @@ func (s *server) handleAdminPasswordChange(w http.ResponseWriter, r *http.Reques
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
+	log.Printf("admin password changed at=%s remote=%s", time.Now().UTC().Format(time.RFC3339), r.RemoteAddr)
 	s.adminSessions.Delete(token)
 	if approver := s.currentAuthApprover(); approver != nil && approver.enabled() {
 		approved, err := approver.requestLoginApproval(r.Context(), loginApprovalRequest{
@@ -2305,6 +2307,7 @@ func (s *server) handleAdminAPKStatus(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, map[string]any{
 		"ok":                       true,
 		"update_pubkey_configured": strings.TrimSpace(s.cfg.UpdatePublicKey) != "",
+		"server_update_key":        s.serverUpdateSigningAvailable(),
 		"next_seq":                 mustNextAPKSeq(s.store),
 		"release":                  optionalAPKRelease(rec, ok),
 	})
@@ -2342,6 +2345,51 @@ func (s *server) handleAdminAPKDownload(w http.ResponseWriter, r *http.Request) 
 	w.Header().Set("Content-Type", "application/vnd.android.package-archive")
 	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%q", name))
 	http.ServeContent(w, r, name, stat.ModTime(), file)
+}
+
+func (s *server) handleAdminAPKInspect(w http.ResponseWriter, r *http.Request) {
+	if !s.requireAdmin(w, r) {
+		return
+	}
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if err := r.ParseMultipartForm(160 << 20); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	apkFile, apkHeader, err := r.FormFile("apk")
+	if err != nil {
+		http.Error(w, "apk file is required", http.StatusBadRequest)
+		return
+	}
+	defer apkFile.Close()
+	sha, size, err := hashMultipartFile(apkFile)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	version, versionErr := inspectAPKVersion(apkFile, size)
+	if _, err := apkFile.Seek(0, io.SeekStart); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	resp := map[string]any{
+		"ok":         true,
+		"apk_name":   safeAPKName(apkHeader.Filename, version.VersionCode),
+		"apk_sha256": sha,
+		"apk_size":   size,
+	}
+	if versionErr != nil {
+		resp["version_detected"] = false
+		resp["version_error"] = versionErr.Error()
+	} else {
+		resp["version_detected"] = true
+		resp["version_code"] = version.VersionCode
+		resp["version_name"] = version.VersionName
+	}
+	writeJSON(w, resp)
 }
 
 func (s *server) handleAdminAPKDraft(w http.ResponseWriter, r *http.Request) {
@@ -2406,22 +2454,77 @@ func (s *server) handleAdminAPKPublish(w http.ResponseWriter, r *http.Request) {
 	}
 	manifestJSON := strings.TrimSpace(r.FormValue("manifest_json"))
 	minisig := strings.TrimSpace(r.FormValue("manifest_minisig"))
-	if manifestJSON == "" || minisig == "" {
-		http.Error(w, "manifest_json and manifest_minisig are required", http.StatusBadRequest)
-		return
-	}
 	apkFile, apkHeader, err := r.FormFile("apk")
 	if err != nil {
 		http.Error(w, "apk file is required", http.StatusBadRequest)
 		return
 	}
 	defer apkFile.Close()
-	manifest, err := parseAPKManifest(manifestJSON)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
-		return
+	serverSigned := false
+	var manifest apkReleaseRecord
+	if manifestJSON == "" && minisig == "" {
+		priv, pubText, err := s.loadServerUpdateSigningKey()
+		if err != nil {
+			http.Error(w, "server update signing key unavailable: "+err.Error(), http.StatusBadRequest)
+			return
+		}
+		sha, size, err := hashMultipartFile(apkFile)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		version, versionErr := inspectAPKVersion(apkFile, size)
+		if _, err := apkFile.Seek(0, io.SeekStart); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		if parsed := parseFormInt64(r, "version_code"); parsed > 0 {
+			version.VersionCode = parsed
+		}
+		if value := strings.TrimSpace(r.FormValue("version_name")); value != "" {
+			version.VersionName = value
+		}
+		if versionErr != nil && (version.VersionCode <= 0 || strings.TrimSpace(version.VersionName) == "") {
+			http.Error(w, "could not read APK version; fill version_code and version_name manually: "+versionErr.Error(), http.StatusBadRequest)
+			return
+		}
+		seq, err := s.store.nextAPKSeq()
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		manifestJSON, err = buildAPKManifest(apkManifestInput{
+			Seq:         seq,
+			VersionCode: version.VersionCode,
+			VersionName: version.VersionName,
+			APKSHA256:   sha,
+			APKSize:     size,
+			APKName:     firstNotBlank(r.FormValue("apk_name"), apkHeader.Filename),
+			MinVersion:  parseFormInt64(r, "min_version"),
+			Notes:       r.FormValue("notes"),
+		})
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		minisig = string(minisign.Sign(priv, []byte(manifestJSON)))
+		if err := verifyManifestSignature(manifestJSON, minisig, pubText); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		serverSigned = true
+	} else {
+		if manifestJSON == "" || minisig == "" {
+			http.Error(w, "manifest_json and manifest_minisig are required for offline signing", http.StatusBadRequest)
+			return
+		}
+		if err := verifyManifestSignature(manifestJSON, minisig, s.cfg.UpdatePublicKey); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
 	}
-	if err := verifyManifestSignature(manifestJSON, minisig, s.cfg.UpdatePublicKey); err != nil {
+	manifest, err = parseAPKManifest(manifestJSON)
+	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
@@ -2430,6 +2533,7 @@ func (s *server) handleAdminAPKPublish(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
+	log.Printf("published APK update seq=%d version=%s(%d) sha256=%s server_signed=%t", release.Seq, release.VersionName, release.VersionCode, release.APKSHA256, serverSigned)
 	writeJSON(w, map[string]any{"ok": true, "release": release})
 }
 
@@ -2900,6 +3004,60 @@ func verifyManifestSignature(manifestJSON, minisigText, publicKey string) error 
 		return errors.New("update manifest signature invalid")
 	}
 	return nil
+}
+
+func (s *server) serverUpdateSigningAvailable() bool {
+	_, _, err := s.loadServerUpdateSigningKey()
+	return err == nil
+}
+
+func (s *server) loadServerUpdateSigningKey() (minisign.PrivateKey, string, error) {
+	raw, err := os.ReadFile(filepath.Join(s.cfg.StateDir, "update.key"))
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return minisign.PrivateKey{}, "", errors.New("update.key is not present")
+		}
+		return minisign.PrivateKey{}, "", err
+	}
+	var priv minisign.PrivateKey
+	if err := priv.UnmarshalText(raw); err != nil {
+		return minisign.PrivateKey{}, "", fmt.Errorf("invalid update key: %w", err)
+	}
+	pubText, err := updatePublicKeyText(priv)
+	if err != nil {
+		return minisign.PrivateKey{}, "", err
+	}
+	if configured := strings.TrimSpace(s.cfg.UpdatePublicKey); configured != "" && configured != strings.TrimSpace(pubText) {
+		return minisign.PrivateKey{}, "", errors.New("update.key does not match ORCH_UPDATE_PUBKEY")
+	}
+	return priv, strings.TrimSpace(pubText), nil
+}
+
+func hashMultipartFile(file multipart.File) (string, int64, error) {
+	if _, err := file.Seek(0, io.SeekStart); err != nil {
+		return "", 0, err
+	}
+	digest := sha256.New()
+	size, err := io.Copy(digest, file)
+	if err != nil {
+		return "", 0, err
+	}
+	if _, err := file.Seek(0, io.SeekStart); err != nil {
+		return "", 0, err
+	}
+	return hex.EncodeToString(digest.Sum(nil)), size, nil
+}
+
+func parseFormInt64(r *http.Request, key string) int64 {
+	value := strings.TrimSpace(r.FormValue(key))
+	if value == "" {
+		return 0
+	}
+	parsed, err := strconv.ParseInt(value, 10, 64)
+	if err != nil {
+		return 0
+	}
+	return parsed
 }
 
 func (s *server) storeAPKRelease(manifest apkReleaseRecord, manifestJSON, minisig string, apk multipart.File, _ *multipart.FileHeader) (apkReleaseRecord, error) {
