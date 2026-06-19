@@ -685,6 +685,32 @@ func (s *orchStore) revokeDevice(id string) error {
 	})
 }
 
+func (s *orchStore) deleteDevice(id string) error {
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return errors.New("device id is required")
+	}
+	return s.db.Update(func(tx *bolt.Tx) error {
+		db := tx.Bucket(bucketDevices)
+		raw := db.Get([]byte(id))
+		if raw == nil {
+			return errors.New("device not found")
+		}
+		var rec deviceRecord
+		if err := s.openJSON(raw, &rec); err != nil {
+			return err
+		}
+		needsRevoke := rec.Status != "revoked"
+		if err := db.Delete([]byte(rec.ID)); err != nil {
+			return err
+		}
+		if needsRevoke {
+			return s.bumpWorkerSeqsTx(tx)
+		}
+		return nil
+	})
+}
+
 func (s *orchStore) upsertPendingWorker(staticPub string, self map[string]any) (workerRecord, error) {
 	id := workerID(staticPub)
 	var rec workerRecord

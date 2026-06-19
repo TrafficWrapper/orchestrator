@@ -46,17 +46,21 @@ type webPageData struct {
 }
 
 type webWorker struct {
-	ID         string
-	Status     string
-	Enabled    bool
-	LastSeen   string
-	DesiredSeq int64
-	AppliedSeq int64
-	Egress     string
-	Priority   int
-	Weight     int
-	Reality    bool
-	AWG        bool
+	ID             string
+	Status         string
+	Enabled        bool
+	LastSeen       string
+	DesiredSeq     int64
+	AppliedSeq     int64
+	ConfigSyncOK   bool
+	ConfigSyncText string
+	APKSyncState   string
+	APKSyncText    string
+	Egress         string
+	Priority       int
+	Weight         int
+	Reality        bool
+	AWG            bool
 }
 
 type webDevice struct {
@@ -231,6 +235,10 @@ func (s *server) webData(templateName, title, path string, session adminSession)
 	if err != nil {
 		return webPageData{}, err
 	}
+	apkRelease, apkPublished, err := s.store.currentAPKRelease()
+	if err != nil {
+		return webPageData{}, err
+	}
 	sort.Slice(workers, func(i, j int) bool { return workers[i].ID < workers[j].ID })
 	sort.Slice(devices, func(i, j int) bool { return devices[i].CreatedAt.After(devices[j].CreatedAt) })
 
@@ -254,18 +262,23 @@ func (s *server) webData(templateName, title, path string, session adminSession)
 	}
 	for _, worker := range workers {
 		item := webWorker{
-			ID:         worker.ID,
-			Status:     worker.Status,
-			Enabled:    !worker.Disabled,
-			LastSeen:   formatOptionalTime(worker.LastAckAt),
-			DesiredSeq: worker.DesiredSeq,
-			AppliedSeq: worker.AppliedSeq,
-			Egress:     firstNotBlank(worker.EgressIPObserved, worker.EgressIPProbe),
-			Priority:   effectiveWorkerPriority(worker),
-			Weight:     effectiveWorkerWeight(worker),
-			Reality:    workerProtocolEnabled(worker, "reality"),
-			AWG:        workerProtocolEnabled(worker, "awg"),
+			ID:             worker.ID,
+			Status:         worker.Status,
+			Enabled:        !worker.Disabled,
+			LastSeen:       formatOptionalTime(worker.LastAckAt),
+			DesiredSeq:     worker.DesiredSeq,
+			AppliedSeq:     worker.AppliedSeq,
+			ConfigSyncOK:   worker.AppliedSeq == worker.DesiredSeq,
+			ConfigSyncText: configSyncText(worker),
+			APKSyncState:   "unknown",
+			APKSyncText:    apkSyncText(worker, apkRelease, apkPublished),
+			Egress:         firstNotBlank(worker.EgressIPObserved, worker.EgressIPProbe),
+			Priority:       effectiveWorkerPriority(worker),
+			Weight:         effectiveWorkerWeight(worker),
+			Reality:        workerProtocolEnabled(worker, "reality"),
+			AWG:            workerProtocolEnabled(worker, "awg"),
 		}
+		item.APKSyncState = apkSyncState(worker, apkRelease, apkPublished)
 		if item.Enabled && item.Status == "active" {
 			page.WorkerActive++
 		}
@@ -319,6 +332,56 @@ func webConfigSeq(workers []workerRecord) int64 {
 		}
 	}
 	return seq
+}
+
+func configSyncText(worker workerRecord) string {
+	if worker.AppliedSeq == worker.DesiredSeq {
+		return "конфиг актуален"
+	}
+	return "отстаёт (applied " + strconv.FormatInt(worker.AppliedSeq, 10) + " / desired " + strconv.FormatInt(worker.DesiredSeq, 10) + ")"
+}
+
+func apkSyncState(worker workerRecord, release apkReleaseRecord, published bool) string {
+	if !published {
+		return "unknown"
+	}
+	apk, ok := worker.SelfDescribe["distributed_apk"].(map[string]any)
+	if !ok || len(apk) == 0 {
+		return "unknown"
+	}
+	sha := stringFromMap(apk, "apk_sha256")
+	versionCode := int64FromAny(apk["version_code"])
+	if sha != "" {
+		if strings.EqualFold(sha, release.APKSHA256) {
+			return "ok"
+		}
+		return "lag"
+	}
+	if versionCode > 0 && versionCode == release.VersionCode {
+		return "ok"
+	}
+	return "lag"
+}
+
+func apkSyncText(worker workerRecord, release apkReleaseRecord, published bool) string {
+	if !published {
+		return "нет published APK"
+	}
+	apk, ok := worker.SelfDescribe["distributed_apk"].(map[string]any)
+	if !ok || len(apk) == 0 {
+		return "нет данных"
+	}
+	versionCode := int64FromAny(apk["version_code"])
+	if apkSyncState(worker, release, published) == "ok" {
+		return "APK актуален"
+	}
+	if sha := stringFromMap(apk, "apk_sha256"); sha != "" {
+		return "отстаёт (worker sha " + shortString(sha, 12) + " / published " + shortString(release.APKSHA256, 12) + ")"
+	}
+	if versionCode > 0 {
+		return "отстаёт (worker v" + strconv.FormatInt(versionCode, 10) + " / published v" + strconv.FormatInt(release.VersionCode, 10) + ")"
+	}
+	return "отстаёт"
 }
 
 func firstNotBlank(values ...string) string {

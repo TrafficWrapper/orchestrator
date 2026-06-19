@@ -194,6 +194,12 @@
     function revokeDevice(id) {
       postJSON('/admin/v1/revoke-device', {id}, 'Отозвать устройство ' + id + '? Доступ будет удалён у workers.');
     }
+    function deleteDevice(id, status) {
+      const text = status === 'revoked'
+        ? 'Удалить запись устройства ' + id + ' безвозвратно?'
+        : 'Отозвать доступ и удалить запись устройства ' + id + ' безвозвратно?';
+      postJSON('/admin/v1/delete-device', {id}, text);
+    }
     function toggleBootstrapForm() {
       const form = document.getElementById('bootstrap-form');
       if (!form) return;
@@ -286,6 +292,15 @@
         document.execCommand('copy');
       }
     }
+    function escapeHTML(value) {
+      return String(value || '').replace(/[&<>"']/g, ch => ({
+        '&': '&amp;',
+        '<': '&lt;',
+        '>': '&gt;',
+        '"': '&quot;',
+        "'": '&#39;'
+      }[ch]));
+    }
     function downloadBootstrapJSON() {
       const text = document.getElementById('bootstrap-json').value;
       if (!text) return;
@@ -359,13 +374,44 @@
       if (!response.ok) { alert(await response.text()); return; }
       window.location.reload();
     }
+    async function loadApkStatus() {
+      const box = document.getElementById('apk-current-release');
+      if (!box) return;
+      const response = await fetch('/admin/v1/apk/status', {credentials: 'same-origin'});
+      if (!response.ok) {
+        box.className = 'notice error';
+        box.style.display = 'block';
+        box.textContent = await response.text();
+        return;
+      }
+      const status = await response.json();
+      const release = status.release;
+      box.style.display = 'block';
+      if (!release) {
+        box.className = 'notice';
+        box.textContent = 'APK ещё не опубликован. Следующий seq: ' + status.next_seq + '.';
+        return;
+      }
+      box.className = 'notice';
+      const name = escapeHTML(release.apk_name || 'APK');
+      const version = escapeHTML(release.version_name || '-') + ' (' + escapeHTML(release.version_code) + ')';
+      const created = escapeHTML(release.created_at || '-');
+      box.innerHTML = '<b>Опубликован APK:</b> ' + version +
+        '<br>seq ' + escapeHTML(release.seq) + ' · ' + name +
+        '<br><code>' + escapeHTML(release.apk_sha256) + '</code>' +
+        '<br><span class="muted">' + created + '</span>' +
+        '<div class="actions" style="margin-top:10px"><a class="button secondary" href="/admin/v1/apk/download">Скачать APK</a></div>';
+    }
     function saveBotSettings(event) {
       event.preventDefault();
       const token = document.getElementById('bot-token').value;
       const owner_id = Number(document.getElementById('bot-owner-id').value);
       postJSON('/admin/v1/bot/set-token', {token, owner_id}, '');
     }
-    document.addEventListener('DOMContentLoaded', () => setBootstrapExpiryPreset('30'));
+    document.addEventListener('DOMContentLoaded', () => {
+      setBootstrapExpiryPreset('30');
+      loadApkStatus();
+    });
   </script>
 </body>
 </html>
@@ -419,13 +465,19 @@
 {{define "workers"}}
 <h1>Workers</h1>
 <table>
-  <thead><tr><th>ID</th><th>Статус</th><th>Seq</th><th>Egress</th><th>Policy</th><th>Протоколы</th><th>Действия</th></tr></thead>
+  <thead><tr><th>ID</th><th>Статус</th><th>Config sync</th><th>APK sync</th><th>Egress</th><th>Policy</th><th>Протоколы</th><th>Действия</th></tr></thead>
   <tbody>
   {{range .Workers}}
     <tr>
       <td><code>{{short .ID 12}}</code><br><span class="muted">{{dash .LastSeen}}</span></td>
       <td>{{if .Enabled}}<span class="ok">enabled</span>{{else}}<span class="bad">disabled</span>{{end}}<br><span class="muted">{{.Status}}</span></td>
-      <td>{{.AppliedSeq}} / {{.DesiredSeq}}</td>
+      <td>
+        {{if .ConfigSyncOK}}<span class="ok">{{.ConfigSyncText}}</span>{{else}}<span class="bad">{{.ConfigSyncText}}</span>{{end}}<br>
+        <span class="muted">last ack: {{dash .LastSeen}}</span>
+      </td>
+      <td>
+        {{if eq .APKSyncState "ok"}}<span class="ok">{{.APKSyncText}}</span>{{else if eq .APKSyncState "lag"}}<span class="bad">{{.APKSyncText}}</span>{{else}}<span class="muted">{{.APKSyncText}}</span>{{end}}
+      </td>
       <td>{{dash .Egress}}</td>
       <td>priority {{.Priority}}<br>weight {{.Weight}}</td>
       <td>
@@ -441,7 +493,7 @@
       </td>
     </tr>
   {{else}}
-    <tr><td colspan="7" class="muted">Workers пока нет.</td></tr>
+    <tr><td colspan="8" class="muted">Workers пока нет.</td></tr>
   {{end}}
   </tbody>
 </table>
@@ -533,7 +585,15 @@
       </td>
       <td>{{dash .InternalIP}}</td>
       <td>{{dash .EnrolledAt}}</td>
-      <td>{{if ne .Status "revoked"}}<button class="danger" onclick="revokeDevice('{{.ID}}')">Отозвать</button>{{else}}<span class="muted">отозвано</span>{{end}}</td>
+      <td class="actions">
+        {{if ne .Status "revoked"}}
+          <button class="danger" onclick="revokeDevice('{{.ID}}')">Отозвать</button>
+          <button class="secondary" onclick="deleteDevice('{{.ID}}','{{.Status}}')">Удалить</button>
+        {{else}}
+          <span class="muted">отозвано</span>
+          <button class="secondary" onclick="deleteDevice('{{.ID}}','{{.Status}}')">Удалить</button>
+        {{end}}
+      </td>
     </tr>
   {{else}}
     <tr><td colspan="8" class="muted">Устройств пока нет.</td></tr>
@@ -574,6 +634,7 @@
 <section class="panel" style="margin-top:16px">
   <h2>Публикация APK</h2>
   <p class="muted">ORCH не подписывает APK и не держит APK-signing key. Загрузите уже подписанный APK, сформируйте manifest, подпишите manifest offline update-ключом и вставьте minisig.</p>
+  <div id="apk-current-release" class="notice"></div>
   <div class="grid">
     <label>APK <input id="apk-file" type="file" accept=".apk"></label>
     <label>version code <input id="apk-version-code" type="number" min="1"></label>

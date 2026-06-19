@@ -379,6 +379,7 @@ func runServe(cfg orchConfig) error {
 	mux.HandleFunc("/admin/v1/bootstrap-token/qr", s.handleAdminBootstrapTokenQR)
 	mux.HandleFunc("/admin/v1/approve-worker", s.handleAdminApproveWorker)
 	mux.HandleFunc("/admin/v1/revoke-device", s.handleAdminRevokeDevice)
+	mux.HandleFunc("/admin/v1/delete-device", s.handleAdminDeleteDevice)
 	mux.HandleFunc("/admin/v1/workers", s.handleAdminWorkers)
 	mux.HandleFunc("/admin/v1/workers/set-enabled", s.handleAdminWorkerSetEnabled)
 	mux.HandleFunc("/admin/v1/workers/protocol", s.handleAdminWorkerProtocol)
@@ -386,6 +387,7 @@ func runServe(cfg orchConfig) error {
 	mux.HandleFunc("/admin/v1/config", s.handleAdminConfig)
 	mux.HandleFunc("/admin/v1/config/edit", s.handleAdminConfigEdit)
 	mux.HandleFunc("/admin/v1/apk/status", s.handleAdminAPKStatus)
+	mux.HandleFunc("/admin/v1/apk/download", s.handleAdminAPKDownload)
 	mux.HandleFunc("/admin/v1/apk/draft", s.handleAdminAPKDraft)
 	mux.HandleFunc("/admin/v1/apk/publish", s.handleAdminAPKPublish)
 	mux.HandleFunc("/admin/v1/status", s.handleAdminStatus)
@@ -2052,6 +2054,28 @@ func (s *server) handleAdminRevokeDevice(w http.ResponseWriter, r *http.Request)
 	fmt.Fprintf(w, "device_revoked id=%s\n", req.ID)
 }
 
+func (s *server) handleAdminDeleteDevice(w http.ResponseWriter, r *http.Request) {
+	if !s.requireAdmin(w, r) {
+		return
+	}
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var req struct {
+		ID string `json:"id"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	if err := s.store.deleteDevice(req.ID); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	fmt.Fprintf(w, "device_deleted id=%s\n", req.ID)
+}
+
 func (s *server) handleAdminWorkers(w http.ResponseWriter, r *http.Request) {
 	if !s.requireAdmin(w, r) {
 		return
@@ -2258,6 +2282,40 @@ func (s *server) handleAdminAPKStatus(w http.ResponseWriter, r *http.Request) {
 		"next_seq":                 mustNextAPKSeq(s.store),
 		"release":                  optionalAPKRelease(rec, ok),
 	})
+}
+
+func (s *server) handleAdminAPKDownload(w http.ResponseWriter, r *http.Request) {
+	if !s.requireAdmin(w, r) {
+		return
+	}
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	rec, ok, err := s.store.currentAPKRelease()
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	if !ok || strings.TrimSpace(rec.APKPath) == "" {
+		http.Error(w, "apk release is not published", http.StatusNotFound)
+		return
+	}
+	file, err := os.Open(rec.APKPath)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusNotFound)
+		return
+	}
+	defer file.Close()
+	stat, err := file.Stat()
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	name := fmt.Sprintf("TrafficWrapper-%d.apk", rec.VersionCode)
+	w.Header().Set("Content-Type", "application/vnd.android.package-archive")
+	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%q", name))
+	http.ServeContent(w, r, name, stat.ModTime(), file)
 }
 
 func (s *server) handleAdminAPKDraft(w http.ResponseWriter, r *http.Request) {

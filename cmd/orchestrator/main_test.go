@@ -147,6 +147,98 @@ func TestDeviceEnrollConsumesBootstrapOnceAndReturnsClientConfig(t *testing.T) {
 	}
 }
 
+func TestAdminDeleteDeviceRequiresCSRFAndPurgesActiveDevice(t *testing.T) {
+	s := newTestServer(t)
+	addApprovedWorker(t, s)
+	if err := s.store.setAdminPassword("owner-secret"); err != nil {
+		t.Fatal(err)
+	}
+	secret := "delete-device-bootstrap-secret"
+	if _, err := s.store.createBootstrapToken(
+		secret,
+		time.Now().Add(time.Hour),
+		json.RawMessage(`{"devices":1}`),
+		[]string{"https://worker.example/tw"},
+	); err != nil {
+		t.Fatal(err)
+	}
+	enroll := enrollDeviceForTest(t, s, secret)
+	if !enroll.OK {
+		t.Fatalf("enroll failed: %s", enroll.Error)
+	}
+	workers, err := s.store.workers()
+	if err != nil {
+		t.Fatal(err)
+	}
+	beforeSeq := workers[0].DesiredSeq
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/admin/v1/login", s.handleAdminLogin)
+	mux.HandleFunc("/admin/v1/delete-device", s.handleAdminDeleteDevice)
+	ts := httptest.NewServer(mux)
+	defer ts.Close()
+
+	rawLogin, _ := json.Marshal(map[string]string{"secret": "owner-secret"})
+	loginReq, _ := http.NewRequest(http.MethodPost, ts.URL+"/admin/v1/login", bytes.NewReader(rawLogin))
+	loginReq.Header.Set("content-type", "application/json")
+	loginResp, err := http.DefaultClient.Do(loginReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	loginBody, _ := io.ReadAll(io.LimitReader(loginResp.Body, 1<<20))
+	_ = loginResp.Body.Close()
+	var login struct {
+		CSRFToken string `json:"csrf_token"`
+	}
+	if loginResp.StatusCode != http.StatusOK || len(loginResp.Cookies()) == 0 {
+		t.Fatalf("login status=%d body=%s cookies=%d", loginResp.StatusCode, string(loginBody), len(loginResp.Cookies()))
+	}
+	if err := json.Unmarshal(loginBody, &login); err != nil {
+		t.Fatal(err)
+	}
+	cookie := loginResp.Cookies()[0]
+
+	rawDelete, _ := json.Marshal(map[string]string{"id": enroll.DeviceID})
+	noCSRFReq, _ := http.NewRequest(http.MethodPost, ts.URL+"/admin/v1/delete-device", bytes.NewReader(rawDelete))
+	noCSRFReq.Header.Set("content-type", "application/json")
+	noCSRFReq.AddCookie(cookie)
+	noCSRFResp, err := http.DefaultClient.Do(noCSRFReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = noCSRFResp.Body.Close()
+	if noCSRFResp.StatusCode != http.StatusForbidden {
+		t.Fatalf("delete without csrf status=%d", noCSRFResp.StatusCode)
+	}
+	if _, err := s.store.device(enroll.DeviceID); err != nil {
+		t.Fatalf("device deleted without csrf: %v", err)
+	}
+
+	deleteReq, _ := http.NewRequest(http.MethodPost, ts.URL+"/admin/v1/delete-device", bytes.NewReader(rawDelete))
+	deleteReq.Header.Set("content-type", "application/json")
+	deleteReq.Header.Set("x-csrf-token", login.CSRFToken)
+	deleteReq.AddCookie(cookie)
+	deleteResp, err := http.DefaultClient.Do(deleteReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	deleteBody, _ := io.ReadAll(io.LimitReader(deleteResp.Body, 1<<20))
+	_ = deleteResp.Body.Close()
+	if deleteResp.StatusCode != http.StatusOK {
+		t.Fatalf("delete status=%d body=%s", deleteResp.StatusCode, string(deleteBody))
+	}
+	if _, err := s.store.device(enroll.DeviceID); err == nil {
+		t.Fatalf("device still exists after delete")
+	}
+	workers, err = s.store.workers()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if workers[0].DesiredSeq <= beforeSeq {
+		t.Fatalf("worker seq was not bumped before active delete: before=%d after=%d", beforeSeq, workers[0].DesiredSeq)
+	}
+}
+
 func TestDeviceEnrollHTTPNoiseEndToEnd(t *testing.T) {
 	s := newTestServer(t)
 	static, err := protocol.GenerateKeypair()
@@ -850,6 +942,74 @@ func TestAdminAPKPublishStoresArtifactAndRejectsRollback(t *testing.T) {
 	badSig := postAPKPublishStatusForTest(t, ts.URL+"/admin/v1/apk/publish", login.SessionToken, apk, badManifest, "bad-signature")
 	if badSig < 400 {
 		t.Fatalf("bad signature publish accepted: status=%d", badSig)
+	}
+}
+
+func TestAdminAPKDownloadRequiresAuthAndServesCurrentRelease(t *testing.T) {
+	s := newTestServer(t)
+	if err := s.store.setAdminPassword("owner-secret"); err != nil {
+		t.Fatal(err)
+	}
+	mux := http.NewServeMux()
+	mux.HandleFunc("/admin/v1/login", s.handleAdminLogin)
+	mux.HandleFunc("/admin/v1/apk/download", s.handleAdminAPKDownload)
+	ts := httptest.NewServer(mux)
+	defer ts.Close()
+
+	noAuthResp, err := http.Get(ts.URL + "/admin/v1/apk/download")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = noAuthResp.Body.Close()
+	if noAuthResp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("download without auth status=%d", noAuthResp.StatusCode)
+	}
+
+	var login struct {
+		SessionToken string `json:"session_token"`
+	}
+	postJSONForTest(t, ts.URL+"/admin/v1/login", map[string]string{"secret": "owner-secret"}, &login)
+	missingReq, _ := http.NewRequest(http.MethodGet, ts.URL+"/admin/v1/apk/download", nil)
+	missingReq.Header.Set("authorization", "Bearer "+login.SessionToken)
+	missingResp, err := http.DefaultClient.Do(missingReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = missingResp.Body.Close()
+	if missingResp.StatusCode != http.StatusNotFound {
+		t.Fatalf("download without release status=%d", missingResp.StatusCode)
+	}
+
+	apkPath := filepath.Join(s.cfg.StateDir, "published.apk")
+	apk := []byte("published apk bytes")
+	if err := os.WriteFile(apkPath, apk, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.store.setAPKRelease(apkReleaseRecord{
+		Seq:         1,
+		VersionCode: 1002,
+		VersionName: "public-1.0.1",
+		APKName:     "app-public-1002.apk",
+		APKSHA256:   sha256HexBytes(apk),
+		APKSize:     int64(len(apk)),
+		APKPath:     apkPath,
+		CreatedAt:   time.Now().UTC(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	downloadReq, _ := http.NewRequest(http.MethodGet, ts.URL+"/admin/v1/apk/download", nil)
+	downloadReq.Header.Set("authorization", "Bearer "+login.SessionToken)
+	downloadResp, err := http.DefaultClient.Do(downloadReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	downloadBody, _ := io.ReadAll(io.LimitReader(downloadResp.Body, 1<<20))
+	_ = downloadResp.Body.Close()
+	if downloadResp.StatusCode != http.StatusOK || string(downloadBody) != string(apk) {
+		t.Fatalf("bad download status=%d body=%q", downloadResp.StatusCode, string(downloadBody))
+	}
+	if got := downloadResp.Header.Get("content-disposition"); !strings.Contains(got, "TrafficWrapper-1002.apk") {
+		t.Fatalf("bad content-disposition: %q", got)
 	}
 }
 
