@@ -4,9 +4,16 @@
 
 [Русский](README.ru.md)
 
-Control plane for the TrafficWrapper platform. It approves workers, enrolls
-devices, signs client configuration, hosts the owner admin UI, stores APK update
-artifacts, and optionally runs an owner-only Telegram admin bot.
+TrafficWrapper is an open-source self-hosted private transport platform for
+small operator deployments and anti-censorship transport research. It separates
+the control plane, worker data plane, and Android client so the operator owns
+deployment keys, worker endpoints, bootstrap payloads, and update policy.
+
+This repository is the control plane. It approves workers, enrolls devices,
+signs client configuration, hosts the owner admin UI, stores APK update
+artifacts, and optionally runs an owner-only Telegram admin bot. The Android app
+is not an Android VPN; it exposes a local SOCKS front-end and uses signed
+deployment config to select user-space transports.
 
 TrafficWrapper is split into three repositories:
 
@@ -24,6 +31,50 @@ Operational and contributor guides: [FAQ.md](FAQ.md),
 [TROUBLESHOOTING.md](TROUBLESHOOTING.md), and [RUNBOOK.md](RUNBOOK.md).
 Local development stand notes live in the organization
 [CONTRIBUTING.md](https://github.com/TrafficWrapper/.github/blob/main/CONTRIBUTING.md#local-development-stand).
+
+## Project Shape
+
+This table is an orientation aid for operators, not a ranking. Other projects
+cover different deployment models and change over time; check their upstream
+documentation before making an operational choice.
+
+| Project | Model | Transport / mimicry | Client mode | Key ownership | Update / config distribution | Reproducible build | License |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| TrafficWrapper | Self-hosted control plane + worker data plane + Android client | REALITY and AmneziaWG routes from signed config | Local SOCKS front-end; not Android `VpnService` | Operator-owned config, update, APK, Noise, and worker keys | Signed client config and APK artifacts distributed through `/tw/` inside the tunnel | Documented source build plus `app/build/verify-release.sh` | MIT |
+| Amnezia | Self-hosted VPN/client tooling | Varies by deployment; includes AmneziaWG-oriented workflows | Usually VPN-style clients | Operator/server owner, depending on setup | Varies | See upstream | See upstream |
+| Marzban | Self-hosted proxy management panel | Varies; commonly Xray-profile based | Depends on external clients | Operator controls panel/server keys | Varies | See upstream | See upstream |
+| 3x-ui / Hiddify | Self-hosted proxy panels | Varies by panel/profile | Depends on external clients | Operator controls panel/server keys | Varies | See upstream | See upstream |
+| Outline | Self-hosted access server + client ecosystem | Shadowsocks-oriented access model | Usually VPN-style client apps | Operator controls server access keys | Varies | See upstream | See upstream |
+
+## Quickstart (5 Minutes)
+
+This is the shortest path to a local development stand. The full
+[end-to-end flow](#start-here-end-to-end-flow) below and the organization
+[Local development stand](https://github.com/TrafficWrapper/.github/blob/main/CONTRIBUTING.md#local-development-stand)
+section explain each step and production differences.
+
+1. Start the orchestrator:
+
+   ```sh
+   git clone https://github.com/TrafficWrapper/orchestrator.git
+   cd orchestrator
+   cp .env.example .env
+   docker compose up -d --build signer orchestrator
+   docker compose logs orchestrator | grep -i 'initial admin password'
+   docker compose exec -T orchestrator orchestrator public-key
+   ```
+
+2. Open `https://127.0.0.1:9091`, change the initial admin password, and create
+   a worker enrollment token in the admin UI.
+3. Start a worker from the worker repository with
+   `ORCH_URL=https://host.docker.internal:9091`,
+   `ORCH_STATIC_PUBLIC_KEY=<public-key>`, `ENROLL_TOKEN=<token>`,
+   `ORCH_INSECURE_TLS=1` for this self-signed dev stand, and a real
+   `CAMOUFLAGE_DOMAIN`.
+4. Approve the pending worker in the admin UI.
+5. Open **Devices** -> **+ New device**, create a one-time bootstrap, install
+   the APK from the app release channel or your own build, import the bootstrap,
+   confirm it, and connect.
 
 ## Start Here: End-to-End Flow
 
@@ -198,8 +249,11 @@ There are two supported ways to publish an Android app update through the
 platform:
 
 - **Web admin UI:** open the admin UI, upload a signed APK and the signed update
-  manifest. The APK signing key stays outside the orchestrator; the orchestrator
-  stores and distributes the already signed artifacts.
+  manifest. If `orch-state/update.key` is present and matches the configured
+  update public key, the UI can build and minisign the manifest automatically.
+  For higher key isolation, keep the update key offline, use the UI to draft the
+  manifest, sign it externally, and paste the minisig. The APK signing key stays
+  outside the orchestrator in both modes.
 - **Seed on first run:** put an APK at `seed/app.apk` before the first start.
   The orchestrator generates its own update minisign key in local state, signs
   a manifest for that APK, and publishes it as `seq=1`. This is for a demo or
@@ -210,6 +264,17 @@ A ready-to-install public APK is available from the app repository release
 channel: <https://github.com/TrafficWrapper/app/releases/latest>. Treat the app
 README and the release assets as the source of truth for the current APK file
 name, version code, SHA-256, and signing certificate fingerprint.
+
+## Verifying the APK Build
+
+The app repository contains the minimal verifier:
+[`build/verify-release.sh`](https://github.com/TrafficWrapper/app/blob/master/build/verify-release.sh).
+Use it to check a downloaded APK SHA-256, APK signing certificate SHA-256,
+optional minisign update manifest, and optional rebuild from a git tag. The
+current public APK hash and certificate fingerprint are documented in the
+[app README](https://github.com/TrafficWrapper/app#prebuilt-apk). Byte-for-byte
+APK reproduction requires the same signing keystore and build inputs; operators
+using their own keystore can verify their own channel the same way.
 
 ## Telegram Bot
 

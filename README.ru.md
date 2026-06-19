@@ -4,9 +4,16 @@
 
 [English](README.md)
 
-Control plane платформы TrafficWrapper. Orchestrator approve'ит workers,
-enroll'ит устройства, подписывает client-config, отдаёт web-админку владельца,
-хранит APK update artifacts и опционально запускает owner-only Telegram-бота.
+TrafficWrapper — open-source self-hosted платформа private transport для
+небольших operator deployments и anti-censorship transport research. Она
+разделяет control plane, worker data plane и Android client, чтобы operator
+владел deployment keys, worker endpoints, bootstrap payloads и update policy.
+
+Этот репозиторий — control plane. Orchestrator approve'ит workers, enroll'ит
+устройства, подписывает client-config, отдаёт web-админку владельца, хранит APK
+update artifacts и опционально запускает owner-only Telegram-бота. Android app
+не является Android VPN: она поднимает local SOCKS front-end и использует signed
+deployment config для выбора user-space transports.
 
 TrafficWrapper разделён на три репозитория:
 
@@ -24,6 +31,50 @@ TrafficWrapper разделён на три репозитория:
 [TROUBLESHOOTING.ru.md](TROUBLESHOOTING.ru.md) и [RUNBOOK.ru.md](RUNBOOK.ru.md).
 Заметки по local development stand находятся в organization
 [CONTRIBUTING.ru.md](https://github.com/TrafficWrapper/.github/blob/main/CONTRIBUTING.ru.md#local-development-stand).
+
+## Форма проекта
+
+Эта таблица — ориентир для operators, а не ranking. Другие проекты закрывают
+другие deployment models и меняются со временем; перед operational choice
+сверяйтесь с их upstream документацией.
+
+| Проект | Модель | Transport / mimicry | Client mode | Key ownership | Update / config distribution | Reproducible build | License |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| TrafficWrapper | Self-hosted control plane + worker data plane + Android client | REALITY и AmneziaWG routes из signed config | Local SOCKS front-end; не Android `VpnService` | Operator-owned config, update, APK, Noise и worker keys | Signed client config и APK artifacts раздаются через `/tw/` внутри туннеля | Документированная source build + `app/build/verify-release.sh` | MIT |
+| Amnezia | Self-hosted VPN/client tooling | Varies by deployment; включает AmneziaWG-oriented workflows | Обычно VPN-style clients | Operator/server owner, зависит от setup | Varies | См. upstream | См. upstream |
+| Marzban | Self-hosted proxy management panel | Varies; часто Xray-profile based | Зависит от external clients | Operator controls panel/server keys | Varies | См. upstream | См. upstream |
+| 3x-ui / Hiddify | Self-hosted proxy panels | Varies by panel/profile | Зависит от external clients | Operator controls panel/server keys | Varies | См. upstream | См. upstream |
+| Outline | Self-hosted access server + client ecosystem | Shadowsocks-oriented access model | Обычно VPN-style client apps | Operator controls server access keys | Varies | См. upstream | См. upstream |
+
+## Quickstart (5 минут)
+
+Это самый короткий путь к local development stand. Полный
+[сквозной сценарий](#начните-здесь-сквозной-сценарий) ниже и organization
+[Local development stand](https://github.com/TrafficWrapper/.github/blob/main/CONTRIBUTING.ru.md#local-development-stand)
+объясняют каждый шаг и production differences.
+
+1. Запустите orchestrator:
+
+   ```sh
+   git clone https://github.com/TrafficWrapper/orchestrator.git
+   cd orchestrator
+   cp .env.example .env
+   docker compose up -d --build signer orchestrator
+   docker compose logs orchestrator | grep -i 'initial admin password'
+   docker compose exec -T orchestrator orchestrator public-key
+   ```
+
+2. Откройте `https://127.0.0.1:9091`, смените initial admin password и создайте
+   worker enrollment token в admin UI.
+3. Запустите worker из worker repository с
+   `ORCH_URL=https://host.docker.internal:9091`,
+   `ORCH_STATIC_PUBLIC_KEY=<public-key>`, `ENROLL_TOKEN=<token>`,
+   `ORCH_INSECURE_TLS=1` для этого self-signed dev stand и реальным
+   `CAMOUFLAGE_DOMAIN`.
+4. Approve pending worker в admin UI.
+5. Откройте **Устройства** -> **+ Новое устройство**, создайте one-time
+   bootstrap, установите APK из app release channel или свою сборку,
+   импортируйте bootstrap, подтвердите его и подключитесь.
 
 ## Начните здесь: сквозной сценарий
 
@@ -194,9 +245,12 @@ minisign key сами и задайте `ORCH_UPDATE_PUBKEY` до первого
 
 Есть два штатных способа опубликовать Android update через платформу:
 
-- **Web-админка:** откройте admin UI, загрузите подписанный APK и подписанный
-  update manifest. APK signing key остаётся вне orchestrator; orchestrator
-  только хранит и раздаёт уже подписанные артефакты.
+- **Web-админка:** откройте admin UI, загрузите подписанный APK и signed update
+  manifest. Если `orch-state/update.key` существует и совпадает с configured
+  update public key, UI может сам собрать и minisign'ить manifest. Для лучшей
+  изоляции key держите update key offline, используйте UI для draft manifest,
+  подпишите его externally и вставьте minisig. APK signing key в обоих режимах
+  остаётся вне orchestrator.
 - **Seed при первом старте:** положите APK в `seed/app.apk` до первого запуска.
   Orchestrator сгенерирует свой update minisign key в local state, подпишет
   manifest для этого APK и опубликует его как `seq=1`. Это только demo/initial
@@ -207,6 +261,17 @@ minisign key сами и задайте `ORCH_UPDATE_PUBKEY` до первого
 <https://github.com/TrafficWrapper/app/releases/latest>. App README и release
 assets считаются source of truth для текущего имени APK, version code, SHA-256 и
 fingerprint signing certificate.
+
+## Проверка APK build
+
+В app repository есть минимальный verifier:
+[`build/verify-release.sh`](https://github.com/TrafficWrapper/app/blob/master/build/verify-release.sh).
+Используйте его, чтобы проверить SHA-256 скачанного APK, SHA-256 signing
+certificate APK, optional minisign update manifest и optional rebuild из git
+tag. Текущий hash public APK и certificate fingerprint документированы в
+[app README](https://github.com/TrafficWrapper/app#prebuilt-apk). Byte-for-byte
+reproduction APK требует тот же signing keystore и build inputs; operators со
+своим keystore могут тем же способом проверять свой channel.
 
 ## Telegram-бот
 

@@ -19,6 +19,15 @@ TrafficWrapper разделяет четыре trust roots:
 owner-controlled secret storage. Не коммитьте `.env`, `orch-state/`,
 `worker-state/`, release keystores или minisign private keys.
 
+## Operational identity и донаты
+
+Донат-адреса, side domains, build hosts, package signing identities и support
+accounts могут deanonymize deployment или maintainer identity. Относитесь к ним
+как к infrastructure metadata. Используйте изолированные addresses и accounts,
+когда нужна separation от personal infrastructure, и не публикуйте payment
+metadata, реальные domains, IP addresses, SNI values или account handles в
+public issues и support threads.
+
 ## Ротация config-signing key
 
 Config-signing key хранится signer process и доступен через
