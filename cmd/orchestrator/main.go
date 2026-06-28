@@ -49,6 +49,7 @@ type orchConfig struct {
 	SeedAPKPath     string
 	SeedVersionCode int64
 	SeedVersionName string
+	APKKeepReleases int
 	TLS             bool
 }
 
@@ -324,6 +325,7 @@ func readConfig() orchConfig {
 		SeedAPKPath:     getenv("SEED_APK_PATH", "./seed/app.apk"),
 		SeedVersionCode: getenvInt64("SEED_APK_VERSION_CODE", 1),
 		SeedVersionName: getenv("SEED_APK_VERSION_NAME", "seed"),
+		APKKeepReleases: getenvInt("ORCH_APK_KEEP_RELEASES", 5),
 		TLS:             getenv("ORCH_TLS", "1") != "0",
 	}
 }
@@ -3165,6 +3167,9 @@ func (s *server) storeAPKRelease(manifest apkReleaseRecord, manifestJSON, minisi
 	if err := s.store.setAPKRelease(manifest); err != nil {
 		return apkReleaseRecord{}, err
 	}
+	if err := s.pruneOldAPKReleases(s.cfg.APKKeepReleases, manifest.Seq); err != nil {
+		log.Printf("apk release prune failed: %v", err)
+	}
 	return manifest, nil
 }
 
@@ -3411,6 +3416,18 @@ func getenvInt64(key string, fallback int64) int64 {
 		return fallback
 	}
 	parsed, err := strconv.ParseInt(value, 10, 64)
+	if err != nil {
+		return fallback
+	}
+	return parsed
+}
+
+func getenvInt(key string, fallback int) int {
+	value := strings.TrimSpace(os.Getenv(key))
+	if value == "" {
+		return fallback
+	}
+	parsed, err := strconv.Atoi(value)
 	if err != nil {
 		return fallback
 	}
