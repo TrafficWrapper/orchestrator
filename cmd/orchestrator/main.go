@@ -457,7 +457,7 @@ func (s *server) handleHandshakeStart(w http.ResponseWriter, r *http.Request) {
 
 func (s *server) reserveHandshakeStart(r *http.Request) (bool, string) {
 	now := time.Now()
-	ip := remoteIP(r.RemoteAddr)
+	ip := clientIP(r)
 	s.handshakeMu.Lock()
 	if s.handshakeRates == nil {
 		s.handshakeRates = map[string]handshakeRate{}
