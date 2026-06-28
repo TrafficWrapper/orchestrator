@@ -58,12 +58,13 @@ func TestDeviceEnrollConsumesBootstrapOnceAndReturnsClientConfig(t *testing.T) {
 	s := newTestServer(t)
 	addApprovedWorker(t, s)
 	secret := "bootstrap-secret"
-	if _, err := s.store.createBootstrapToken(
+	token, err := s.store.createBootstrapToken(
 		secret,
 		time.Now().Add(time.Hour),
 		json.RawMessage(`{"devices":1}`),
 		[]string{"https://worker.example/tw"},
-	); err != nil {
+	)
+	if err != nil {
 		t.Fatal(err)
 	}
 
@@ -128,6 +129,21 @@ func TestDeviceEnrollConsumesBootstrapOnceAndReturnsClientConfig(t *testing.T) {
 	if !strings.Contains(workerBundle.ConfigJSON, resp.RealityUUID) || !strings.Contains(workerBundle.ConfigJSON, "device-awg-public") {
 		t.Fatalf("worker config does not contain approved device: %s", workerBundle.ConfigJSON)
 	}
+	used := bootstrapTokenForTest(t, s, token.ID)
+	if used.Uses != 1 {
+		t.Fatalf("first enroll token uses=%d want 1", used.Uses)
+	}
+	replay := enrollDeviceForTest(t, s, secret)
+	if !replay.OK {
+		t.Fatalf("idempotent replay rejected: %+v", replay)
+	}
+	if replay.RealityUUID != resp.RealityUUID || replay.InternalIP != resp.InternalIP || replay.PSK2 != resp.PSK2 {
+		t.Fatalf("idempotent replay changed creds: first=%+v replay=%+v", resp, replay)
+	}
+	used = bootstrapTokenForTest(t, s, token.ID)
+	if used.Uses != 1 {
+		t.Fatalf("idempotent replay burned bootstrap use: uses=%d", used.Uses)
+	}
 	if err := s.store.revokeDevice(resp.DeviceID); err != nil {
 		t.Fatal(err)
 	}
@@ -142,10 +158,34 @@ func TestDeviceEnrollConsumesBootstrapOnceAndReturnsClientConfig(t *testing.T) {
 	if strings.Contains(revokedBundle.ConfigJSON, resp.RealityUUID) {
 		t.Fatalf("revoked device still present in worker config: %s", revokedBundle.ConfigJSON)
 	}
+}
 
-	replay := enrollDeviceForTest(t, s, secret)
-	if replay.OK || !strings.Contains(replay.Error, "exhausted bootstrap token") {
-		t.Fatalf("replay accepted or wrong error: %+v", replay)
+func TestDeviceEnrollRejectsExistingBindingMismatches(t *testing.T) {
+	s := newTestServer(t)
+	addApprovedWorker(t, s)
+	secret := "bootstrap-mismatch-secret"
+	if _, err := s.store.createBootstrapToken(
+		secret,
+		time.Now().Add(time.Hour),
+		json.RawMessage(`{"devices":1}`),
+		[]string{"https://worker.example/tw"},
+	); err != nil {
+		t.Fatal(err)
+	}
+	resp := enrollDeviceForTest(t, s, secret)
+	if !resp.OK {
+		t.Fatalf("enroll failed: %+v", resp)
+	}
+	churn := enrollDeviceForTestWithAWG(t, s, secret, "different-device-awg-public")
+	if churn.OK || !strings.Contains(churn.Error, "awg public key mismatch") {
+		t.Fatalf("awg key churn accepted or wrong error: %+v", churn)
+	}
+	if err := tamperDeviceIdentityForTest(s, resp.DeviceID, "other-identity-pub"); err != nil {
+		t.Fatal(err)
+	}
+	mismatch := enrollDeviceForTest(t, s, secret)
+	if mismatch.OK || !strings.Contains(mismatch.Error, "device identity mismatch") {
+		t.Fatalf("identity mismatch accepted or wrong error: %+v", mismatch)
 	}
 }
 
@@ -1333,6 +1373,11 @@ func addApprovedWorkerWithStatic(t *testing.T, s *server, staticPub string) work
 
 func enrollDeviceForTest(t *testing.T, s *server, token string) deviceEnrollResponse {
 	t.Helper()
+	return enrollDeviceForTestWithAWG(t, s, token, "device-awg-public")
+}
+
+func enrollDeviceForTestWithAWG(t *testing.T, s *server, token string, awgPublicKey string) deviceEnrollResponse {
+	t.Helper()
 	raw, _ := json.Marshal(deviceEnrollRequest{
 		BootstrapToken:  token,
 		DeviceID:        "android-id",
@@ -1342,7 +1387,7 @@ func enrollDeviceForTest(t *testing.T, s *server, token string) deviceEnrollResp
 		Model:           "A15",
 		EnrollmentNonce: "nonce",
 		ClientVersion:   "public-test",
-		AWGPublicKey:    "device-awg-public",
+		AWGPublicKey:    awgPublicKey,
 	})
 	resp, err := s.handleDeviceEnroll(make([]byte, 32), raw)
 	if err != nil {
@@ -1353,6 +1398,41 @@ func enrollDeviceForTest(t *testing.T, s *server, token string) deviceEnrollResp
 		t.Fatalf("unexpected response type %T", resp)
 	}
 	return typed
+}
+
+func bootstrapTokenForTest(t *testing.T, s *server, id string) tokenRecord {
+	t.Helper()
+	var rec tokenRecord
+	if err := s.store.db.View(func(tx *bolt.Tx) error {
+		raw := tx.Bucket(bucketTokens).Get([]byte(id))
+		if raw == nil {
+			return os.ErrNotExist
+		}
+		return json.Unmarshal(raw, &rec)
+	}); err != nil {
+		t.Fatal(err)
+	}
+	return rec
+}
+
+func tamperDeviceIdentityForTest(s *server, id string, identityPub string) error {
+	return s.store.db.Update(func(tx *bolt.Tx) error {
+		b := tx.Bucket(bucketDevices)
+		raw := b.Get([]byte(id))
+		if raw == nil {
+			return os.ErrNotExist
+		}
+		var rec deviceRecord
+		if err := s.store.openJSON(raw, &rec); err != nil {
+			return err
+		}
+		rec.IdentityPubKey = identityPub
+		sealed, err := s.store.sealJSON(rec)
+		if err != nil {
+			return err
+		}
+		return b.Put([]byte(id), sealed)
+	})
 }
 
 func insertBootstrapToken(t *testing.T, st *orchStore, secret string, expiresAt time.Time) {

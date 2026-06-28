@@ -628,6 +628,8 @@ func (s *server) handleDeviceEnroll(peer []byte, raw []byte) (any, error) {
 	if strings.TrimSpace(req.AWGPublicKey) == "" {
 		return deviceEnrollResponse{OK: false, Error: "awg_public_key is required"}, nil
 	}
+	identityPub := strings.TrimSpace(req.IdentityPubKey)
+	awgPublic := strings.TrimSpace(req.AWGPublicKey)
 	id := deviceID(req.IdentityPubKey, noisePub)
 	workers, err := s.store.workers()
 	if err != nil {
@@ -638,16 +640,53 @@ func (s *server) handleDeviceEnroll(peer []byte, raw []byte) (any, error) {
 	if serverAWGPublic == "" {
 		return deviceEnrollResponse{OK: false, Error: "no approved worker with awg public key"}, nil
 	}
+	existing, err := s.store.device(id)
+	if err == nil {
+		storedIdentityPub := strings.TrimSpace(existing.IdentityPubKey)
+		storedNoisePub := strings.TrimSpace(existing.NoisePublicKey)
+		storedAWGPublic := strings.TrimSpace(existing.AWGPublicKey)
+		switch {
+		case existing.Status != "approved":
+			return deviceEnrollResponse{OK: false, Error: "device is not approved"}, nil
+		case storedIdentityPub == "" || storedIdentityPub != identityPub:
+			return deviceEnrollResponse{OK: false, Error: "device identity mismatch"}, nil
+		case storedNoisePub == "" || storedNoisePub != noisePub:
+			return deviceEnrollResponse{OK: false, Error: "device noise pub mismatch"}, nil
+		case storedAWGPublic == "" || storedAWGPublic != awgPublic:
+			return deviceEnrollResponse{OK: false, Error: "device awg public key mismatch"}, nil
+		}
+		bundle, err := s.buildClientBundle(0)
+		if err != nil {
+			return nil, err
+		}
+		pub, err := s.signer.publicKey()
+		if err != nil {
+			return nil, err
+		}
+		return deviceEnrollResponse{
+			OK:              true,
+			DeviceID:        existing.ID,
+			Status:          existing.Status,
+			RealityUUID:     existing.RealityUUID,
+			InternalIP:      existing.InternalIP,
+			PSK2:            existing.PSK2,
+			ServerAWGPublic: serverAWGPublic,
+			SignerPublicKey: pub,
+			ClientBundle:    bundle,
+		}, nil
+	} else if err.Error() != "device not found" {
+		return nil, err
+	}
 	device := deviceRecord{
 		ID:              id,
 		NoisePublicKey:  noisePub,
-		IdentityPubKey:  strings.TrimSpace(req.IdentityPubKey),
+		IdentityPubKey:  identityPub,
 		IdentityKeyType: strings.TrimSpace(req.IdentityKeyType),
 		AndroidID:       strings.TrimSpace(req.AndroidID),
 		Model:           strings.TrimSpace(req.Model),
 		EnrollmentNonce: strings.TrimSpace(req.EnrollmentNonce),
 		ClientVersion:   strings.TrimSpace(req.ClientVersion),
-		AWGPublicKey:    strings.TrimSpace(req.AWGPublicKey),
+		AWGPublicKey:    awgPublic,
 	}
 	_, stored, err := s.store.consumeBootstrapToken(req.BootstrapToken, device, awgSubnet)
 	if err != nil {
