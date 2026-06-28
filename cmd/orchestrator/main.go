@@ -61,6 +61,9 @@ type server struct {
 	sessionCount   atomic.Int64
 	handshakeMu    sync.Mutex
 	handshakeRates map[string]handshakeRate
+	loginLimiterMu sync.Mutex
+	loginLimiter   *loginLimiter
+	audit          *auditLog
 	adminSessions  sync.Map
 	botMu          sync.Mutex
 	authApprover   authApprover
@@ -346,7 +349,12 @@ func runServe(cfg orchConfig) error {
 	if err != nil {
 		return err
 	}
-	s := &server{cfg: cfg, store: st, signer: signerClient{socket: cfg.SignerSocket}, static: static}
+	audit, err := openAuditLog(filepath.Join(cfg.StateDir, "audit.log"))
+	if err != nil {
+		return err
+	}
+	defer audit.Close()
+	s := &server{cfg: cfg, store: st, signer: signerClient{socket: cfg.SignerSocket}, static: static, loginLimiter: newLoginLimiter(), audit: audit}
 	if _, err := s.signer.publicKey(); err != nil {
 		return fmt.Errorf("signer unavailable: %w", err)
 	}
@@ -1583,6 +1591,19 @@ func (s *server) handleAdminLogin(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
+	ip := clientIP(r)
+	limiter := s.adminLoginLimiter()
+	if until, locked := limiter.isLocked(ip); locked {
+		w.Header().Set("Retry-After", retryAfterSeconds(until, limiter.clock()))
+		s.auditEvent(auditEntry{
+			Event:  "admin_login",
+			IP:     ip,
+			Result: "locked",
+			Fields: map[string]string{"locked_until": until.UTC().Format(time.RFC3339)},
+		})
+		http.Error(w, "too many failed login attempts", http.StatusTooManyRequests)
+		return
+	}
 	var req struct {
 		Secret string `json:"secret"`
 	}
@@ -1592,28 +1613,43 @@ func (s *server) handleAdminLogin(w http.ResponseWriter, r *http.Request) {
 	}
 	ok, mustChange, err := s.store.verifyAdminPassword(req.Secret)
 	if err != nil {
+		s.auditEvent(auditEntry{Event: "admin_login", IP: ip, Result: "failed", Fields: map[string]string{"reason": "verify_error"}})
 		http.Error(w, err.Error(), http.StatusForbidden)
 		return
 	}
 	if !ok {
+		until, locked := limiter.recordFailure(ip)
+		fields := map[string]string{"reason": "bad_secret"}
+		if locked {
+			fields["locked_until"] = until.UTC().Format(time.RFC3339)
+			w.Header().Set("Retry-After", retryAfterSeconds(until, limiter.clock()))
+			s.auditEvent(auditEntry{Event: "admin_login", IP: ip, Result: "locked", Fields: fields})
+			http.Error(w, "too many failed login attempts", http.StatusTooManyRequests)
+			return
+		}
+		s.auditEvent(auditEntry{Event: "admin_login", IP: ip, Result: "failed", Fields: fields})
 		http.Error(w, "invalid admin secret", http.StatusForbidden)
 		return
 	}
+	limiter.recordSuccess(ip)
+	s.auditEvent(auditEntry{Event: "admin_login", IP: ip, Result: "ok"})
 	if mustChange {
 		s.createAdminSession(w, true)
 		return
 	}
 	if approver := s.currentAuthApprover(); approver != nil && approver.enabled() {
 		approved, err := approver.requestLoginApproval(r.Context(), loginApprovalRequest{
-			RemoteAddr: r.RemoteAddr,
+			RemoteAddr: ip,
 			UserAgent:  r.UserAgent(),
 			CreatedAt:  time.Now().UTC(),
 		})
 		if err != nil {
+			s.auditEvent(auditEntry{Event: "admin_login_approval", IP: ip, Result: "failed", Fields: map[string]string{"reason": "approval_error"}})
 			http.Error(w, err.Error(), http.StatusForbidden)
 			return
 		}
 		if !approved {
+			s.auditEvent(auditEntry{Event: "admin_login_approval", IP: ip, Result: "denied"})
 			http.Error(w, "admin login approval denied", http.StatusForbidden)
 			return
 		}
@@ -1700,6 +1736,7 @@ func (s *server) handleAdminPasswordChange(w http.ResponseWriter, r *http.Reques
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
+	ip := clientIP(r)
 	token, source, session, ok := s.lookupAdminSession(r)
 	if token == "" {
 		http.Error(w, "admin session required", http.StatusUnauthorized)
@@ -1723,22 +1760,26 @@ func (s *server) handleAdminPasswordChange(w http.ResponseWriter, r *http.Reques
 	}
 	okPassword, _, err := s.store.verifyAdminPassword(req.CurrentSecret)
 	if err != nil {
+		s.auditEvent(auditEntry{Event: "admin_password_change", IP: ip, Result: "failed", Fields: map[string]string{"reason": "verify_error"}})
 		http.Error(w, err.Error(), http.StatusForbidden)
 		return
 	}
 	if !okPassword {
+		s.auditEvent(auditEntry{Event: "admin_password_change", IP: ip, Result: "failed", Fields: map[string]string{"reason": "bad_current_secret"}})
 		http.Error(w, "invalid current admin secret", http.StatusForbidden)
 		return
 	}
 	if err := s.store.setAdminPassword(req.NewSecret); err != nil {
+		s.auditEvent(auditEntry{Event: "admin_password_change", IP: ip, Result: "failed", Fields: map[string]string{"reason": "set_failed"}})
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 	log.Printf("admin password changed at=%s remote=%s", time.Now().UTC().Format(time.RFC3339), r.RemoteAddr)
+	s.auditEvent(auditEntry{Event: "admin_password_change", IP: ip, Result: "ok"})
 	s.adminSessions.Delete(token)
 	if approver := s.currentAuthApprover(); approver != nil && approver.enabled() {
 		approved, err := approver.requestLoginApproval(r.Context(), loginApprovalRequest{
-			RemoteAddr: r.RemoteAddr,
+			RemoteAddr: ip,
 			UserAgent:  r.UserAgent(),
 			CreatedAt:  time.Now().UTC(),
 		})
@@ -1827,6 +1868,7 @@ func (s *server) handleAdminBotSetToken(w http.ResponseWriter, r *http.Request) 
 			return
 		}
 	}
+	s.auditEvent(auditEntry{Event: "bot_token_set", IP: clientIP(r), Result: "ok", Fields: map[string]string{"owner_id": strconv.FormatInt(req.OwnerID, 10)}})
 	writeJSON(w, map[string]any{"ok": true, "configured": true, "owner_id": req.OwnerID})
 }
 
@@ -1857,6 +1899,7 @@ func (s *server) handleAdminTokenCreate(w http.ResponseWriter, r *http.Request) 
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
+	s.auditEvent(auditEntry{Event: "enroll_token_create", IP: clientIP(r), Result: "ok", Fields: map[string]string{"id": req.ID, "ttl": ttl.String(), "pinned_worker": strconv.FormatBool(strings.TrimSpace(req.WorkerStaticPub) != "")}})
 	fmt.Fprintf(w, "token_created id=%s ttl=%s max_uses=1\n", req.ID, ttl)
 }
 
@@ -1906,6 +1949,7 @@ func (s *server) handleAdminBootstrapTokenCreate(w http.ResponseWriter, r *http.
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
+	s.auditEvent(auditEntry{Event: "bootstrap_token_create", IP: clientIP(r), Result: "ok", Fields: map[string]string{"id": rec.ID, "expires_at": rec.ExpiresAt.UTC().Format(time.RFC3339)}})
 	writeJSON(w, makeBootstrapPayload(s.cfg, pub, protocol.KeyToBase64(s.static.Public), secret, rec))
 }
 
@@ -2035,6 +2079,7 @@ func (s *server) handleAdminApproveWorker(w http.ResponseWriter, r *http.Request
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
+	s.auditEvent(auditEntry{Event: "worker_approve", IP: clientIP(r), Result: "ok", Fields: map[string]string{"worker_id": req.ID}})
 	fmt.Fprintf(w, "worker_approved id=%s\n", req.ID)
 }
 
@@ -2057,6 +2102,7 @@ func (s *server) handleAdminRevokeDevice(w http.ResponseWriter, r *http.Request)
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
+	s.auditEvent(auditEntry{Event: "device_revoke", IP: clientIP(r), Result: "ok", Fields: map[string]string{"device_id": req.ID}})
 	fmt.Fprintf(w, "device_revoked id=%s\n", req.ID)
 }
 
@@ -2079,6 +2125,7 @@ func (s *server) handleAdminDeleteDevice(w http.ResponseWriter, r *http.Request)
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
+	s.auditEvent(auditEntry{Event: "device_delete", IP: clientIP(r), Result: "ok", Fields: map[string]string{"device_id": req.ID}})
 	fmt.Fprintf(w, "device_deleted id=%s\n", req.ID)
 }
 
