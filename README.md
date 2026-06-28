@@ -221,6 +221,10 @@ Recommended setup:
 3. Issue a Let's Encrypt certificate for your `ORCH_PUBLIC_URL`.
 4. Proxy HTTPS traffic to `http://127.0.0.1:9091`.
 
+Configure the proxy to pass the real peer IP with `X-Real-IP $remote_addr` or
+to overwrite `X-Forwarded-For` with `$remote_addr`. Do not leave append-only
+`X-Forwarded-For` defaults as the only signal for rate-limited endpoints.
+
 For tests with the default self-signed listener, workers must set
 `ORCH_INSECURE_TLS=1`. Do not use that setting for production.
 

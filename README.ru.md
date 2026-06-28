@@ -219,6 +219,11 @@ insecure-TLS override.
 3. Выпустить Let's Encrypt certificate для вашего `ORCH_PUBLIC_URL`.
 4. Проксировать HTTPS на `http://127.0.0.1:9091`.
 
+Настройте proxy так, чтобы он передавал реальный peer IP через
+`X-Real-IP $remote_addr` или перезаписывал `X-Forwarded-For` значением
+`$remote_addr`. Не оставляйте append-only `X-Forwarded-For` defaults как
+единственный сигнал для endpoints с rate-limit.
+
 Для тестов с дефолтным self-signed listener workers должны ставить
 `ORCH_INSECURE_TLS=1`. Не используйте это в production.
 

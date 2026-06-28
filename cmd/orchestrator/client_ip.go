@@ -9,11 +9,13 @@ import (
 func clientIP(r *http.Request) string {
 	host := remoteIP(r.RemoteAddr)
 	if trustedProxyHost(host) {
-		if forwarded := firstForwardedIP(r.Header.Get("X-Forwarded-For")); forwarded != "" {
-			return forwarded
-		}
 		if realIP := validIPString(r.Header.Get("X-Real-IP")); realIP != "" {
 			return realIP
+		}
+		// Assumes a single trusted co-located proxy hop. Appending proxies add
+		// the peer they observed at the right edge of X-Forwarded-For.
+		if forwarded := rightmostForwardedIP(r.Header.Get("X-Forwarded-For")); forwarded != "" {
+			return forwarded
 		}
 	}
 	return host
@@ -24,8 +26,10 @@ func trustedProxyHost(host string) bool {
 	return ip != nil && ip.IsLoopback()
 }
 
-func firstForwardedIP(value string) string {
-	for _, part := range strings.Split(value, ",") {
+func rightmostForwardedIP(value string) string {
+	parts := strings.Split(value, ",")
+	for i := len(parts) - 1; i >= 0; i-- {
+		part := parts[i]
 		if ip := validIPString(part); ip != "" {
 			return ip
 		}
