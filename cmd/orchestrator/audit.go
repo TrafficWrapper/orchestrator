@@ -6,6 +6,8 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"sync"
@@ -13,6 +15,8 @@ import (
 )
 
 var errAuditChainBroken = errors.New("audit hash chain broken")
+
+const auditScannerMaxBytes = 16 * 1024 * 1024
 
 type auditEntry struct {
 	Time     time.Time         `json:"time"`
@@ -38,12 +42,25 @@ func openAuditLog(path string) (*auditLog, error) {
 	if err := ensureAuditFile(path, 0o600); err != nil {
 		return nil, err
 	}
-	prevHash := lastAuditHash(path)
+	verifyErr := verifyAuditChain(path)
+	prevHash, tailErr := lastAuditHash(path)
 	file, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
 	if err != nil {
 		return nil, err
 	}
-	return &auditLog{file: file, prevHash: prevHash}, nil
+	logFile := &auditLog{file: file, prevHash: prevHash}
+	if verifyErr != nil || tailErr != nil {
+		log.Printf("AUDIT CHAIN BROKEN/TAMPER path=%s verify_error=%v tail_error=%v", path, verifyErr, tailErr)
+		fields := map[string]string{}
+		if verifyErr != nil {
+			fields["verify_error"] = verifyErr.Error()
+		}
+		if tailErr != nil {
+			fields["tail_error"] = tailErr.Error()
+		}
+		logFile.Log(auditEntry{Event: "audit_chain_break_detected", Result: "warning", Fields: fields})
+	}
+	return logFile, nil
 }
 
 func ensureAuditFile(path string, perm os.FileMode) error {
@@ -54,24 +71,42 @@ func ensureAuditFile(path string, perm os.FileMode) error {
 	return file.Close()
 }
 
-func lastAuditHash(path string) string {
+func lastAuditHash(path string) (string, error) {
 	file, err := os.Open(path)
 	if err != nil {
-		return ""
+		return "", err
 	}
 	defer file.Close()
 
 	scanner := bufio.NewScanner(file)
 	buf := make([]byte, 0, 64*1024)
-	scanner.Buffer(buf, 1024*1024)
+	scanner.Buffer(buf, auditScannerMaxBytes)
 	last := ""
+	var firstErr error
+	line := 0
 	for scanner.Scan() {
+		line++
 		var entry auditEntry
-		if json.Unmarshal(scanner.Bytes(), &entry) == nil && entry.Hash != "" {
+		if err := json.Unmarshal(scanner.Bytes(), &entry); err != nil {
+			if firstErr == nil {
+				firstErr = fmt.Errorf("%w at line %d: %v", errAuditChainBroken, line, err)
+			}
+			continue
+		}
+		if entry.Hash == "" {
+			if firstErr == nil {
+				firstErr = fmt.Errorf("%w at line %d: missing hash", errAuditChainBroken, line)
+			}
+			continue
+		}
+		if entry.Hash != "" {
 			last = entry.Hash
 		}
 	}
-	return last
+	if err := scanner.Err(); err != nil {
+		return last, err
+	}
+	return last, firstErr
 }
 
 func (l *auditLog) Log(entry auditEntry) {
@@ -126,15 +161,17 @@ func verifyAuditChain(path string) error {
 	prev := ""
 	scanner := bufio.NewScanner(file)
 	buf := make([]byte, 0, 64*1024)
-	scanner.Buffer(buf, 1024*1024)
+	scanner.Buffer(buf, auditScannerMaxBytes)
+	line := 0
 	for scanner.Scan() {
+		line++
 		var entry auditEntry
 		if err := json.Unmarshal(scanner.Bytes(), &entry); err != nil {
-			return err
+			return fmt.Errorf("%w at line %d: %v", errAuditChainBroken, line, err)
 		}
 		hash := entry.Hash
 		if entry.PrevHash != prev {
-			return errAuditChainBroken
+			return fmt.Errorf("%w at line %d: prev_hash mismatch", errAuditChainBroken, line)
 		}
 		entry.Hash = ""
 		payload, err := json.Marshal(entry)
@@ -143,7 +180,7 @@ func verifyAuditChain(path string) error {
 		}
 		sum := sha256.Sum256(append([]byte(entry.PrevHash+"\n"), payload...))
 		if hex.EncodeToString(sum[:]) != hash {
-			return errAuditChainBroken
+			return fmt.Errorf("%w at line %d: hash mismatch", errAuditChainBroken, line)
 		}
 		prev = hash
 	}
