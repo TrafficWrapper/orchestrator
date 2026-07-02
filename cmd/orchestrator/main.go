@@ -143,16 +143,17 @@ type deviceEnrollRequest struct {
 }
 
 type deviceEnrollResponse struct {
-	OK              bool         `json:"ok"`
-	Error           string       `json:"error,omitempty"`
-	DeviceID        string       `json:"device_id,omitempty"`
-	Status          string       `json:"status,omitempty"`
-	RealityUUID     string       `json:"reality_uuid,omitempty"`
-	InternalIP      string       `json:"internal_ip,omitempty"`
-	PSK2            string       `json:"psk2,omitempty"`
-	ServerAWGPublic string       `json:"server_awg_public,omitempty"`
-	SignerPublicKey string       `json:"signer_public_key,omitempty"`
-	ClientBundle    signedConfig `json:"client_bundle,omitempty"`
+	OK              bool                        `json:"ok"`
+	Error           string                      `json:"error,omitempty"`
+	DeviceID        string                      `json:"device_id,omitempty"`
+	Status          string                      `json:"status,omitempty"`
+	RealityUUID     string                      `json:"reality_uuid,omitempty"`
+	InternalIP      string                      `json:"internal_ip,omitempty"`
+	PSK2            string                      `json:"psk2,omitempty"`
+	AWGProfiles     map[string]deviceAWGProfile `json:"awg_profiles,omitempty"`
+	ServerAWGPublic string                      `json:"server_awg_public,omitempty"`
+	SignerPublicKey string                      `json:"signer_public_key,omitempty"`
+	ClientBundle    signedConfig                `json:"client_bundle,omitempty"`
 }
 
 type bootstrapPayload struct {
@@ -650,8 +651,8 @@ func (s *server) handleDeviceEnroll(peer []byte, raw []byte) (any, error) {
 	if err != nil {
 		return nil, err
 	}
-	awgSubnet := workerAWGSubnet(workers)
-	serverAWGPublic := workerAWGPublicKey(workers)
+	awgProfiles := workerAWGProfiles(workers)
+	serverAWGPublic := workerAWGPublicKeyFromProfiles(awgProfiles)
 	if serverAWGPublic == "" {
 		return deviceEnrollResponse{OK: false, Error: "no approved worker with awg public key"}, nil
 	}
@@ -670,6 +671,10 @@ func (s *server) handleDeviceEnroll(peer []byte, raw []byte) (any, error) {
 		case storedAWGPublic == "" || storedAWGPublic != awgPublic:
 			return deviceEnrollResponse{OK: false, Error: "device awg public key mismatch"}, nil
 		}
+		existing, err = s.store.ensureDeviceAWGProfiles(existing.ID, awgProfiles, awgPublic)
+		if err != nil {
+			return nil, err
+		}
 		bundle, err := s.buildClientBundleForClient(0, existing.ClientVersion)
 		if err != nil {
 			return nil, err
@@ -685,6 +690,7 @@ func (s *server) handleDeviceEnroll(peer []byte, raw []byte) (any, error) {
 			RealityUUID:     existing.RealityUUID,
 			InternalIP:      existing.InternalIP,
 			PSK2:            existing.PSK2,
+			AWGProfiles:     existing.AWGProfiles,
 			ServerAWGPublic: serverAWGPublic,
 			SignerPublicKey: pub,
 			ClientBundle:    bundle,
@@ -703,7 +709,7 @@ func (s *server) handleDeviceEnroll(peer []byte, raw []byte) (any, error) {
 		ClientVersion:   strings.TrimSpace(req.ClientVersion),
 		AWGPublicKey:    awgPublic,
 	}
-	_, stored, err := s.store.consumeBootstrapToken(req.BootstrapToken, device, awgSubnet)
+	_, stored, err := s.store.consumeBootstrapToken(req.BootstrapToken, device, awgProfiles)
 	if err != nil {
 		return deviceEnrollResponse{OK: false, Error: err.Error()}, nil
 	}
@@ -722,6 +728,7 @@ func (s *server) handleDeviceEnroll(peer []byte, raw []byte) (any, error) {
 		RealityUUID:     stored.RealityUUID,
 		InternalIP:      stored.InternalIP,
 		PSK2:            stored.PSK2,
+		AWGProfiles:     stored.AWGProfiles,
 		ServerAWGPublic: serverAWGPublic,
 		SignerPublicKey: pub,
 		ClientBundle:    bundle,
@@ -1196,7 +1203,13 @@ func clientWorkerPayloadForClient(rec workerRecord, clientVersion string) (map[s
 		}
 	}
 	if workerProtocolEnabled(rec, "awg") {
-		if route, ok := clientRoutePayload("awg", rec.SelfDescribe["awg"], expected, configURL); ok {
+		if profile, ok := selectAWGProfileForClient(awgProfilesFromWorker(rec), clientVersion); ok {
+			if route, ok := clientRoutePayload("awg", profile.Params, expected, configURL); ok {
+				route["profile"] = profile.Name
+				route["awg_profile"] = profile.Name
+				routes = append(routes, route)
+			}
+		} else if route, ok := clientRoutePayload("awg", rec.SelfDescribe["awg"], expected, configURL); ok {
 			routes = append(routes, route)
 		}
 	}
@@ -1329,6 +1342,9 @@ func approvedDevicePayloads(devices []deviceRecord) []any {
 			"psk2":           device.PSK2,
 			"status":         device.Status,
 		}
+		if len(device.AWGProfiles) > 0 {
+			payload["awg_profiles"] = device.AWGProfiles
+		}
 		if !deviceLimitsEmpty(device.Limits) {
 			payload["limits"] = device.Limits
 			if device.Limits.ExpiresAt != nil && strings.TrimSpace(*device.Limits.ExpiresAt) != "" {
@@ -1341,32 +1357,20 @@ func approvedDevicePayloads(devices []deviceRecord) []any {
 }
 
 func workerAWGSubnet(workers []workerRecord) string {
-	for _, rec := range workers {
-		if rec.Status != "approved" && rec.Status != "active" {
-			continue
-		}
-		awg, ok := rec.SelfDescribe["awg"].(map[string]any)
-		if !ok {
-			continue
-		}
-		if subnet := stringFromMap(awg, "subnet"); subnet != "" {
-			return subnet
-		}
-	}
-	return "10.13.13.0/24"
+	return baseAWGSubnet(workerAWGProfiles(workers))
 }
 
 func workerAWGPublicKey(workers []workerRecord) string {
-	for _, rec := range workers {
-		if rec.Status != "approved" && rec.Status != "active" {
-			continue
-		}
-		awg, ok := rec.SelfDescribe["awg"].(map[string]any)
-		if !ok {
-			continue
-		}
-		if key := stringFromMap(awg, "public_key"); key != "" {
-			return key
+	return workerAWGPublicKeyFromProfiles(workerAWGProfiles(workers))
+}
+
+func workerAWGPublicKeyFromProfiles(profiles []awgProfile) string {
+	if profile, ok := selectAWGProfileForClient(profiles, ""); ok && profile.ServerPublicKey != "" {
+		return profile.ServerPublicKey
+	}
+	for _, profile := range profiles {
+		if profile.ServerPublicKey != "" {
+			return profile.ServerPublicKey
 		}
 	}
 	return ""

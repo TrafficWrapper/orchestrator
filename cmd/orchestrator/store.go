@@ -72,29 +72,36 @@ type workerRecord struct {
 }
 
 type deviceRecord struct {
-	ID              string       `json:"id"`
-	Alias           string       `json:"alias,omitempty"`
-	Status          string       `json:"status"`
-	NoisePublicKey  string       `json:"noise_public_key"`
-	IdentityPubKey  string       `json:"identity_pubkey"`
-	IdentityKeyType string       `json:"identity_key_type,omitempty"`
-	AndroidID       string       `json:"android_id,omitempty"`
-	Model           string       `json:"model,omitempty"`
-	EnrollmentNonce string       `json:"enrollment_nonce,omitempty"`
-	ClientVersion   string       `json:"client_version,omitempty"`
-	AWGPublicKey    string       `json:"awg_public_key,omitempty"`
-	RealityUUID     string       `json:"reality_uuid,omitempty"`
-	InternalIP      string       `json:"internal_ip,omitempty"`
-	PSK2            string       `json:"psk2,omitempty"`
-	BootstrapToken  string       `json:"bootstrap_token"`
-	Limits          deviceLimits `json:"limits,omitempty"`
-	UsageRxBytes    uint64       `json:"usage_rx_bytes,omitempty"`
-	UsageTxBytes    uint64       `json:"usage_tx_bytes,omitempty"`
-	UsageUpdatedAt  *time.Time   `json:"usage_updated_at,omitempty"`
-	BlockedAt       *time.Time   `json:"blocked_at,omitempty"`
-	BlockedReason   string       `json:"blocked_reason,omitempty"`
-	CreatedAt       time.Time    `json:"created_at"`
-	ConfigSeq       int64        `json:"config_seq"`
+	ID              string                      `json:"id"`
+	Alias           string                      `json:"alias,omitempty"`
+	Status          string                      `json:"status"`
+	NoisePublicKey  string                      `json:"noise_public_key"`
+	IdentityPubKey  string                      `json:"identity_pubkey"`
+	IdentityKeyType string                      `json:"identity_key_type,omitempty"`
+	AndroidID       string                      `json:"android_id,omitempty"`
+	Model           string                      `json:"model,omitempty"`
+	EnrollmentNonce string                      `json:"enrollment_nonce,omitempty"`
+	ClientVersion   string                      `json:"client_version,omitempty"`
+	AWGPublicKey    string                      `json:"awg_public_key,omitempty"`
+	RealityUUID     string                      `json:"reality_uuid,omitempty"`
+	InternalIP      string                      `json:"internal_ip,omitempty"`
+	PSK2            string                      `json:"psk2,omitempty"`
+	AWGProfiles     map[string]deviceAWGProfile `json:"awg_profiles,omitempty"`
+	BootstrapToken  string                      `json:"bootstrap_token"`
+	Limits          deviceLimits                `json:"limits,omitempty"`
+	UsageRxBytes    uint64                      `json:"usage_rx_bytes,omitempty"`
+	UsageTxBytes    uint64                      `json:"usage_tx_bytes,omitempty"`
+	UsageUpdatedAt  *time.Time                  `json:"usage_updated_at,omitempty"`
+	BlockedAt       *time.Time                  `json:"blocked_at,omitempty"`
+	BlockedReason   string                      `json:"blocked_reason,omitempty"`
+	CreatedAt       time.Time                   `json:"created_at"`
+	ConfigSeq       int64                       `json:"config_seq"`
+}
+
+type deviceAWGProfile struct {
+	AWGPublicKey string `json:"awg_public_key,omitempty"`
+	InternalIP   string `json:"internal_ip,omitempty"`
+	PSK2         string `json:"psk2,omitempty"`
 }
 
 type deviceLimits struct {
@@ -503,7 +510,7 @@ func (s *orchStore) consumeToken(secret string, workerStaticPub string) (string,
 	return matched, nil
 }
 
-func (s *orchStore) consumeBootstrapToken(secret string, device deviceRecord, awgSubnet string) (tokenRecord, deviceRecord, error) {
+func (s *orchStore) consumeBootstrapToken(secret string, device deviceRecord, profiles []awgProfile) (tokenRecord, deviceRecord, error) {
 	now := time.Now().UTC()
 	var matched tokenRecord
 	err := s.db.Update(func(tx *bolt.Tx) error {
@@ -540,7 +547,7 @@ func (s *orchStore) consumeBootstrapToken(secret string, device deviceRecord, aw
 				device.RealityUUID = uuidV4()
 			}
 			if device.InternalIP == "" {
-				ip, err := s.allocateDeviceIP(tx, awgSubnet)
+				ip, err := s.allocateDeviceIP(tx, baseAWGSubnet(profiles))
 				if err != nil {
 					return err
 				}
@@ -555,6 +562,9 @@ func (s *orchStore) consumeBootstrapToken(secret string, device deviceRecord, aw
 			}
 			if device.ConfigSeq < 1 {
 				device.ConfigSeq = 1
+			}
+			if err := s.ensureDeviceAWGProfilesTx(tx, &device, profiles, device.AWGPublicKey); err != nil {
+				return err
 			}
 			sealed, err := s.sealJSON(device)
 			if err != nil {
@@ -577,6 +587,118 @@ func (s *orchStore) consumeBootstrapToken(secret string, device deviceRecord, aw
 		return tokenRecord{}, deviceRecord{}, errors.New("invalid, expired, or exhausted bootstrap token")
 	}
 	return matched, device, nil
+}
+
+func (s *orchStore) ensureDeviceAWGProfiles(id string, profiles []awgProfile, awgPublic string) (deviceRecord, error) {
+	var out deviceRecord
+	err := s.db.Update(func(tx *bolt.Tx) error {
+		b := tx.Bucket(bucketDevices)
+		raw := b.Get([]byte(id))
+		if raw == nil {
+			return errors.New("device not found")
+		}
+		var rec deviceRecord
+		if err := s.openJSON(raw, &rec); err != nil {
+			return err
+		}
+		before, _ := json.Marshal(rec.AWGProfiles)
+		if err := s.ensureDeviceAWGProfilesTx(tx, &rec, profiles, awgPublic); err != nil {
+			return err
+		}
+		after, _ := json.Marshal(rec.AWGProfiles)
+		if string(before) == string(after) {
+			out = rec
+			return nil
+		}
+		sealed, err := s.sealJSON(rec)
+		if err != nil {
+			return err
+		}
+		if err := b.Put([]byte(rec.ID), sealed); err != nil {
+			return err
+		}
+		if err := s.bumpWorkerSeqsTx(tx); err != nil {
+			return err
+		}
+		out = rec
+		return nil
+	})
+	return out, err
+}
+
+func (s *orchStore) ensureDeviceAWGProfilesTx(tx *bolt.Tx, device *deviceRecord, profiles []awgProfile, awgPublic string) error {
+	awgPublic = strings.TrimSpace(awgPublic)
+	if awgPublic == "" {
+		awgPublic = strings.TrimSpace(device.AWGPublicKey)
+	}
+	if awgPublic == "" {
+		return errors.New("awg public key is required")
+	}
+	if strings.TrimSpace(device.AWGPublicKey) == "" {
+		device.AWGPublicKey = awgPublic
+	} else if strings.TrimSpace(device.AWGPublicKey) != awgPublic {
+		return errors.New("device awg public key mismatch")
+	}
+	if len(profiles) == 0 {
+		profiles = []awgProfile{{Name: "awg", Subnet: "10.13.13.0/24"}}
+	}
+	if device.AWGProfiles == nil {
+		device.AWGProfiles = map[string]deviceAWGProfile{}
+	}
+	for _, profile := range profiles {
+		name := normalizeAWGProfileName(profile.Name)
+		if name == "" {
+			name = "awg"
+		}
+		creds := device.AWGProfiles[name]
+		if name == "awg" {
+			creds.AWGPublicKey = device.AWGPublicKey
+			if creds.InternalIP == "" {
+				creds.InternalIP = device.InternalIP
+			}
+			if creds.PSK2 == "" {
+				creds.PSK2 = device.PSK2
+			}
+		}
+		if strings.TrimSpace(creds.AWGPublicKey) == "" {
+			creds.AWGPublicKey = awgPublic
+		}
+		if strings.TrimSpace(creds.AWGPublicKey) != awgPublic {
+			return fmt.Errorf("device awg public key mismatch for profile %s", name)
+		}
+		if strings.TrimSpace(creds.InternalIP) == "" {
+			ip, err := s.allocateDeviceIPForProfile(tx, name, profile.Subnet)
+			if err != nil {
+				return err
+			}
+			creds.InternalIP = ip
+		}
+		if strings.TrimSpace(creds.PSK2) == "" {
+			psk, err := randomBase64Key()
+			if err != nil {
+				return err
+			}
+			creds.PSK2 = psk
+		}
+		device.AWGProfiles[name] = creds
+		if name == "awg" {
+			device.InternalIP = creds.InternalIP
+			device.PSK2 = creds.PSK2
+		}
+	}
+	return nil
+}
+
+func baseAWGSubnet(profiles []awgProfile) string {
+	for _, profile := range profiles {
+		if normalizeAWGProfileName(profile.Name) == "awg" && strings.TrimSpace(profile.Subnet) != "" {
+			return profile.Subnet
+		}
+	}
+	if len(profiles) > 0 && strings.TrimSpace(profiles[0].Subnet) != "" {
+		return profiles[0].Subnet
+	}
+	return "10.13.13.0/24"
 }
 
 func (s *orchStore) devices() ([]deviceRecord, error) {
@@ -716,6 +838,13 @@ func (s *orchStore) applyDeviceUsageAndBlocks(reports []deviceUsage, now time.Ti
 				changed = applyDeviceUsageReport(&rec, report, now) || changed
 			} else if report, ok := byAWG[strings.TrimSpace(rec.AWGPublicKey)]; ok {
 				changed = applyDeviceUsageReport(&rec, report, now) || changed
+			} else {
+				for _, profile := range rec.AWGProfiles {
+					if report, ok := byAWG[strings.TrimSpace(profile.AWGPublicKey)]; ok {
+						changed = applyDeviceUsageReport(&rec, report, now) || changed
+						break
+					}
+				}
 			}
 			reason := ""
 			if deviceLimitsExpired(rec.Limits, now) {
@@ -1243,6 +1372,56 @@ func (s *orchStore) allocateDeviceIP(tx *bolt.Tx, cidr string) (string, error) {
 			return err
 		}
 		addrText := strings.TrimSuffix(strings.TrimSpace(rec.InternalIP), "/32")
+		if addr, err := netip.ParseAddr(addrText); err == nil {
+			used[addr] = struct{}{}
+		}
+		return nil
+	}); err != nil {
+		return "", err
+	}
+	addr := prefix.Addr()
+	if !addr.Is4() {
+		return "", errors.New("device IP pool must be IPv4")
+	}
+	raw := addr.As4()
+	for i := 10; i < 255; i++ {
+		raw[3] = byte(i)
+		next := netip.AddrFrom4(raw)
+		if !prefix.Contains(next) {
+			break
+		}
+		if _, ok := used[next]; ok {
+			continue
+		}
+		return next.String() + "/32", nil
+	}
+	return "", errors.New("device IP pool exhausted")
+}
+
+func (s *orchStore) allocateDeviceIPForProfile(tx *bolt.Tx, profileName, cidr string) (string, error) {
+	profileName = normalizeAWGProfileName(profileName)
+	if profileName == "" || profileName == "awg" {
+		return s.allocateDeviceIP(tx, cidr)
+	}
+	prefix, err := netip.ParsePrefix(strings.TrimSpace(cidr))
+	if err != nil || !prefix.Addr().Is4() {
+		prefix = netip.MustParsePrefix("10.13.13.0/24")
+	}
+	used := map[netip.Addr]struct{}{}
+	db := tx.Bucket(bucketDevices)
+	if err := db.ForEach(func(_, raw []byte) error {
+		var rec deviceRecord
+		if err := s.openJSON(raw, &rec); err != nil {
+			return err
+		}
+		if rec.AWGProfiles == nil {
+			return nil
+		}
+		creds, ok := rec.AWGProfiles[profileName]
+		if !ok {
+			return nil
+		}
+		addrText := strings.TrimSuffix(strings.TrimSpace(creds.InternalIP), "/32")
 		if addr, err := netip.ParseAddr(addrText); err == nil {
 			used[addr] = struct{}{}
 		}
