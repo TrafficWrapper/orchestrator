@@ -664,7 +664,7 @@ func (s *server) handleDeviceEnroll(peer []byte, raw []byte) (any, error) {
 		case storedAWGPublic == "" || storedAWGPublic != awgPublic:
 			return deviceEnrollResponse{OK: false, Error: "device awg public key mismatch"}, nil
 		}
-		bundle, err := s.buildClientBundle(0)
+		bundle, err := s.buildClientBundleForClient(0, existing.ClientVersion)
 		if err != nil {
 			return nil, err
 		}
@@ -701,7 +701,7 @@ func (s *server) handleDeviceEnroll(peer []byte, raw []byte) (any, error) {
 	if err != nil {
 		return deviceEnrollResponse{OK: false, Error: err.Error()}, nil
 	}
-	bundle, err := s.buildClientBundle(0)
+	bundle, err := s.buildClientBundleForClient(0, stored.ClientVersion)
 	if err != nil {
 		return nil, err
 	}
@@ -1117,6 +1117,10 @@ func (s *server) buildBundles(rec workerRecord) (signedConfig, signedConfig, err
 }
 
 func (s *server) buildClientBundle(minSeq int64) (signedConfig, error) {
+	return s.buildClientBundleForClient(minSeq, "")
+}
+
+func (s *server) buildClientBundleForClient(minSeq int64, clientVersion string) (signedConfig, error) {
 	workers, err := s.store.workers()
 	if err != nil {
 		return signedConfig{}, err
@@ -1137,7 +1141,7 @@ func (s *server) buildClientBundle(minSeq int64) (signedConfig, error) {
 		if !workerFreshForClients(rec, issued) {
 			continue
 		}
-		item, ok := clientWorkerPayload(rec)
+		item, ok := clientWorkerPayloadForClient(rec, clientVersion)
 		if ok {
 			items = append(items, item)
 		}
@@ -1167,11 +1171,15 @@ func (s *server) buildClientBundle(minSeq int64) (signedConfig, error) {
 }
 
 func clientWorkerPayload(rec workerRecord) (map[string]any, bool) {
+	return clientWorkerPayloadForClient(rec, "")
+}
+
+func clientWorkerPayloadForClient(rec workerRecord, clientVersion string) (map[string]any, bool) {
 	expected := stringFromMap(rec.SelfDescribe, "egress_ip")
 	configURL := stringFromMap(rec.SelfDescribe, "distributor_url")
 	routes := make([]any, 0, 2)
 	if workerProtocolEnabled(rec, "reality") {
-		if route, ok := clientRoutePayload("reality", rec.SelfDescribe["reality"], expected, configURL); ok {
+		if route, ok := clientRoutePayloadForClient("reality", rec.SelfDescribe["reality"], expected, configURL, clientVersion); ok {
 			routes = append(routes, route)
 		}
 	}
@@ -1222,11 +1230,15 @@ func workerProtocolEnabled(rec workerRecord, protocolName string) bool {
 }
 
 func clientRoutePayload(routeType string, raw any, expected, configURL string) (map[string]any, bool) {
+	return clientRoutePayloadForClient(routeType, raw, expected, configURL, "")
+}
+
+func clientRoutePayloadForClient(routeType string, raw any, expected, configURL, clientVersion string) (map[string]any, bool) {
 	params, ok := raw.(map[string]any)
 	if !ok || len(params) == 0 {
 		return nil, false
 	}
-	routeParams := canonicalClientRouteParams(routeType, params)
+	routeParams := canonicalClientRouteParamsForClient(routeType, params, clientVersion)
 	route := cloneMap(routeParams)
 	route["type"] = routeType
 	route["enabled"] = true
@@ -1256,6 +1268,10 @@ func clientRoutePayload(routeType string, raw any, expected, configURL string) (
 }
 
 func canonicalClientRouteParams(routeType string, params map[string]any) map[string]any {
+	return canonicalClientRouteParamsForClient(routeType, params, "")
+}
+
+func canonicalClientRouteParamsForClient(routeType string, params map[string]any, clientVersion string) map[string]any {
 	out := cloneMap(params)
 	switch normalizeProtocolName(routeType) {
 	case "reality":
@@ -1272,7 +1288,7 @@ func canonicalClientRouteParams(routeType string, params map[string]any) map[str
 			out["network"] = "tcp"
 		}
 		if firstStringFromMap(params, "fingerprint") == "" {
-			out["fingerprint"] = realityFingerprintDefault()
+			out["fingerprint"] = realityFingerprintForClientVersion(clientVersion)
 		}
 		if firstStringFromMap(params, "spiderX") == "" {
 			out["spiderX"] = "/"

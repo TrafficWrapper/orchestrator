@@ -1,6 +1,9 @@
 package main
 
-import "testing"
+import (
+	"encoding/json"
+	"testing"
+)
 
 func TestClientVersionCode(t *testing.T) {
 	tests := []struct {
@@ -57,4 +60,53 @@ func TestRealityFingerprintForClientVersion(t *testing.T) {
 	if got := realityFingerprintForClientVersion("0.1.16"); got != "chrome" {
 		t.Fatalf("min0 fp=%q want chrome", got)
 	}
+}
+
+func TestBuildClientBundleRealityFingerprintVersionGate(t *testing.T) {
+	t.Setenv("REALITY_FP_DEFAULT", "chrome")
+	t.Setenv("REALITY_FP_MODERN", "utls-modern")
+	t.Setenv("REALITY_FP_MODERN_MIN_VC", "116")
+	s := newTestServer(t)
+	addApprovedWorker(t, s)
+
+	if got := clientBundleRealityFingerprint(t, s, "0.1.15"); got != "chrome" {
+		t.Fatalf("old client fingerprint=%q want chrome", got)
+	}
+	if got := clientBundleRealityFingerprint(t, s, "TrafficWrapper 0.1.16 (code 17)"); got != "utls-modern" {
+		t.Fatalf("new client fingerprint=%q want utls-modern", got)
+	}
+	t.Setenv("REALITY_FP_MODERN", "")
+	if got := clientBundleRealityFingerprint(t, s, "0.1.16"); got != "chrome" {
+		t.Fatalf("modern empty fingerprint=%q want chrome", got)
+	}
+}
+
+func clientBundleRealityFingerprint(t *testing.T, s *server, clientVersion string) string {
+	t.Helper()
+	bundle, err := s.buildClientBundleForClient(0, clientVersion)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var root struct {
+		Workers []struct {
+			Routes []struct {
+				Type   string         `json:"type"`
+				Params map[string]any `json:"params"`
+			} `json:"routes"`
+		} `json:"workers"`
+	}
+	if err := json.Unmarshal([]byte(bundle.ConfigJSON), &root); err != nil {
+		t.Fatal(err)
+	}
+	for _, worker := range root.Workers {
+		for _, route := range worker.Routes {
+			if route.Type == "reality" {
+				if value, _ := route.Params["fingerprint"].(string); value != "" {
+					return value
+				}
+			}
+		}
+	}
+	t.Fatalf("reality route fingerprint not found in %s", bundle.ConfigJSON)
+	return ""
 }
