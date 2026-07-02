@@ -1299,9 +1299,6 @@ func approvedDevicePayloads(devices []deviceRecord) []any {
 			"psk2":           device.PSK2,
 			"status":         device.Status,
 		}
-		if fp := realityFingerprintForClientVersion(device.ClientVersion); fp != "" {
-			payload["reality_fingerprint"] = fp
-		}
 		if !deviceLimitsEmpty(device.Limits) {
 			payload["limits"] = device.Limits
 			if device.Limits.ExpiresAt != nil && strings.TrimSpace(*device.Limits.ExpiresAt) != "" {

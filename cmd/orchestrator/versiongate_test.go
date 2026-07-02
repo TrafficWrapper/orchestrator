@@ -58,21 +58,3 @@ func TestRealityFingerprintForClientVersion(t *testing.T) {
 		t.Fatalf("min0 fp=%q want chrome", got)
 	}
 }
-
-func TestApprovedDevicePayloadUsesVersionGatedRealityFingerprint(t *testing.T) {
-	t.Setenv("REALITY_FP_DEFAULT", "chrome")
-	t.Setenv("REALITY_FP_MODERN", "utls-modern")
-	t.Setenv("REALITY_FP_MODERN_MIN_VC", "116")
-	payloads := approvedDevicePayloads([]deviceRecord{{
-		ID:            "device-a",
-		Status:        "approved",
-		ClientVersion: "0.1.16",
-	}})
-	if len(payloads) != 1 {
-		t.Fatalf("payload count=%d", len(payloads))
-	}
-	payload := payloads[0].(map[string]any)
-	if payload["reality_fingerprint"] != "utls-modern" {
-		t.Fatalf("bad device fingerprint payload: %#v", payload)
-	}
-}
