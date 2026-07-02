@@ -195,6 +195,7 @@ type ackRequest struct {
 	SelfCheck        string         `json:"self_check"`
 	EgressIPObserved string         `json:"egress_ip_observed"`
 	SelfDescribe     map[string]any `json:"self_describe,omitempty"`
+	Usage            []deviceUsage  `json:"usage,omitempty"`
 }
 
 type ackResponse struct {
@@ -204,6 +205,14 @@ type ackResponse struct {
 	AppliedSeq    int64  `json:"applied_seq,omitempty"`
 	EgressIPProbe string `json:"egress_ip_probe,omitempty"`
 	EgressMatch   bool   `json:"egress_match"`
+	QuotaBlocks   int    `json:"quota_blocks,omitempty"`
+}
+
+type deviceUsage struct {
+	DeviceID     string `json:"device_id,omitempty"`
+	AWGPublicKey string `json:"awg_public_key,omitempty"`
+	RxBytes      uint64 `json:"rx_bytes,omitempty"`
+	TxBytes      uint64 `json:"tx_bytes,omitempty"`
 }
 
 type nudgeRequest struct {
@@ -795,7 +804,18 @@ func (s *server) handleAck(peer []byte, raw []byte) (any, error) {
 	if err := s.store.updateAck(rec.ID, req.AppliedVersion, req.EgressIPObserved, req.SelfDescribe); err != nil {
 		return nil, err
 	}
-	return ackResponse{OK: true, DesiredSeq: rec.DesiredSeq, AppliedSeq: req.AppliedVersion, EgressIPProbe: probe, EgressMatch: egressMatch}, nil
+	quotaBlocks, err := s.store.applyDeviceUsageAndBlocks(req.Usage, time.Now().UTC())
+	if err != nil {
+		return nil, err
+	}
+	if quotaBlocks > 0 {
+		log.Printf("quota enforcement blocked devices count=%d worker=%s", quotaBlocks, rec.ID)
+	}
+	updated, err := s.store.worker(rec.ID)
+	if err != nil {
+		return nil, err
+	}
+	return ackResponse{OK: true, DesiredSeq: updated.DesiredSeq, AppliedSeq: req.AppliedVersion, EgressIPProbe: probe, EgressMatch: egressMatch, QuotaBlocks: quotaBlocks}, nil
 }
 
 func (s *server) handleWorkerTelemetry(peer []byte, raw []byte) (any, error) {
@@ -1252,7 +1272,7 @@ func canonicalClientRouteParams(routeType string, params map[string]any) map[str
 			out["network"] = "tcp"
 		}
 		if firstStringFromMap(params, "fingerprint") == "" {
-			out["fingerprint"] = "chrome"
+			out["fingerprint"] = realityFingerprintDefault()
 		}
 		if firstStringFromMap(params, "spiderX") == "" {
 			out["spiderX"] = "/"
@@ -1278,6 +1298,9 @@ func approvedDevicePayloads(devices []deviceRecord) []any {
 			"internal_ip":    device.InternalIP,
 			"psk2":           device.PSK2,
 			"status":         device.Status,
+		}
+		if fp := realityFingerprintForClientVersion(device.ClientVersion); fp != "" {
+			payload["reality_fingerprint"] = fp
 		}
 		if !deviceLimitsEmpty(device.Limits) {
 			payload["limits"] = device.Limits

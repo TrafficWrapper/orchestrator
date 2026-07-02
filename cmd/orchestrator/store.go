@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"net/netip"
 	"os"
 	"path/filepath"
@@ -87,6 +88,11 @@ type deviceRecord struct {
 	PSK2            string       `json:"psk2,omitempty"`
 	BootstrapToken  string       `json:"bootstrap_token"`
 	Limits          deviceLimits `json:"limits,omitempty"`
+	UsageRxBytes    uint64       `json:"usage_rx_bytes,omitempty"`
+	UsageTxBytes    uint64       `json:"usage_tx_bytes,omitempty"`
+	UsageUpdatedAt  *time.Time   `json:"usage_updated_at,omitempty"`
+	BlockedAt       *time.Time   `json:"blocked_at,omitempty"`
+	BlockedReason   string       `json:"blocked_reason,omitempty"`
 	CreatedAt       time.Time    `json:"created_at"`
 	ConfigSeq       int64        `json:"config_seq"`
 }
@@ -265,6 +271,21 @@ func parseDeviceLimitsRaw(raw json.RawMessage) (deviceLimits, error) {
 
 func deviceLimitsEmpty(limits deviceLimits) bool {
 	return limits.TrafficQuotaBytes == 0 && strings.TrimSpace(limits.RateLimit) == "" && limits.ExpiresAt == nil
+}
+
+func deviceLimitsExpired(limits deviceLimits, now time.Time) bool {
+	if limits.ExpiresAt == nil {
+		return false
+	}
+	value := strings.TrimSpace(*limits.ExpiresAt)
+	if value == "" {
+		return false
+	}
+	expiresAt, err := time.Parse(time.RFC3339, value)
+	if err != nil {
+		return false
+	}
+	return !now.Before(expiresAt.UTC())
 }
 
 func (s *orchStore) setAdminPassword(secret string) error {
@@ -666,6 +687,99 @@ func (s *orchStore) updateDeviceClientVersionFromTelemetry(id, version string) (
 		return nil
 	})
 	return changed, err
+}
+
+func (s *orchStore) applyDeviceUsageAndBlocks(reports []deviceUsage, now time.Time) (int, error) {
+	byID := make(map[string]deviceUsage, len(reports))
+	byAWG := make(map[string]deviceUsage, len(reports))
+	for _, report := range reports {
+		report.DeviceID = strings.TrimSpace(report.DeviceID)
+		report.AWGPublicKey = strings.TrimSpace(report.AWGPublicKey)
+		if report.DeviceID != "" {
+			byID[report.DeviceID] = report
+		}
+		if report.AWGPublicKey != "" {
+			byAWG[report.AWGPublicKey] = report
+		}
+	}
+	blocked := 0
+	changedAny := false
+	err := s.db.Update(func(tx *bolt.Tx) error {
+		b := tx.Bucket(bucketDevices)
+		err := b.ForEach(func(k, raw []byte) error {
+			var rec deviceRecord
+			if err := s.openJSON(raw, &rec); err != nil {
+				return err
+			}
+			changed := false
+			if report, ok := byID[rec.ID]; ok {
+				changed = applyDeviceUsageReport(&rec, report, now) || changed
+			} else if report, ok := byAWG[strings.TrimSpace(rec.AWGPublicKey)]; ok {
+				changed = applyDeviceUsageReport(&rec, report, now) || changed
+			}
+			reason := ""
+			if deviceLimitsExpired(rec.Limits, now) {
+				reason = "expires_at"
+			} else if rec.Limits.TrafficQuotaBytes > 0 && rec.UsageRxBytes+rec.UsageTxBytes >= rec.Limits.TrafficQuotaBytes {
+				reason = "traffic_quota_bytes"
+			}
+			if reason != "" && rec.Status == "approved" {
+				rec.Status = "revoked"
+				rec.BlockedReason = reason
+				blockedAt := now.UTC()
+				rec.BlockedAt = &blockedAt
+				if rec.ConfigSeq < 1 {
+					rec.ConfigSeq = 1
+				}
+				log.Printf("device quota block id=%s reason=%s usage_rx=%d usage_tx=%d quota=%d", rec.ID, reason, rec.UsageRxBytes, rec.UsageTxBytes, rec.Limits.TrafficQuotaBytes)
+				blocked++
+				changed = true
+			}
+			if !changed {
+				return nil
+			}
+			sealed, err := s.sealJSON(rec)
+			if err != nil {
+				return err
+			}
+			if err := b.Put(k, sealed); err != nil {
+				return err
+			}
+			changedAny = true
+			return nil
+		})
+		if err != nil {
+			return err
+		}
+		if blocked > 0 {
+			return s.bumpWorkerSeqsTx(tx)
+		}
+		return nil
+	})
+	if err != nil {
+		return 0, err
+	}
+	if !changedAny {
+		return 0, nil
+	}
+	return blocked, nil
+}
+
+func applyDeviceUsageReport(rec *deviceRecord, report deviceUsage, now time.Time) bool {
+	changed := false
+	if report.RxBytes > rec.UsageRxBytes {
+		rec.UsageRxBytes = report.RxBytes
+		changed = true
+	}
+	if report.TxBytes > rec.UsageTxBytes {
+		rec.UsageTxBytes = report.TxBytes
+		changed = true
+	}
+	if changed {
+		updatedAt := now.UTC()
+		rec.UsageUpdatedAt = &updatedAt
+	}
+	return changed
 }
 
 func (s *orchStore) telemetrySnapshots() (map[string]telemetrySnapshotRecord, error) {
