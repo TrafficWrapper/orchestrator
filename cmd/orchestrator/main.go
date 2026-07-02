@@ -66,6 +66,7 @@ type server struct {
 	loginLimiterMu sync.Mutex
 	loginLimiter   *loginLimiter
 	audit          *auditLog
+	discoverySeqMu sync.Mutex
 	adminSessions  sync.Map
 	botMu          sync.Mutex
 	authApprover   authApprover
@@ -381,6 +382,8 @@ func runServe(cfg orchConfig) error {
 	go s.runWorkerJanitor(context.Background())
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write([]byte("ok\n")) })
+	mux.HandleFunc("/discovery/endpoints.json", s.handleDiscoveryEndpointsJSON)
+	mux.HandleFunc("/discovery/endpoints.json.minisig", s.handleDiscoveryEndpointsMinisig)
 	s.registerWebRoutes(mux)
 	mux.HandleFunc("/w/v1/handshake/start", s.handleHandshakeStart)
 	mux.HandleFunc("/w/v1/enroll", s.handleNoise(s.handleEnroll))
@@ -413,6 +416,7 @@ func runServe(cfg orchConfig) error {
 	mux.HandleFunc("/admin/v1/apk/inspect", s.handleAdminAPKInspect)
 	mux.HandleFunc("/admin/v1/apk/draft", s.handleAdminAPKDraft)
 	mux.HandleFunc("/admin/v1/apk/publish", s.handleAdminAPKPublish)
+	mux.HandleFunc("/admin/v1/discovery/bump", s.handleAdminDiscoveryBump)
 	mux.HandleFunc("/admin/v1/status", s.handleAdminStatus)
 	addr := cfg.Listen
 	log.Printf("orchestrator serve listen=%s tls=%t public_key=%s", addr, cfg.TLS, protocol.KeyToBase64(static.Public))
@@ -1161,6 +1165,9 @@ func (s *server) buildClientBundleForClient(minSeq int64, clientVersion string) 
 	}
 	if strings.TrimSpace(s.cfg.UpdatePublicKey) != "" {
 		clientPayload["update_pubkey"] = strings.TrimSpace(s.cfg.UpdatePublicKey)
+	}
+	if pub := s.discoveryPublicKey(); pub != "" {
+		clientPayload["discovery_pubkey"] = pub
 	}
 	if len(s.cfg.DNSServers) > 0 {
 		clientPayload["dns_servers"] = append([]string(nil), s.cfg.DNSServers...)
