@@ -46,6 +46,7 @@ type orchConfig struct {
 	EgressProbeURL  string
 	AdminSecret     string
 	UpdatePublicKey string
+	DNSServers      []string
 	SeedAPKPath     string
 	SeedVersionCode int64
 	SeedVersionName string
@@ -331,6 +332,7 @@ func readConfig() orchConfig {
 		EgressProbeURL:  os.Getenv("ORCH_EGRESS_PROBE_URL"),
 		AdminSecret:     os.Getenv("ORCH_ADMIN_SECRET"),
 		UpdatePublicKey: os.Getenv("ORCH_UPDATE_PUBKEY"),
+		DNSServers:      splitCSV(os.Getenv("ORCH_DNS_SERVERS")),
 		SeedAPKPath:     getenv("SEED_APK_PATH", "./seed/app.apk"),
 		SeedVersionCode: getenvInt64("SEED_APK_VERSION_CODE", 1),
 		SeedVersionName: getenv("SEED_APK_VERSION_NAME", "seed"),
@@ -1159,6 +1161,9 @@ func (s *server) buildClientBundleForClient(minSeq int64, clientVersion string) 
 	}
 	if strings.TrimSpace(s.cfg.UpdatePublicKey) != "" {
 		clientPayload["update_pubkey"] = strings.TrimSpace(s.cfg.UpdatePublicKey)
+	}
+	if len(s.cfg.DNSServers) > 0 {
+		clientPayload["dns_servers"] = append([]string(nil), s.cfg.DNSServers...)
 	}
 	clientJSON, err := canonicalJSON(clientPayload)
 	if err != nil {

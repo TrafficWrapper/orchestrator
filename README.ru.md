@@ -191,6 +191,7 @@ unset ORCH_NEW_ADMIN_PASSWORD
 | `ORCH_ADMIN_SECRET` | Optional seed для first-run admin password. Лучше использовать generated initial password или safe CLI input. | Опц. | empty | Если нужен, передавайте через secret manager/env, не коммитьте. |
 | `ORCH_ADMIN_SESSION_TOKEN` | Optional bearer session token для local CLI admin requests при запущенном сервере. | Опц. | empty | Получите из `/admin/v1/login`; не кладите в shell history или git. |
 | `ORCH_UPDATE_PUBKEY` | Public minisign key для APK update manifests. | Опц. | empty | Для управляемого update-канала задайте свой offline `update.pub` до первого старта. Empty разрешает seed-on-first-run сгенерировать demo key в local state. |
+| `ORCH_DNS_SERVERS` | Optional comma-separated DNS servers, попадают в client configs. | Опц. | empty | Пример: `1.1.1.1,1.0.0.1`. Empty оставляет built-in in-tunnel defaults клиента. |
 | `ORCH_TLS` | Включает built-in self-signed TLS listener, если не `0`. | Опц. | `1` | `0` только для local dev за доверенным транспортом. |
 | `SEED_APK_PATH` | Путь к APK для seed-on-first-run. | Опц. | `./seed/app.apk` | Compose монтирует `./seed` и ставит `/seed/app.apk`. |
 | `SEED_APK_VERSION_CODE` | Version code в generated seed update manifest. | Опц. | `1` | Должен совпадать с seed APK version code. |

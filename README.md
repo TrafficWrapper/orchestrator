@@ -193,6 +193,7 @@ provided Compose file:
 | `ORCH_ADMIN_SECRET` | Optional first-run admin password seed. Prefer the generated initial password or safe CLI input. | Optional | empty | If used, pass via a secret manager/env, never commit it. |
 | `ORCH_ADMIN_SESSION_TOKEN` | Optional bearer session token used by local CLI admin requests while the server is running. | Optional | empty | Get it from `/admin/v1/login`; do not put it in shell history or git. |
 | `ORCH_UPDATE_PUBKEY` | Update minisign public key for APK update manifests. | Optional | empty | For a managed update channel, set this from your offline `update.pub` before the first start. Leaving it empty lets seed-on-first-run generate a demo key in local state. |
+| `ORCH_DNS_SERVERS` | Optional comma-separated DNS servers embedded into client configs. | Optional | empty | Example: `1.1.1.1,1.0.0.1`. Empty lets clients use their built-in in-tunnel defaults. |
 | `ORCH_TLS` | Enables the built-in self-signed TLS listener unless set to `0`. | Optional | `1` | Use `0` only for local dev behind trusted transport. |
 | `SEED_APK_PATH` | APK path used by seed-on-first-run. | Optional | `./seed/app.apk` | Compose mounts `./seed` and defaults to `/seed/app.apk`. |
 | `SEED_APK_VERSION_CODE` | Version code written into the generated seed update manifest. | Optional | `1` | Match the seed APK version code. |

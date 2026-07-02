@@ -1,6 +1,7 @@
 package main
 
 import (
+	"log"
 	"os"
 	"strconv"
 	"strings"
@@ -83,7 +84,7 @@ func minVersionFor(feature string) int {
 
 func realityFingerprintDefault() string {
 	if value := strings.TrimSpace(os.Getenv("REALITY_FP_DEFAULT")); value != "" {
-		return value
+		return clampRealityFingerprint(value)
 	}
 	return "chrome"
 }
@@ -96,7 +97,20 @@ func realityFingerprintForClientVersion(clientVersion string) string {
 		return defaultFP
 	}
 	if clientVersionCode(clientVersion) >= minVC {
-		return modernFP
+		return clampRealityFingerprint(modernFP)
 	}
 	return defaultFP
+}
+
+func clampRealityFingerprint(value string) string {
+	fp := strings.ToLower(strings.TrimSpace(value))
+	switch fp {
+	case "chrome", "firefox", "safari", "ios", "android", "edge", "360", "qq", "random", "randomized":
+		return fp
+	case "":
+		return "chrome"
+	default:
+		log.Printf("invalid REALITY fingerprint %q; falling back to chrome", value)
+		return "chrome"
+	}
 }

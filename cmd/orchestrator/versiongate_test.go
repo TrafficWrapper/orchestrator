@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"reflect"
 	"testing"
 )
 
@@ -43,28 +44,36 @@ func TestMinVersionFor(t *testing.T) {
 
 func TestRealityFingerprintForClientVersion(t *testing.T) {
 	t.Setenv("REALITY_FP_DEFAULT", "chrome")
-	t.Setenv("REALITY_FP_MODERN", "utls-modern")
+	t.Setenv("REALITY_FP_MODERN", "firefox")
 	t.Setenv("REALITY_FP_MODERN_MIN_VC", "116")
 	if got := realityFingerprintForClientVersion("0.1.15"); got != "chrome" {
 		t.Fatalf("old client fp=%q want chrome", got)
 	}
-	if got := realityFingerprintForClientVersion("TrafficWrapper 0.1.16 (code 17)"); got != "utls-modern" {
-		t.Fatalf("new client fp=%q want utls-modern", got)
+	if got := realityFingerprintForClientVersion("TrafficWrapper 0.1.16 (code 17)"); got != "firefox" {
+		t.Fatalf("new client fp=%q want firefox", got)
 	}
 	t.Setenv("REALITY_FP_MODERN", "")
 	if got := realityFingerprintForClientVersion("0.1.16"); got != "chrome" {
 		t.Fatalf("empty modern fp=%q want chrome", got)
 	}
-	t.Setenv("REALITY_FP_MODERN", "utls-modern")
+	t.Setenv("REALITY_FP_MODERN", "firefox")
 	t.Setenv("REALITY_FP_MODERN_MIN_VC", "0")
 	if got := realityFingerprintForClientVersion("0.1.16"); got != "chrome" {
 		t.Fatalf("min0 fp=%q want chrome", got)
+	}
+	t.Setenv("REALITY_FP_MODERN", "utls-modern")
+	t.Setenv("REALITY_FP_MODERN_MIN_VC", "116")
+	if got := realityFingerprintForClientVersion("0.1.16"); got != "chrome" {
+		t.Fatalf("invalid modern fp=%q want chrome", got)
+	}
+	if got := clampRealityFingerprint(" Android "); got != "android" {
+		t.Fatalf("clamp valid fp=%q want android", got)
 	}
 }
 
 func TestBuildClientBundleRealityFingerprintVersionGate(t *testing.T) {
 	t.Setenv("REALITY_FP_DEFAULT", "chrome")
-	t.Setenv("REALITY_FP_MODERN", "utls-modern")
+	t.Setenv("REALITY_FP_MODERN", "firefox")
 	t.Setenv("REALITY_FP_MODERN_MIN_VC", "116")
 	s := newTestServer(t)
 	addApprovedWorker(t, s)
@@ -72,12 +81,36 @@ func TestBuildClientBundleRealityFingerprintVersionGate(t *testing.T) {
 	if got := clientBundleRealityFingerprint(t, s, "0.1.15"); got != "chrome" {
 		t.Fatalf("old client fingerprint=%q want chrome", got)
 	}
-	if got := clientBundleRealityFingerprint(t, s, "TrafficWrapper 0.1.16 (code 17)"); got != "utls-modern" {
-		t.Fatalf("new client fingerprint=%q want utls-modern", got)
+	if got := clientBundleRealityFingerprint(t, s, "TrafficWrapper 0.1.16 (code 17)"); got != "firefox" {
+		t.Fatalf("new client fingerprint=%q want firefox", got)
+	}
+	t.Setenv("REALITY_FP_MODERN", "utls-modern")
+	if got := clientBundleRealityFingerprint(t, s, "0.1.16"); got != "chrome" {
+		t.Fatalf("invalid modern fingerprint=%q want chrome", got)
 	}
 	t.Setenv("REALITY_FP_MODERN", "")
 	if got := clientBundleRealityFingerprint(t, s, "0.1.16"); got != "chrome" {
 		t.Fatalf("modern empty fingerprint=%q want chrome", got)
+	}
+}
+
+func TestBuildClientBundleDNSServers(t *testing.T) {
+	s := newTestServer(t)
+	s.cfg.DNSServers = []string{"1.1.1.1", "1.0.0.1"}
+	addApprovedWorker(t, s)
+
+	bundle, err := s.buildClientBundleForClient(0, "0.1.17")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var root struct {
+		DNSServers []string `json:"dns_servers"`
+	}
+	if err := json.Unmarshal([]byte(bundle.ConfigJSON), &root); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(root.DNSServers, s.cfg.DNSServers) {
+		t.Fatalf("dns_servers=%v want %v", root.DNSServers, s.cfg.DNSServers)
 	}
 }
 
