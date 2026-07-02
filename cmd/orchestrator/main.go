@@ -1292,9 +1292,11 @@ func canonicalClientRouteParamsForClient(routeType string, params map[string]any
 		if firstStringFromMap(params, "network") == "" {
 			out["network"] = "tcp"
 		}
-		if firstStringFromMap(params, "fingerprint") == "" {
-			out["fingerprint"] = realityFingerprintForClientVersion(clientVersion)
+		fingerprint := firstStringFromMap(params, "fingerprint")
+		if fingerprint == "" {
+			fingerprint = realityFingerprintForClientVersion(clientVersion)
 		}
+		out["fingerprint"] = clampRealityFingerprint(fingerprint)
 		if firstStringFromMap(params, "spiderX") == "" {
 			out["spiderX"] = "/"
 		}

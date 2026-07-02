@@ -94,6 +94,15 @@ func TestBuildClientBundleRealityFingerprintVersionGate(t *testing.T) {
 	}
 }
 
+func TestBuildClientBundleClampsWorkerSuppliedRealityFingerprint(t *testing.T) {
+	s := newTestServer(t)
+	addApprovedWorkerWithRealityFingerprint(t, s, "utls-modern")
+
+	if got := clientBundleRealityFingerprint(t, s, "0.1.17"); got != "chrome" {
+		t.Fatalf("worker-supplied invalid fingerprint=%q want chrome", got)
+	}
+}
+
 func TestBuildClientBundleDNSServers(t *testing.T) {
 	s := newTestServer(t)
 	s.cfg.DNSServers = []string{"1.1.1.1", "1.0.0.1"}
@@ -111,6 +120,27 @@ func TestBuildClientBundleDNSServers(t *testing.T) {
 	}
 	if !reflect.DeepEqual(root.DNSServers, s.cfg.DNSServers) {
 		t.Fatalf("dns_servers=%v want %v", root.DNSServers, s.cfg.DNSServers)
+	}
+}
+
+func addApprovedWorkerWithRealityFingerprint(t *testing.T, s *server, fingerprint string) {
+	t.Helper()
+	rec, err := s.store.upsertPendingWorker("worker-static-fingerprint", map[string]any{
+		"label":     "Worker FP",
+		"egress_ip": "203.0.113.5",
+		"reality": map[string]any{
+			"address":     "203.0.113.5",
+			"port":        8444,
+			"publicKey":   "pub",
+			"shortId":     "sid",
+			"fingerprint": fingerprint,
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.store.approveWorker(rec.ID); err != nil {
+		t.Fatal(err)
 	}
 }
 
