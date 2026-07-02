@@ -1,6 +1,8 @@
 package main
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -80,15 +82,11 @@ func (s *server) discoveryBundleJSON(now time.Time) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	seq := int64(1)
 	var awg []any
 	var reality []any
 	for _, rec := range workers {
 		if rec.Status != "approved" && rec.Status != "active" {
 			continue
-		}
-		if rec.DesiredSeq > seq {
-			seq = rec.DesiredSeq
 		}
 		if rec.Disabled || !workerFreshForClients(rec, now) {
 			continue
@@ -100,9 +98,16 @@ func (s *server) discoveryBundleJSON(now time.Time) (string, error) {
 			reality = append(reality, item)
 		}
 	}
-	if persisted, err := s.discoverySeq(); err == nil && persisted > seq {
-		seq = persisted
-	} else if err != nil {
+	endpoints := map[string]any{
+		"awg":     awg,
+		"reality": reality,
+	}
+	endpointsJSON, err := canonicalJSON(endpoints)
+	if err != nil {
+		return "", err
+	}
+	seq, err := s.discoverySeqForHash(discoveryHash(endpointsJSON))
+	if err != nil {
 		return "", err
 	}
 	payload := map[string]any{
@@ -111,10 +116,7 @@ func (s *server) discoveryBundleJSON(now time.Time) (string, error) {
 		"seq":        seq,
 		"issued_at":  now.Format(time.RFC3339),
 		"expires_at": now.Add(12 * time.Hour).Format(time.RFC3339),
-		"endpoints": map[string]any{
-			"awg":     awg,
-			"reality": reality,
-		},
+		"endpoints":  endpoints,
 	}
 	jsonText, err := canonicalJSON(payload)
 	if err != nil {
@@ -132,6 +134,32 @@ func (s *server) discoverySeq() (int64, error) {
 	return s.readDiscoverySeqLocked()
 }
 
+func (s *server) discoverySeqForHash(hash string) (int64, error) {
+	s.discoverySeqMu.Lock()
+	defer s.discoverySeqMu.Unlock()
+	current, err := s.readDiscoverySeqLocked()
+	if err != nil {
+		return 0, err
+	}
+	if current < 1 {
+		current = 1
+	}
+	storedHash, err := s.readDiscoveryHashLocked()
+	if err != nil {
+		return 0, err
+	}
+	next := current
+	if storedHash != "" && storedHash != hash {
+		next++
+	}
+	if storedHash != hash || next != current {
+		if err := s.writeDiscoverySeqStateLocked(next, hash); err != nil {
+			return 0, err
+		}
+	}
+	return next, nil
+}
+
 func (s *server) bumpDiscoverySeq() (int64, error) {
 	s.discoverySeqMu.Lock()
 	defer s.discoverySeqMu.Unlock()
@@ -139,21 +167,15 @@ func (s *server) bumpDiscoverySeq() (int64, error) {
 	if err != nil {
 		return 0, err
 	}
-	floor, err := s.discoveryWorkerSeqFloor()
-	if err != nil {
-		return 0, err
-	}
-	if floor > current {
-		current = floor
-	}
 	if current < 1 {
 		current = 1
 	}
 	next := current + 1
-	if err := os.MkdirAll(s.cfg.StateDir, 0o700); err != nil {
+	hash, err := s.readDiscoveryHashLocked()
+	if err != nil {
 		return 0, err
 	}
-	if err := os.WriteFile(s.discoverySeqPath(), []byte(strconv.FormatInt(next, 10)+"\n"), 0o600); err != nil {
+	if err := s.writeDiscoverySeqStateLocked(next, hash); err != nil {
 		return 0, err
 	}
 	return next, nil
@@ -177,22 +199,43 @@ func (s *server) readDiscoverySeqLocked() (int64, error) {
 	return value, nil
 }
 
+func (s *server) readDiscoveryHashLocked() (string, error) {
+	raw, err := os.ReadFile(s.discoveryHashPath())
+	if os.IsNotExist(err) {
+		return "", nil
+	}
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(string(raw)), nil
+}
+
+func (s *server) writeDiscoverySeqStateLocked(seq int64, hash string) error {
+	if err := os.MkdirAll(s.cfg.StateDir, 0o700); err != nil {
+		return err
+	}
+	if err := os.WriteFile(s.discoverySeqPath(), []byte(strconv.FormatInt(seq, 10)+"\n"), 0o600); err != nil {
+		return err
+	}
+	if hash != "" {
+		if err := os.WriteFile(s.discoveryHashPath(), []byte(hash+"\n"), 0o600); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func (s *server) discoverySeqPath() string {
 	return filepath.Join(s.cfg.StateDir, "discovery.seq")
 }
 
-func (s *server) discoveryWorkerSeqFloor() (int64, error) {
-	workers, err := s.store.workers()
-	if err != nil {
-		return 0, err
-	}
-	seq := int64(1)
-	for _, rec := range workers {
-		if rec.DesiredSeq > seq {
-			seq = rec.DesiredSeq
-		}
-	}
-	return seq, nil
+func (s *server) discoveryHashPath() string {
+	return filepath.Join(s.cfg.StateDir, "discovery.hash")
+}
+
+func discoveryHash(value string) string {
+	sum := sha256.Sum256([]byte(value))
+	return hex.EncodeToString(sum[:])
 }
 
 func discoveryAWGEndpoint(rec workerRecord) (map[string]any, bool) {

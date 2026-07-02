@@ -96,3 +96,72 @@ func TestDiscoverySeqBumpPersistsAboveWorkerFloor(t *testing.T) {
 		t.Fatalf("bundle seq=%d want bumped seq=%d", root.Seq, seq)
 	}
 }
+
+func TestDiscoverySeqIsMonotonicAcrossEndpointChangesAndRestart(t *testing.T) {
+	s := newTestServer(t)
+	addApprovedWorkerWithStatic(t, s, "worker-static-a")
+	now := time.Now().UTC()
+
+	seq1 := discoverySeqFromJSON(t, s, now)
+	seqAgain := discoverySeqFromJSON(t, s, now.Add(time.Minute))
+	if seqAgain != seq1 {
+		t.Fatalf("stable endpoints changed seq: first=%d second=%d", seq1, seqAgain)
+	}
+
+	addApprovedDiscoveryWorker(t, s, "worker-static-b", "203.0.113.6")
+	seq2 := discoverySeqFromJSON(t, s, now.Add(2*time.Minute))
+	if seq2 <= seq1 {
+		t.Fatalf("endpoint add did not advance seq: before=%d after=%d", seq1, seq2)
+	}
+
+	if n, err := s.store.markStaleWorkersInactive(now.Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	} else if n == 0 {
+		t.Fatal("expected workers to be marked inactive")
+	}
+	seq3 := discoverySeqFromJSON(t, s, now.Add(3*time.Minute))
+	if seq3 <= seq2 {
+		t.Fatalf("endpoint removal did not advance seq monotonically: before=%d after=%d", seq2, seq3)
+	}
+
+	restarted := &server{cfg: s.cfg, store: s.store}
+	seq4 := discoverySeqFromJSON(t, restarted, now.Add(4*time.Minute))
+	if seq4 != seq3 {
+		t.Fatalf("restart changed stable discovery seq: before=%d after=%d", seq3, seq4)
+	}
+}
+
+func discoverySeqFromJSON(t *testing.T, s *server, now time.Time) int64 {
+	t.Helper()
+	jsonText, err := s.discoveryBundleJSON(now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var root struct {
+		Seq int64 `json:"seq"`
+	}
+	if err := json.Unmarshal([]byte(jsonText), &root); err != nil {
+		t.Fatal(err)
+	}
+	return root.Seq
+}
+
+func addApprovedDiscoveryWorker(t *testing.T, s *server, staticPub string, address string) {
+	t.Helper()
+	rec, err := s.store.upsertPendingWorker(staticPub, map[string]any{
+		"label":     "Worker " + address,
+		"egress_ip": address,
+		"reality": map[string]any{
+			"address":   address,
+			"port":      8444,
+			"publicKey": "pub-" + address,
+			"shortId":   "sid",
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.store.approveWorker(rec.ID); err != nil {
+		t.Fatal(err)
+	}
+}
