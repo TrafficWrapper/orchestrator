@@ -1288,6 +1288,9 @@ func clientRoutePayloadForClient(routeType string, raw any, expected, configURL,
 	if _, ok := route["dialect_id"].(string); !ok {
 		route["dialect_id"] = dialectID(routeParams)
 	}
+	if region := firstStringFromMap(routeParams, "region"); region != "" {
+		route["region"] = region
+	}
 	route["params"] = routeParams
 	return route, true
 }

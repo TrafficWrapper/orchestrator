@@ -1961,6 +1961,7 @@ func TestClientRoutePayloadIncludesCanonicalParams(t *testing.T) {
 		"publicKey":  "reality-pub",
 		"shortId":    "short-id",
 		"serverName": "www.microsoft.com",
+		"region":     "Operator Lab",
 	}, "198.51.100.8", "http://awg-gw:8080/tw")
 	if !ok {
 		t.Fatal("reality route was not built")
@@ -1981,6 +1982,9 @@ func TestClientRoutePayloadIncludesCanonicalParams(t *testing.T) {
 	}
 	if reality["expected_egress_ip"] != "198.51.100.8" || reality["config_url"] != "http://awg-gw:8080/tw" {
 		t.Fatalf("bad reality route: %#v", reality)
+	}
+	if reality["region"] != "Operator Lab" || params["region"] != "Operator Lab" {
+		t.Fatalf("route region was not preserved: route=%#v params=%#v", reality, params)
 	}
 
 	xhttpRoute, ok := clientRoutePayload("reality", map[string]any{
