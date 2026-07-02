@@ -1976,8 +1976,36 @@ func TestClientRoutePayloadIncludesCanonicalParams(t *testing.T) {
 	if flow, ok := params["flow"].(string); ok && flow != "" {
 		t.Fatalf("reality flow should not be forced by orchestrator: %#v", params)
 	}
+	if params["network"] != "tcp" {
+		t.Fatalf("reality network default = %#v, want tcp", params["network"])
+	}
 	if reality["expected_egress_ip"] != "198.51.100.8" || reality["config_url"] != "http://awg-gw:8080/tw" {
 		t.Fatalf("bad reality route: %#v", reality)
+	}
+
+	xhttpRoute, ok := clientRoutePayload("reality", map[string]any{
+		"address":    "worker.example",
+		"port":       443,
+		"public_key": "reality-pub",
+		"short_id":   "short-id",
+		"serverName": "www.microsoft.com",
+		"network":    "xhttp",
+		"xhttp": map[string]any{
+			"path":  "/operator-path",
+			"mode":  "auto",
+			"extra": map[string]any{"headers": map[string]any{"X-Test": "1"}},
+		},
+	}, "198.51.100.8", "")
+	if !ok {
+		t.Fatal("xhttp reality route was not built")
+	}
+	xhttpParams := xhttpRoute["params"].(map[string]any)
+	if xhttpParams["network"] != "xhttp" {
+		t.Fatalf("xhttp network not preserved: %#v", xhttpParams)
+	}
+	xhttp := xhttpParams["xhttp"].(map[string]any)
+	if xhttp["path"] != "/operator-path" || xhttp["mode"] != "auto" {
+		t.Fatalf("xhttp params not preserved: %#v", xhttp)
 	}
 
 	awg, ok := clientRoutePayload("awg", map[string]any{
