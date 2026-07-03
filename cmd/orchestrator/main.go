@@ -1327,7 +1327,7 @@ func canonicalClientRouteParamsForClient(routeType string, params map[string]any
 		}
 		if strings.EqualFold(firstStringFromMap(out, "network"), "xhttp") {
 			delete(out, "flow")
-			normalizeClientXHTTPMode(out)
+			normalizeClientXHTTPParams(out)
 		}
 		fingerprint := firstStringFromMap(params, "fingerprint")
 		if fingerprint == "" {
@@ -1348,12 +1348,13 @@ func canonicalClientRouteParamsForClient(routeType string, params map[string]any
 	return out
 }
 
-func normalizeClientXHTTPMode(params map[string]any) {
+func normalizeClientXHTTPParams(params map[string]any) {
 	raw, ok := params["xhttp"].(map[string]any)
 	if !ok {
 		return
 	}
 	xhttp := cloneMap(raw)
+	delete(xhttp, "host")
 	mode := firstStringFromMap(xhttp, "mode")
 	if mode == "" || strings.EqualFold(mode, "auto") {
 		xhttp["mode"] = "stream-up"
