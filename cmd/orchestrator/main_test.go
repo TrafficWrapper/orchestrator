@@ -1994,6 +1994,7 @@ func TestClientRoutePayloadIncludesCanonicalParams(t *testing.T) {
 		"short_id":   "short-id",
 		"serverName": "www.microsoft.com",
 		"network":    "xhttp",
+		"flow":       "xtls-rprx-vision",
 		"xhttp": map[string]any{
 			"host":  "cdn.operator.example",
 			"path":  "/operator-path",
@@ -2011,6 +2012,9 @@ func TestClientRoutePayloadIncludesCanonicalParams(t *testing.T) {
 	xhttp := xhttpParams["xhttp"].(map[string]any)
 	if xhttp["host"] != "cdn.operator.example" || xhttp["path"] != "/operator-path" || xhttp["mode"] != "auto" {
 		t.Fatalf("xhttp params not preserved: %#v", xhttp)
+	}
+	if _, ok := xhttpParams["flow"]; ok {
+		t.Fatalf("xhttp route should not include vision flow: %#v", xhttpParams)
 	}
 
 	awg, ok := clientRoutePayload("awg", map[string]any{
