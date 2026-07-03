@@ -39,19 +39,21 @@ import (
 )
 
 type orchConfig struct {
-	StateDir        string
-	Listen          string
-	SignerSocket    string
-	PublicURL       string
-	EgressProbeURL  string
-	AdminSecret     string
-	UpdatePublicKey string
-	DNSServers      []string
-	SeedAPKPath     string
-	SeedVersionCode int64
-	SeedVersionName string
-	APKKeepReleases int
-	TLS             bool
+	StateDir                string
+	Listen                  string
+	SignerSocket            string
+	PublicURL               string
+	EgressProbeURL          string
+	AdminSecret             string
+	UpdatePublicKey         string
+	DNSServers              []string
+	DiscoveryNextSinks      []string
+	DiscoveryRescuePointers []string
+	SeedAPKPath             string
+	SeedVersionCode         int64
+	SeedVersionName         string
+	APKKeepReleases         int
+	TLS                     bool
 }
 
 type server struct {
@@ -327,19 +329,21 @@ func runMain() error {
 
 func readConfig() orchConfig {
 	return orchConfig{
-		StateDir:        getenv("ORCH_STATE_DIR", "./orch-state"),
-		Listen:          getenv("ORCH_LISTEN", ":9091"),
-		SignerSocket:    getenv("ORCH_SIGNER_SOCKET", "./orch-state/signer.sock"),
-		PublicURL:       getenv("ORCH_PUBLIC_URL", "https://127.0.0.1:9091"),
-		EgressProbeURL:  os.Getenv("ORCH_EGRESS_PROBE_URL"),
-		AdminSecret:     os.Getenv("ORCH_ADMIN_SECRET"),
-		UpdatePublicKey: os.Getenv("ORCH_UPDATE_PUBKEY"),
-		DNSServers:      splitCSV(os.Getenv("ORCH_DNS_SERVERS")),
-		SeedAPKPath:     getenv("SEED_APK_PATH", "./seed/app.apk"),
-		SeedVersionCode: getenvInt64("SEED_APK_VERSION_CODE", 1),
-		SeedVersionName: getenv("SEED_APK_VERSION_NAME", "seed"),
-		APKKeepReleases: getenvInt("ORCH_APK_KEEP_RELEASES", 5),
-		TLS:             getenv("ORCH_TLS", "1") != "0",
+		StateDir:                getenv("ORCH_STATE_DIR", "./orch-state"),
+		Listen:                  getenv("ORCH_LISTEN", ":9091"),
+		SignerSocket:            getenv("ORCH_SIGNER_SOCKET", "./orch-state/signer.sock"),
+		PublicURL:               getenv("ORCH_PUBLIC_URL", "https://127.0.0.1:9091"),
+		EgressProbeURL:          os.Getenv("ORCH_EGRESS_PROBE_URL"),
+		AdminSecret:             os.Getenv("ORCH_ADMIN_SECRET"),
+		UpdatePublicKey:         os.Getenv("ORCH_UPDATE_PUBKEY"),
+		DNSServers:              splitCSV(os.Getenv("ORCH_DNS_SERVERS")),
+		DiscoveryNextSinks:      splitCSV(os.Getenv("ORCH_DISCOVERY_NEXT_SINKS")),
+		DiscoveryRescuePointers: splitCSV(os.Getenv("ORCH_DISCOVERY_RESCUE_POINTERS")),
+		SeedAPKPath:             getenv("SEED_APK_PATH", "./seed/app.apk"),
+		SeedVersionCode:         getenvInt64("SEED_APK_VERSION_CODE", 1),
+		SeedVersionName:         getenv("SEED_APK_VERSION_NAME", "seed"),
+		APKKeepReleases:         getenvInt("ORCH_APK_KEEP_RELEASES", 5),
+		TLS:                     getenv("ORCH_TLS", "1") != "0",
 	}
 }
 
@@ -1175,6 +1179,9 @@ func (s *server) buildClientBundleForClient(minSeq int64, clientVersion string) 
 	}
 	if pub := s.discoveryPublicKey(); pub != "" {
 		clientPayload["discovery_pubkey"] = pub
+	}
+	if len(s.cfg.DiscoveryRescuePointers) > 0 {
+		clientPayload["discovery_rescue_pointers"] = append([]string(nil), s.cfg.DiscoveryRescuePointers...)
 	}
 	if len(s.cfg.DNSServers) > 0 {
 		clientPayload["dns_servers"] = append([]string(nil), s.cfg.DNSServers...)

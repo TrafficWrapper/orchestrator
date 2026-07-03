@@ -102,7 +102,12 @@ func (s *server) discoveryBundleJSON(now time.Time) (string, error) {
 		"awg":     awg,
 		"reality": reality,
 	}
-	endpointsJSON, err := canonicalJSON(endpoints)
+	nextSinks := discoveryConfiguredURLs(s.cfg.DiscoveryNextSinks)
+	hashInput := map[string]any{"endpoints": endpoints}
+	if len(nextSinks) > 0 {
+		hashInput["next_sinks"] = nextSinks
+	}
+	endpointsJSON, err := canonicalJSON(hashInput)
 	if err != nil {
 		return "", err
 	}
@@ -118,6 +123,9 @@ func (s *server) discoveryBundleJSON(now time.Time) (string, error) {
 		"expires_at": now.Add(12 * time.Hour).Format(time.RFC3339),
 		"endpoints":  endpoints,
 	}
+	if len(nextSinks) > 0 {
+		payload["next_sinks"] = nextSinks
+	}
 	jsonText, err := canonicalJSON(payload)
 	if err != nil {
 		return "", err
@@ -126,6 +134,23 @@ func (s *server) discoveryBundleJSON(now time.Time) (string, error) {
 		return "", err
 	}
 	return jsonText, nil
+}
+
+func discoveryConfiguredURLs(values []string) []string {
+	out := make([]string, 0, len(values))
+	seen := map[string]struct{}{}
+	for _, value := range values {
+		trimmed := strings.TrimSpace(value)
+		if trimmed == "" {
+			continue
+		}
+		if _, ok := seen[trimmed]; ok {
+			continue
+		}
+		seen[trimmed] = struct{}{}
+		out = append(out, trimmed)
+	}
+	return out
 }
 
 func (s *server) discoverySeq() (int64, error) {

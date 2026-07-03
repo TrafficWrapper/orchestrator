@@ -71,6 +71,41 @@ func TestSignedDiscoveryBundleUsesUpdateKey(t *testing.T) {
 	}
 }
 
+func TestDiscoveryBundleNextSinksAndClientRescuePointersAreOptional(t *testing.T) {
+	s := newTestServer(t)
+	addApprovedWorker(t, s)
+	s.cfg.DiscoveryNextSinks = []string{"https://operator.example/discovery", "https://operator.example/discovery", ""}
+	s.cfg.DiscoveryRescuePointers = []string{"https://operator.example/rescue-pointer.json"}
+
+	jsonText, err := s.discoveryBundleJSON(time.Now().UTC())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var root struct {
+		NextSinks []string `json:"next_sinks"`
+	}
+	if err := json.Unmarshal([]byte(jsonText), &root); err != nil {
+		t.Fatal(err)
+	}
+	if len(root.NextSinks) != 1 || root.NextSinks[0] != "https://operator.example/discovery" {
+		t.Fatalf("next_sinks=%v", root.NextSinks)
+	}
+
+	bundle, err := s.buildClientBundleForClient(0, "0.1.25")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var clientRoot struct {
+		RescuePointers []string `json:"discovery_rescue_pointers"`
+	}
+	if err := json.Unmarshal([]byte(bundle.ConfigJSON), &clientRoot); err != nil {
+		t.Fatal(err)
+	}
+	if len(clientRoot.RescuePointers) != 1 || clientRoot.RescuePointers[0] != "https://operator.example/rescue-pointer.json" {
+		t.Fatalf("rescue pointers=%v", clientRoot.RescuePointers)
+	}
+}
+
 func TestDiscoverySeqBumpPersistsAboveWorkerFloor(t *testing.T) {
 	s := newTestServer(t)
 	addApprovedWorker(t, s)
