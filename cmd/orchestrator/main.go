@@ -401,6 +401,9 @@ func runServe(cfg orchConfig) error {
 	mux.HandleFunc("/admin/v1/login", s.handleAdminLogin)
 	mux.HandleFunc("/admin/v1/password/change", s.handleAdminPasswordChange)
 	mux.HandleFunc("/admin/v1/password/force-set", s.handleAdminPasswordForceSet)
+	mux.HandleFunc("/admin/v1/totp/enroll", s.handleAdminTOTPEnroll)
+	mux.HandleFunc("/admin/v1/totp/enable", s.handleAdminTOTPEnable)
+	mux.HandleFunc("/admin/v1/totp/disable", s.handleAdminTOTPDisable)
 	mux.HandleFunc("/admin/v1/bot/status", s.handleAdminBotStatus)
 	mux.HandleFunc("/admin/v1/bot/set-token", s.handleAdminBotSetToken)
 	mux.HandleFunc("/admin/v1/token/create", s.handleAdminTokenCreate)
@@ -1710,7 +1713,8 @@ func (s *server) handleAdminLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req struct {
-		Secret string `json:"secret"`
+		Secret   string `json:"secret"`
+		TOTPCode string `json:"totp_code,omitempty"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
@@ -1734,6 +1738,24 @@ func (s *server) handleAdminLogin(w http.ResponseWriter, r *http.Request) {
 		}
 		s.auditEvent(auditEntry{Event: "admin_login", IP: ip, Result: "failed", Fields: fields})
 		http.Error(w, "invalid admin secret", http.StatusForbidden)
+		return
+	}
+	if enabled, totpOK, err := s.store.verifyAdminTOTP(req.TOTPCode, time.Now().UTC()); err != nil {
+		s.auditEvent(auditEntry{Event: "admin_login", IP: ip, Result: "failed", Fields: map[string]string{"reason": "totp_error"}})
+		http.Error(w, err.Error(), http.StatusForbidden)
+		return
+	} else if enabled && !totpOK {
+		until, locked := limiter.recordFailure(ip)
+		fields := map[string]string{"reason": "bad_totp"}
+		if locked {
+			fields["locked_until"] = until.UTC().Format(time.RFC3339)
+			w.Header().Set("Retry-After", retryAfterSeconds(until, limiter.clock()))
+			s.auditEvent(auditEntry{Event: "admin_login", IP: ip, Result: "locked", Fields: fields})
+			http.Error(w, "too many failed login attempts", http.StatusTooManyRequests)
+			return
+		}
+		s.auditEvent(auditEntry{Event: "admin_login", IP: ip, Result: "failed", Fields: fields})
+		http.Error(w, "invalid totp code", http.StatusForbidden)
 		return
 	}
 	limiter.recordSuccess(ip)
@@ -1782,6 +1804,67 @@ func (s *server) createAdminSession(w http.ResponseWriter, mustChange bool) {
 		"expires_at":    expires.Format(time.RFC3339),
 		"must_change":   mustChange,
 	})
+}
+
+func (s *server) handleAdminTOTPEnroll(w http.ResponseWriter, r *http.Request) {
+	if !s.requireAdmin(w, r) {
+		return
+	}
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	rec, err := s.store.startAdminTOTPEnrollment()
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	s.auditEvent(auditEntry{Event: "admin_totp_enroll", IP: clientIP(r), Result: "ok"})
+	writeJSON(w, map[string]any{
+		"ok":          true,
+		"secret":      rec.Secret,
+		"otpauth_url": totpProvisioningURL(rec.Secret),
+	})
+}
+
+func (s *server) handleAdminTOTPEnable(w http.ResponseWriter, r *http.Request) {
+	if !s.requireAdmin(w, r) {
+		return
+	}
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var req struct {
+		Code string `json:"code"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	if err := s.store.enableAdminTOTP(req.Code, time.Now().UTC()); err != nil {
+		s.auditEvent(auditEntry{Event: "admin_totp_enable", IP: clientIP(r), Result: "failed"})
+		http.Error(w, err.Error(), http.StatusForbidden)
+		return
+	}
+	s.auditEvent(auditEntry{Event: "admin_totp_enable", IP: clientIP(r), Result: "ok"})
+	writeJSON(w, map[string]any{"ok": true})
+}
+
+func (s *server) handleAdminTOTPDisable(w http.ResponseWriter, r *http.Request) {
+	if !s.requireAdmin(w, r) {
+		return
+	}
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if err := s.store.disableAdminTOTP(); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	s.auditEvent(auditEntry{Event: "admin_totp_disable", IP: clientIP(r), Result: "ok"})
+	writeJSON(w, map[string]any{"ok": true})
 }
 
 func (s *server) lookupAdminSession(r *http.Request) (string, string, adminSession, bool) {

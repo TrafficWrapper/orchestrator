@@ -32,6 +32,7 @@ var (
 	metaAdminSecret = []byte("admin_secret")
 	metaAPKRelease  = []byte("apk_release")
 	metaBotSettings = []byte("bot_settings")
+	metaAdminTOTP   = []byte("admin_totp")
 )
 
 type orchStore struct {
@@ -69,6 +70,13 @@ type workerRecord struct {
 	ConfigPriority   *int            `json:"config_priority,omitempty"`
 	ConfigWeight     *int            `json:"config_weight,omitempty"`
 	ProtocolEnabled  map[string]bool `json:"protocol_enabled,omitempty"`
+}
+
+type adminTOTPRecord struct {
+	Secret      string    `json:"secret"`
+	Enabled     bool      `json:"enabled"`
+	LastCounter int64     `json:"last_counter"`
+	UpdatedAt   time.Time `json:"updated_at"`
 }
 
 type deviceRecord struct {
@@ -360,6 +368,109 @@ func (s *orchStore) verifyAdminPassword(secret string) (bool, bool, error) {
 	}
 	ok := protocol.VerifySecret(rec.Hash, strings.TrimSpace(secret))
 	return ok, rec.MustChange, nil
+}
+
+func (s *orchStore) adminTOTP() (adminTOTPRecord, bool, error) {
+	var rec adminTOTPRecord
+	err := s.db.View(func(tx *bolt.Tx) error {
+		raw := tx.Bucket(bucketMeta).Get(metaAdminTOTP)
+		if raw == nil {
+			return nil
+		}
+		return s.openJSON(raw, &rec)
+	})
+	if err != nil {
+		return adminTOTPRecord{}, false, err
+	}
+	if strings.TrimSpace(rec.Secret) == "" {
+		return adminTOTPRecord{}, false, nil
+	}
+	return rec, rec.Enabled, nil
+}
+
+func (s *orchStore) startAdminTOTPEnrollment() (adminTOTPRecord, error) {
+	secret, err := generateTOTPSecret()
+	if err != nil {
+		return adminTOTPRecord{}, err
+	}
+	rec := adminTOTPRecord{Secret: secret, Enabled: false, UpdatedAt: time.Now().UTC()}
+	return rec, s.putAdminTOTPLocked(rec)
+}
+
+func (s *orchStore) enableAdminTOTP(code string, now time.Time) error {
+	return s.db.Update(func(tx *bolt.Tx) error {
+		var rec adminTOTPRecord
+		raw := tx.Bucket(bucketMeta).Get(metaAdminTOTP)
+		if raw == nil {
+			return errors.New("totp enrollment is not started")
+		}
+		if err := s.openJSON(raw, &rec); err != nil {
+			return err
+		}
+		counter, ok := verifyTOTPCode(rec.Secret, code, now, rec.LastCounter)
+		if !ok {
+			return errors.New("invalid totp code")
+		}
+		rec.Enabled = true
+		rec.LastCounter = counter
+		rec.UpdatedAt = now.UTC()
+		sealed, err := s.sealJSON(rec)
+		if err != nil {
+			return err
+		}
+		return tx.Bucket(bucketMeta).Put(metaAdminTOTP, sealed)
+	})
+}
+
+func (s *orchStore) disableAdminTOTP() error {
+	return s.db.Update(func(tx *bolt.Tx) error {
+		return tx.Bucket(bucketMeta).Delete(metaAdminTOTP)
+	})
+}
+
+func (s *orchStore) verifyAdminTOTP(code string, now time.Time) (bool, bool, error) {
+	enabled := false
+	ok := false
+	err := s.db.Update(func(tx *bolt.Tx) error {
+		var rec adminTOTPRecord
+		raw := tx.Bucket(bucketMeta).Get(metaAdminTOTP)
+		if raw == nil {
+			return nil
+		}
+		if err := s.openJSON(raw, &rec); err != nil {
+			return err
+		}
+		if strings.TrimSpace(rec.Secret) == "" || !rec.Enabled {
+			return nil
+		}
+		enabled = true
+		counter, verified := verifyTOTPCode(rec.Secret, code, now, rec.LastCounter)
+		if !verified {
+			return nil
+		}
+		rec.LastCounter = counter
+		rec.UpdatedAt = now.UTC()
+		sealed, err := s.sealJSON(rec)
+		if err != nil {
+			return err
+		}
+		if err := tx.Bucket(bucketMeta).Put(metaAdminTOTP, sealed); err != nil {
+			return err
+		}
+		ok = true
+		return nil
+	})
+	return enabled, ok, err
+}
+
+func (s *orchStore) putAdminTOTPLocked(rec adminTOTPRecord) error {
+	sealed, err := s.sealJSON(rec)
+	if err != nil {
+		return err
+	}
+	return s.db.Update(func(tx *bolt.Tx) error {
+		return tx.Bucket(bucketMeta).Put(metaAdminTOTP, sealed)
+	})
 }
 
 func (s *orchStore) setBotSettings(token string, ownerID int64) error {
