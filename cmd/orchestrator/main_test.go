@@ -1995,6 +1995,7 @@ func TestClientRoutePayloadIncludesCanonicalParams(t *testing.T) {
 		"serverName": "www.microsoft.com",
 		"network":    "xhttp",
 		"xhttp": map[string]any{
+			"host":  "cdn.operator.example",
 			"path":  "/operator-path",
 			"mode":  "auto",
 			"extra": map[string]any{"headers": map[string]any{"X-Test": "1"}},
@@ -2008,7 +2009,7 @@ func TestClientRoutePayloadIncludesCanonicalParams(t *testing.T) {
 		t.Fatalf("xhttp network not preserved: %#v", xhttpParams)
 	}
 	xhttp := xhttpParams["xhttp"].(map[string]any)
-	if xhttp["path"] != "/operator-path" || xhttp["mode"] != "auto" {
+	if xhttp["host"] != "cdn.operator.example" || xhttp["path"] != "/operator-path" || xhttp["mode"] != "auto" {
 		t.Fatalf("xhttp params not preserved: %#v", xhttp)
 	}
 
