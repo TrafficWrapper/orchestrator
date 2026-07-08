@@ -490,7 +490,7 @@ func TestBotProblemOfflineRequiresTelemetrySnapshot(t *testing.T) {
 	}
 }
 
-func TestBotProblemRecoveryCleanupIgnoresSendCap(t *testing.T) {
+func TestBotProblemRecoveryRetryWhenStarvedBySendCap(t *testing.T) {
 	now := time.Date(2026, 7, 8, 12, 0, 0, 0, time.UTC)
 	prev := botProblemState{
 		Active:        map[string]botProblemEntry{},
@@ -508,11 +508,13 @@ func TestBotProblemRecoveryCleanupIgnoresSendCap(t *testing.T) {
 		prev.LastNotified[key] = now.Add(-botProblemRepeatCooldown - time.Minute)
 		problems[key] = entry
 	}
-	recovered := botProblemEntry{Scope: "worker", ID: "worker-recovered", Kind: "worker_down", Label: "worker-recovered"}
-	recoveredKey := botProblemKey(recovered)
-	prev.Recovering[recoveredKey] = recovered
-	prev.RecoveryPolls[recoveredKey] = botProblemRecoveryPollsBeforeNote - 1
-	prev.LastNotified[recoveredKey] = now.Add(-time.Hour)
+	for i := 0; i < botProblemMaxNoticesPerPoll/4+2; i++ {
+		recovered := botProblemEntry{Scope: "worker", ID: fmt.Sprintf("worker-recovered-%02d", i), Kind: "worker_down", Label: fmt.Sprintf("worker-recovered-%02d", i)}
+		key := botProblemKey(recovered)
+		prev.Recovering[key] = recovered
+		prev.RecoveryPolls[key] = botProblemRecoveryPollsBeforeNote - 1
+		prev.LastNotified[key] = now.Add(-time.Hour)
+	}
 
 	current := buildBotProblemState(prev, problems, now)
 	notices := botProblemNotices(prev, current, true)
@@ -521,11 +523,70 @@ func TestBotProblemRecoveryCleanupIgnoresSendCap(t *testing.T) {
 	}
 	markBotProblemNoticesSent(&current, notices)
 	cleanupRecoveredBotProblems(&current)
-	if _, ok := current.Recovering[recoveredKey]; ok {
-		t.Fatalf("recovery state was not cleaned under send cap")
+	if got := len(current.Recovering); got != 2 {
+		t.Fatalf("starved recoveries were not retained for retry, got %d: %+v", got, current.Recovering)
 	}
-	if _, ok := current.LastNotified[recoveredKey]; ok {
-		t.Fatalf("recovered last_notified was not cleaned under send cap")
+	for key := range current.Recovering {
+		if current.RecoveryPolls[key] < botProblemRecoveryPollsBeforeNote {
+			t.Fatalf("starved recovery lost poll count: key=%s polls=%d", key, current.RecoveryPolls[key])
+		}
+	}
+
+	nextPrev := current
+	nextPrev.Active = map[string]botProblemEntry{}
+	nextPrev.PendingPolls = map[string]int{}
+	next := buildBotProblemState(nextPrev, nil, now.Add(time.Minute))
+	retryNotices := botProblemNotices(nextPrev, next, true)
+	if len(retryNotices) != 2 {
+		t.Fatalf("starved recoveries did not retry when cap freed: %+v", retryNotices)
+	}
+	for _, notice := range retryNotices {
+		if !notice.Recovery || !strings.Contains(notice.Text, "recovered") {
+			t.Fatalf("bad retry recovery notice: %+v", notice)
+		}
+	}
+}
+
+func TestBotProblemRecoveryForceDropsAfterGrace(t *testing.T) {
+	now := time.Date(2026, 7, 8, 12, 0, 0, 0, time.UTC)
+	prev := botProblemState{
+		Active:        map[string]botProblemEntry{},
+		PendingPolls:  map[string]int{},
+		Recovering:    map[string]botProblemEntry{},
+		RecoveryPolls: map[string]int{},
+		LastNotified:  map[string]time.Time{},
+	}
+	problems := map[string]botProblemEntry{}
+	for i := 0; i < botProblemMaxNoticesPerPoll+2; i++ {
+		entry := botProblemEntry{Scope: "device", ID: fmt.Sprintf("twpk_%02d", i), Kind: "device_offline", Label: fmt.Sprintf("twpk_%02d", i)}
+		key := botProblemKey(entry)
+		prev.Active[key] = entry
+		prev.PendingPolls[key] = botProblemPollsBeforeAlert
+		prev.LastNotified[key] = now.Add(-botProblemRepeatCooldown - time.Minute)
+		problems[key] = entry
+	}
+	var forceKey string
+	for i := 0; i < botProblemMaxNoticesPerPoll/4+2; i++ {
+		recovered := botProblemEntry{Scope: "worker", ID: fmt.Sprintf("worker-force-%02d", i), Kind: "worker_down", Label: fmt.Sprintf("worker-force-%02d", i)}
+		key := botProblemKey(recovered)
+		prev.Recovering[key] = recovered
+		prev.RecoveryPolls[key] = botProblemRecoveryMaxPolls - 1
+		prev.LastNotified[key] = now.Add(-time.Hour)
+		forceKey = key
+	}
+
+	current := buildBotProblemState(prev, problems, now)
+	notices := botProblemNotices(prev, current, true)
+	if len(notices) != botProblemMaxNoticesPerPoll {
+		t.Fatalf("send cap not enforced: got %d", len(notices))
+	}
+	markBotProblemNoticesSent(&current, notices)
+	cleanupRecoveredBotProblems(&current)
+	if _, ok := current.Recovering[forceKey]; ok {
+		t.Fatalf("starved recovery was not force-dropped after grace")
+	}
+	if _, ok := current.LastNotified[forceKey]; ok {
+		t.Fatalf("force-dropped recovery last_notified was not cleaned")
 	}
 }
 

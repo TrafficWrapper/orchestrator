@@ -14,6 +14,7 @@ const (
 	botProblemWorkerDownAfter         = workerFreshTTL
 	botProblemPollsBeforeAlert        = 2
 	botProblemRecoveryPollsBeforeNote = 2
+	botProblemRecoveryMaxPolls        = botProblemRecoveryPollsBeforeNote + 10
 	botProblemRepeatCooldown          = 3 * time.Hour
 	botProblemMaxNoticesPerPoll       = 16
 	botProblemQuotaNearPercent        = 90
@@ -386,7 +387,7 @@ func cleanupRecoveredBotProblems(state *botProblemState) {
 		return
 	}
 	for key := range state.Recovering {
-		if state.RecoveryPolls[key] < botProblemRecoveryPollsBeforeNote {
+		if state.RecoveryPolls[key] < botProblemRecoveryMaxPolls {
 			continue
 		}
 		delete(state.Recovering, key)
