@@ -271,6 +271,7 @@ func (b *telegramBot) run(ctx context.Context) {
 		}
 		if !time.Now().Before(nextNotify) {
 			b.notifyPendingWorkers(ctx)
+			b.notifyProblemTransitions(ctx)
 			nextNotify = time.Now().Add(botPendingNotifyInterval)
 		}
 		updates, err := b.client.getUpdates(ctx, offset, botPollTimeoutSeconds)

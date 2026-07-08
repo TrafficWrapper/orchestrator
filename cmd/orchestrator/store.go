@@ -32,6 +32,7 @@ var (
 	metaAdminSecret = []byte("admin_secret")
 	metaAPKRelease  = []byte("apk_release")
 	metaBotSettings = []byte("bot_settings")
+	metaBotProblems = []byte("bot_problem_state")
 	metaAdminTOTP   = []byte("admin_totp")
 )
 
@@ -513,6 +514,36 @@ func (s *orchStore) botSettings() (botSettingsRecord, bool, error) {
 		return botSettingsRecord{}, false, nil
 	}
 	return rec, true, nil
+}
+
+func (s *orchStore) getBotProblemState() (botProblemState, bool, error) {
+	var rec botProblemState
+	err := s.db.View(func(tx *bolt.Tx) error {
+		raw := tx.Bucket(bucketMeta).Get(metaBotProblems)
+		if raw == nil {
+			return nil
+		}
+		return s.openJSON(raw, &rec)
+	})
+	if err != nil {
+		return botProblemState{}, false, err
+	}
+	if rec.Version == 0 {
+		return botProblemState{}, false, nil
+	}
+	return rec, true, nil
+}
+
+func (s *orchStore) putBotProblemState(rec botProblemState) error {
+	rec.Version = 1
+	rec.UpdatedAt = rec.UpdatedAt.UTC()
+	sealed, err := s.sealJSON(rec)
+	if err != nil {
+		return err
+	}
+	return s.db.Update(func(tx *bolt.Tx) error {
+		return tx.Bucket(bucketMeta).Put(metaBotProblems, sealed)
+	})
 }
 
 func (s *orchStore) botPendingWorkerNotified(workerID string) (bool, error) {

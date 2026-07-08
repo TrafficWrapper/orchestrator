@@ -335,6 +335,111 @@ func TestTelegramBotSendCurrentAPK(t *testing.T) {
 	}
 }
 
+func TestTelegramBotProblemNotifyDebounceCooldownRecovery(t *testing.T) {
+	s := newTestServer(t)
+	deviceID := "twpk_offline"
+	putQuotaDevice(t, s, deviceRecord{
+		ID:           deviceID,
+		Status:       "approved",
+		CreatedAt:    time.Now().UTC().Add(-botProblemDeviceOfflineAfter - time.Minute),
+		AWGPublicKey: "awg",
+		InternalIP:   "10.13.13.9/32",
+		RealityUUID:  "uuid",
+	})
+	mock := &mockTelegramAPI{}
+	bot := newTelegramBot(s, botSettingsRecord{Token: "test-token", OwnerID: 1001}, mock)
+
+	bot.notifyProblemTransitions(context.Background())
+	if got := mock.sentCount(); got != 0 {
+		t.Fatalf("problem notice sent before debounce: %d", got)
+	}
+	bot.notifyProblemTransitions(context.Background())
+	if got := mock.lastSent(); !strings.Contains(got.Text, "offline") || !strings.Contains(got.Text, shortString(deviceID, 12)) {
+		t.Fatalf("bad problem notice: %+v", got)
+	}
+	bot.notifyProblemTransitions(context.Background())
+	if got := mock.sentCount(); got != 1 {
+		t.Fatalf("cooldown did not suppress repeat notice: %d", got)
+	}
+
+	if err := s.store.setTelemetrySnapshot(telemetrySnapshotRecord{
+		DeviceID:   deviceID,
+		WorkerID:   "worker-a",
+		ReceivedAt: time.Now().UTC(),
+		Health:     "ok",
+		Carry:      true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	bot.notifyProblemTransitions(context.Background())
+	if got := mock.sentCount(); got != 1 {
+		t.Fatalf("recovery notice sent before debounce: %d", got)
+	}
+	bot.notifyProblemTransitions(context.Background())
+	if got := mock.lastSent(); !strings.Contains(got.Text, "recovered") {
+		t.Fatalf("bad recovery notice: %+v", got)
+	}
+}
+
+func TestBotProblemSnapshotIncludesQuotaAndWorkerDown(t *testing.T) {
+	s := newTestServer(t)
+	putQuotaDevice(t, s, deviceRecord{
+		ID:             "twpk_quota",
+		Status:         "revoked",
+		CreatedAt:      time.Now().UTC(),
+		Limits:         deviceLimits{TrafficQuotaBytes: 100},
+		UsageRxBytes:   100,
+		BlockedReason:  "traffic_quota_bytes",
+		AWGPublicKey:   "awg-quota",
+		InternalIP:     "10.13.13.10/32",
+		RealityUUID:    "uuid-quota",
+		BootstrapToken: "bootstrap",
+	})
+	addApprovedWorker(t, s)
+	workers, err := s.store.workers()
+	if err != nil {
+		t.Fatal(err)
+	}
+	worker := workers[0]
+	if _, err := s.store.markStaleWorkersInactive(time.Now().UTC().Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+
+	problems, err := s.botProblemSnapshot(time.Now().UTC())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := problems["device:twpk_quota:quota100"]; !ok {
+		t.Fatalf("quota problem missing: %+v", problems)
+	}
+	if _, ok := problems["worker:"+worker.ID+":worker_down"]; !ok {
+		t.Fatalf("worker down problem missing: %+v", problems)
+	}
+}
+
+func TestBotProblemCooldownAllowsRepeatAfterWindow(t *testing.T) {
+	now := time.Date(2026, 7, 8, 12, 0, 0, 0, time.UTC)
+	entry := botProblemEntry{Scope: "device", ID: "twpk_a", Kind: "device_offline", Label: "twpk_a"}
+	key := botProblemKey(entry)
+	prev := botProblemState{
+		Active:        map[string]botProblemEntry{key: entry},
+		PendingPolls:  map[string]int{key: botProblemPollsBeforeAlert},
+		LastNotified:  map[string]time.Time{key: now.Add(-botProblemRepeatCooldown - time.Minute)},
+		UpdatedAt:     now.Add(-botProblemRepeatCooldown - time.Minute),
+		RecoveryPolls: map[string]int{},
+	}
+	current := buildBotProblemState(prev, map[string]botProblemEntry{key: entry}, now)
+	notices := botProblemNotices(prev, current, true)
+	if len(notices) != 1 || notices[0].Key != key {
+		t.Fatalf("repeat after cooldown not emitted: %+v", notices)
+	}
+}
+
+func TestTelegramBotProblemNotifyNoopWhenBotOff(t *testing.T) {
+	var bot *telegramBot
+	bot.notifyProblemTransitions(context.Background())
+}
+
 func addPendingWorker(t *testing.T, s *server) workerRecord {
 	t.Helper()
 	rec, err := s.store.upsertPendingWorker("pending-static", map[string]any{
