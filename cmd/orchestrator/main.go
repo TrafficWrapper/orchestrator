@@ -65,6 +65,7 @@ type server struct {
 	sessionCount   atomic.Int64
 	handshakeMu    sync.Mutex
 	handshakeRates map[string]handshakeRate
+	handshakePrune time.Time
 	loginLimiterMu sync.Mutex
 	loginLimiter   *loginLimiter
 	audit          *auditLog
@@ -241,6 +242,8 @@ const (
 	maxNoiseSessions         = 1024
 	handshakeRateWindow      = 10 * time.Second
 	handshakeRateLimit       = 30
+	handshakeRatePruneEvery  = time.Second
+	maxHandshakeRateKeys     = 64 * 1024
 	workerFreshTTL           = 2 * time.Minute
 	workerJanitorEvery       = 30 * time.Second
 )
@@ -490,17 +493,17 @@ func (s *server) handleHandshakeStart(w http.ResponseWriter, r *http.Request) {
 
 func (s *server) reserveHandshakeStart(r *http.Request) (bool, string) {
 	now := time.Now()
-	ip := clientIP(r)
+	key := rateLimitKey(clientIP(r))
 	s.handshakeMu.Lock()
 	if s.handshakeRates == nil {
 		s.handshakeRates = map[string]handshakeRate{}
 	}
-	for key, rate := range s.handshakeRates {
-		if now.Sub(rate.WindowStart) > 2*handshakeRateWindow {
-			delete(s.handshakeRates, key)
-		}
+	s.pruneHandshakeRatesLocked(now)
+	rate, exists := s.handshakeRates[key]
+	if !exists && len(s.handshakeRates) >= maxHandshakeRateKeys {
+		s.handshakeMu.Unlock()
+		return false, "handshake rate limit exceeded"
 	}
-	rate := s.handshakeRates[ip]
 	if rate.WindowStart.IsZero() || now.Sub(rate.WindowStart) > handshakeRateWindow {
 		rate = handshakeRate{WindowStart: now}
 	}
@@ -509,13 +512,25 @@ func (s *server) reserveHandshakeStart(r *http.Request) (bool, string) {
 		return false, "handshake rate limit exceeded"
 	}
 	rate.Count++
-	s.handshakeRates[ip] = rate
+	s.handshakeRates[key] = rate
 	s.handshakeMu.Unlock()
 	if s.sessionCount.Add(1) > maxNoiseSessions {
 		s.sessionCount.Add(-1)
 		return false, "too many pending handshakes"
 	}
 	return true, ""
+}
+
+func (s *server) pruneHandshakeRatesLocked(now time.Time) {
+	if !s.handshakePrune.IsZero() && now.After(s.handshakePrune) && now.Sub(s.handshakePrune) < handshakeRatePruneEvery {
+		return
+	}
+	s.handshakePrune = now
+	for key, rate := range s.handshakeRates {
+		if rate.WindowStart.IsZero() || now.Sub(rate.WindowStart) > 2*handshakeRateWindow {
+			delete(s.handshakeRates, key)
+		}
+	}
 }
 
 func remoteIP(remoteAddr string) string {
@@ -1719,23 +1734,24 @@ func (s *server) handleAdminLogin(w http.ResponseWriter, r *http.Request) {
 	}
 	ip := clientIP(r)
 	limiter := s.adminLoginLimiter()
-	if until, locked := limiter.isLocked(ip); locked {
-		w.Header().Set("Retry-After", retryAfterSeconds(until, limiter.clock()))
-		s.auditEvent(auditEntry{
-			Event:  "admin_login",
-			IP:     ip,
-			Result: "locked",
-			Fields: map[string]string{"locked_until": until.UTC().Format(time.RFC3339)},
-		})
-		http.Error(w, "too many failed login attempts", http.StatusTooManyRequests)
-		return
-	}
 	var req struct {
 		Secret   string `json:"secret"`
 		TOTPCode string `json:"totp_code,omitempty"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	attempt := limiter.reserveAttempt(ip)
+	if !attempt.Allowed {
+		w.Header().Set("Retry-After", retryAfterSeconds(attempt.LockedUntil, limiter.clock()))
+		s.auditEvent(auditEntry{
+			Event:  "admin_login",
+			IP:     ip,
+			Result: "locked",
+			Fields: map[string]string{"locked_until": attempt.LockedUntil.UTC().Format(time.RFC3339)},
+		})
+		http.Error(w, "too many failed login attempts", http.StatusTooManyRequests)
 		return
 	}
 	ok, mustChange, err := s.store.verifyAdminPassword(req.Secret)
@@ -1745,11 +1761,10 @@ func (s *server) handleAdminLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if !ok {
-		until, locked := limiter.recordFailure(ip)
 		fields := map[string]string{"reason": "bad_secret"}
-		if locked {
-			fields["locked_until"] = until.UTC().Format(time.RFC3339)
-			w.Header().Set("Retry-After", retryAfterSeconds(until, limiter.clock()))
+		if attempt.LockedAfterAttempt {
+			fields["locked_until"] = attempt.LockedUntil.UTC().Format(time.RFC3339)
+			w.Header().Set("Retry-After", retryAfterSeconds(attempt.LockedUntil, limiter.clock()))
 			s.auditEvent(auditEntry{Event: "admin_login", IP: ip, Result: "locked", Fields: fields})
 			http.Error(w, "too many failed login attempts", http.StatusTooManyRequests)
 			return
@@ -1763,11 +1778,10 @@ func (s *server) handleAdminLogin(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusForbidden)
 		return
 	} else if enabled && !totpOK {
-		until, locked := limiter.recordFailure(ip)
 		fields := map[string]string{"reason": "bad_totp"}
-		if locked {
-			fields["locked_until"] = until.UTC().Format(time.RFC3339)
-			w.Header().Set("Retry-After", retryAfterSeconds(until, limiter.clock()))
+		if attempt.LockedAfterAttempt {
+			fields["locked_until"] = attempt.LockedUntil.UTC().Format(time.RFC3339)
+			w.Header().Set("Retry-After", retryAfterSeconds(attempt.LockedUntil, limiter.clock()))
 			s.auditEvent(auditEntry{Event: "admin_login", IP: ip, Result: "locked", Fields: fields})
 			http.Error(w, "too many failed login attempts", http.StatusTooManyRequests)
 			return
@@ -3636,9 +3650,4 @@ func getenvInt(key string, fallback int) int {
 		return fallback
 	}
 	return parsed
-}
-
-func _unusedImports() {
-	_, _, _ = sha256.Size, tls.VersionTLS13, strconv.IntSize
-	_, _ = base64.StdEncoding, x509.ExtKeyUsageServerAuth
 }

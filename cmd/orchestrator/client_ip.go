@@ -3,6 +3,7 @@ package main
 import (
 	"net"
 	"net/http"
+	"net/netip"
 	"strings"
 )
 
@@ -43,4 +44,23 @@ func validIPString(value string) string {
 		return ""
 	}
 	return ip.String()
+}
+
+func rateLimitKey(value string) string {
+	value = strings.TrimSpace(value)
+	addr, err := netip.ParseAddr(value)
+	if err != nil {
+		return value
+	}
+	if addr.Is4() {
+		return addr.String()
+	}
+	if addr.Is4In6() {
+		return addr.Unmap().String()
+	}
+	raw := addr.As16()
+	for i := 8; i < len(raw); i++ {
+		raw[i] = 0
+	}
+	return netip.AddrFrom16(raw).String() + "/64"
 }
