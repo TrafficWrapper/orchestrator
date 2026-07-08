@@ -1,8 +1,12 @@
 package main
 
 import (
+	"bytes"
+	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
+	"net/http/httptest"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -41,6 +45,32 @@ func TestHandshakeRateMapCapsDistinctIPs(t *testing.T) {
 	}
 }
 
+func TestHandshakeRateMapEvictsWhenFullForNewKey(t *testing.T) {
+	s := &server{handshakeRates: make(map[string]handshakeRate, maxHandshakeRateKeys)}
+	now := time.Now()
+	for i := 0; i < maxHandshakeRateKeys; i++ {
+		s.handshakeRates[rateLimitKey(fmt.Sprintf("2001:db8:%x:%x::1", i/0x10000, i%0x10000))] = handshakeRate{
+			WindowStart: now,
+			Count:       1,
+		}
+	}
+	s.handshakePrune = now
+	req := &http.Request{RemoteAddr: "[2001:db8:ffff:ffff::1]:443"}
+	reserved, reason := s.reserveHandshakeStart(req)
+	if !reserved {
+		t.Fatalf("new handshake key rejected at cap: %s", reason)
+	}
+	s.sessionCount.Add(-1)
+	s.handshakeMu.Lock()
+	defer s.handshakeMu.Unlock()
+	if got := len(s.handshakeRates); got != maxHandshakeRateKeys {
+		t.Fatalf("handshake rate keys=%d want cap %d", got, maxHandshakeRateKeys)
+	}
+	if _, ok := s.handshakeRates[rateLimitKey("2001:db8:ffff:ffff::1")]; !ok {
+		t.Fatal("new handshake key was not admitted after eviction")
+	}
+}
+
 func TestLoginLimiterStateMapCapsDistinctIPs(t *testing.T) {
 	now := time.Date(2026, 7, 8, 10, 0, 0, 0, time.UTC)
 	limiter := newLoginLimiter()
@@ -53,6 +83,51 @@ func TestLoginLimiterStateMapCapsDistinctIPs(t *testing.T) {
 	limiter.mu.Unlock()
 	if got != maxLoginLimiterStates {
 		t.Fatalf("login limiter states=%d want hard cap %d", got, maxLoginLimiterStates)
+	}
+}
+
+func TestLoginLimiterEvictsWhenFullForNewKey(t *testing.T) {
+	now := time.Date(2026, 7, 8, 10, 0, 0, 0, time.UTC)
+	limiter := fullLoginLimiterForTest(now)
+	reservation := limiter.reserveAttempt("2001:db8:ffff:ffff::1")
+	if !reservation.Allowed || reservation.Locked {
+		t.Fatalf("new login key rejected at cap: %+v", reservation)
+	}
+	limiter.mu.Lock()
+	defer limiter.mu.Unlock()
+	if got := len(limiter.states); got != maxLoginLimiterStates {
+		t.Fatalf("login limiter states=%d want cap %d", got, maxLoginLimiterStates)
+	}
+	if _, ok := limiter.states[rateLimitKey("2001:db8:ffff:ffff::1")]; !ok {
+		t.Fatal("new login key was not admitted after eviction")
+	}
+}
+
+func TestAdminLoginSucceedsWhenLimiterMapIsFull(t *testing.T) {
+	s := newTestServer(t)
+	if err := s.store.setAdminPassword("owner-secret"); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 7, 8, 10, 0, 0, 0, time.UTC)
+	s.loginLimiter = fullLoginLimiterForTest(now)
+	ts := httptest.NewServer(http.HandlerFunc(s.handleAdminLogin))
+	defer ts.Close()
+
+	raw, _ := json.Marshal(map[string]string{"secret": "owner-secret"})
+	req, err := http.NewRequest(http.MethodPost, ts.URL, bytes.NewReader(raw))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("content-type", "application/json")
+	req.Header.Set("X-Forwarded-For", "2001:db8:ffff:ffff::2")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = io.Copy(io.Discard, resp.Body)
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("admin login status=%d want 200", resp.StatusCode)
 	}
 }
 
@@ -98,4 +173,18 @@ func TestLoginLimiterReserveAttemptIsAtomicUnderConcurrency(t *testing.T) {
 	if got, want := lockedBefore.Load(), int64(workers-adminLoginFailureLimit); got != want {
 		t.Fatalf("pre-locked attempts=%d want %d", got, want)
 	}
+}
+
+func fullLoginLimiterForTest(now time.Time) *loginLimiter {
+	limiter := newLoginLimiter()
+	limiter.now = func() time.Time { return now }
+	limiter.states = make(map[string]*loginLimitState, maxLoginLimiterStates)
+	for i := 0; i < maxLoginLimiterStates; i++ {
+		limiter.states[rateLimitKey(fmt.Sprintf("2001:db8:%x:%x::1", i/0x10000, i%0x10000))] = &loginLimitState{
+			Failures:    1,
+			WindowStart: now,
+		}
+	}
+	limiter.lastPrune = now
+	return limiter
 }

@@ -501,8 +501,7 @@ func (s *server) reserveHandshakeStart(r *http.Request) (bool, string) {
 	s.pruneHandshakeRatesLocked(now)
 	rate, exists := s.handshakeRates[key]
 	if !exists && len(s.handshakeRates) >= maxHandshakeRateKeys {
-		s.handshakeMu.Unlock()
-		return false, "handshake rate limit exceeded"
+		evictOneHandshakeRateLocked(s.handshakeRates)
 	}
 	if rate.WindowStart.IsZero() || now.Sub(rate.WindowStart) > handshakeRateWindow {
 		rate = handshakeRate{WindowStart: now}
@@ -530,6 +529,13 @@ func (s *server) pruneHandshakeRatesLocked(now time.Time) {
 		if rate.WindowStart.IsZero() || now.Sub(rate.WindowStart) > 2*handshakeRateWindow {
 			delete(s.handshakeRates, key)
 		}
+	}
+}
+
+func evictOneHandshakeRateLocked(rates map[string]handshakeRate) {
+	for key := range rates {
+		delete(rates, key)
+		return
 	}
 }
 
