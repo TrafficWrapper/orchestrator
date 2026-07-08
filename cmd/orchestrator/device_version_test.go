@@ -131,6 +131,13 @@ func TestUpdateDeviceClientVersionFromTelemetry(t *testing.T) {
 	if rec.ClientVersion != "0.1.12" {
 		t.Fatalf("empty telemetry version cleared device version: %q", rec.ClientVersion)
 	}
+	changed, err = s.store.updateDeviceClientVersionFromTelemetry("device-a", "   ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if changed {
+		t.Fatal("blank telemetry version should not clear device version")
+	}
 
 	changed, err = s.store.updateDeviceClientVersionFromTelemetry("device-a", "0.1.12")
 	if err != nil {

@@ -986,7 +986,10 @@ func (s *orchStore) updateDeviceClientVersionFromTelemetry(id, version string) (
 func clientVersionWouldRollback(current, next string) bool {
 	current = strings.TrimSpace(current)
 	next = strings.TrimSpace(next)
-	if current == "" || next == "" {
+	if next == "" {
+		return current != ""
+	}
+	if current == "" {
 		return false
 	}
 	currentCode := clientVersionCode(current)
@@ -1088,10 +1091,16 @@ func applyDeviceUsageReport(rec *deviceRecord, workerID string, report deviceUsa
 	if rec.UsageCounters == nil {
 		rec.UsageCounters = map[string]deviceUsageCounter{}
 	}
-	prev := rec.UsageCounters[stateKey]
+	next := deviceUsageCounter{RxBytes: report.RxBytes, TxBytes: report.TxBytes}
+	prev, ok := rec.UsageCounters[stateKey]
+	if !ok {
+		rec.UsageCounters[stateKey] = next
+		updatedAt := now.UTC()
+		rec.UsageUpdatedAt = &updatedAt
+		return true
+	}
 	deltaRx := usageCounterDelta(prev.RxBytes, report.RxBytes)
 	deltaTx := usageCounterDelta(prev.TxBytes, report.TxBytes)
-	next := deviceUsageCounter{RxBytes: report.RxBytes, TxBytes: report.TxBytes}
 	changed := false
 	if deltaRx > 0 {
 		rec.UsageRxBytes = saturatingAddUint64(rec.UsageRxBytes, deltaRx)
@@ -1553,12 +1562,27 @@ func (s *orchStore) updateWorkerHeartbeat(id string, haveSeq int64, self map[str
 }
 
 func forceWorkerResync(rec *workerRecord, haveSeq int64) {
-	if rec.DesiredSeq <= haveSeq {
-		rec.DesiredSeq = haveSeq + 1
+	target := rec.DesiredSeq
+	if rec.AppliedSeq > target {
+		target = rec.AppliedSeq
 	}
-	if rec.DesiredSeq < 1 {
-		rec.DesiredSeq = 1
+	if haveSeq > target {
+		target = haveSeq
 	}
+	if target < 0 {
+		target = 0
+	}
+	const maxInt64 = int64(1<<63 - 1)
+	if target < maxInt64 {
+		target++
+	}
+	if target < rec.DesiredSeq {
+		target = rec.DesiredSeq
+	}
+	if target < 1 {
+		target = 1
+	}
+	rec.DesiredSeq = target
 }
 
 func (s *orchStore) updateWorker(id string, fn func(*workerRecord) error) error {

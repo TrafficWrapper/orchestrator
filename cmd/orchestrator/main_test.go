@@ -241,6 +241,18 @@ func TestInactiveWorkerReactivationForcesFreshBundleAfterRevocation(t *testing.T
 	}
 }
 
+func TestForceWorkerResyncDoesNotOverflow(t *testing.T) {
+	const maxInt64 = int64(1<<63 - 1)
+	rec := workerRecord{DesiredSeq: 100, AppliedSeq: 200}
+	forceWorkerResync(&rec, maxInt64)
+	if rec.DesiredSeq != maxInt64 {
+		t.Fatalf("desired seq=%d want saturated max int64", rec.DesiredSeq)
+	}
+	if rec.DesiredSeq < rec.AppliedSeq {
+		t.Fatalf("desired seq regressed below applied: %+v", rec)
+	}
+}
+
 func TestDeviceEnrollRejectsExistingBindingMismatches(t *testing.T) {
 	s := newTestServer(t)
 	addApprovedWorker(t, s)

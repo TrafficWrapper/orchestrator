@@ -20,6 +20,13 @@ func TestApplyDeviceUsageBlocksAtQuotaAndIsIdempotent(t *testing.T) {
 		CreatedAt:    time.Now().UTC(),
 		ConfigSeq:    1,
 	})
+	if _, err := s.store.applyDeviceUsageAndBlocks("worker-a", []deviceUsage{{
+		DeviceID: "device-a",
+		RxBytes:  0,
+		TxBytes:  0,
+	}}, time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
 	blocked, err := s.store.applyDeviceUsageAndBlocks("worker-a", []deviceUsage{{
 		DeviceID: "device-a",
 		RxBytes:  60,
@@ -98,6 +105,20 @@ func TestApplyDeviceUsageSumsPerWorkerAndHandlesCounterReset(t *testing.T) {
 	now := time.Now().UTC()
 	if _, err := s.store.applyDeviceUsageAndBlocks("worker-a", []deviceUsage{{
 		AWGPublicKey: "awg-pub-a",
+		RxBytes:      0,
+		TxBytes:      0,
+	}}, now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.store.applyDeviceUsageAndBlocks("worker-b", []deviceUsage{{
+		AWGPublicKey: "awg-pub-a",
+		RxBytes:      0,
+		TxBytes:      0,
+	}}, now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.store.applyDeviceUsageAndBlocks("worker-a", []deviceUsage{{
+		AWGPublicKey: "awg-pub-a",
 		RxBytes:      50,
 		TxBytes:      5,
 	}}, now); err != nil {
@@ -130,6 +151,50 @@ func TestApplyDeviceUsageSumsPerWorkerAndHandlesCounterReset(t *testing.T) {
 	}
 	if rec.UsageRxBytes != 110 || rec.UsageTxBytes != 11 {
 		t.Fatalf("usage=(%d,%d), want (110,11)", rec.UsageRxBytes, rec.UsageTxBytes)
+	}
+}
+
+func TestApplyDeviceUsageAdoptsFirstBaselineForLegacyUsage(t *testing.T) {
+	s := newTestServer(t)
+	putQuotaDevice(t, s, deviceRecord{
+		ID:           "device-a",
+		Status:       "approved",
+		AWGPublicKey: "awg-pub-a",
+		InternalIP:   "10.13.13.10/32",
+		RealityUUID:  "uuid-a",
+		UsageRxBytes: 80,
+		UsageTxBytes: 20,
+		CreatedAt:    time.Now().UTC(),
+		ConfigSeq:    1,
+	})
+	now := time.Now().UTC()
+	if _, err := s.store.applyDeviceUsageAndBlocks("worker-a", []deviceUsage{{
+		AWGPublicKey: "awg-pub-a",
+		RxBytes:      80,
+		TxBytes:      20,
+	}}, now); err != nil {
+		t.Fatal(err)
+	}
+	rec, err := s.store.device("device-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rec.UsageRxBytes != 80 || rec.UsageTxBytes != 20 {
+		t.Fatalf("first legacy report double-counted usage=(%d,%d), want (80,20)", rec.UsageRxBytes, rec.UsageTxBytes)
+	}
+	if _, err := s.store.applyDeviceUsageAndBlocks("worker-a", []deviceUsage{{
+		AWGPublicKey: "awg-pub-a",
+		RxBytes:      90,
+		TxBytes:      25,
+	}}, now); err != nil {
+		t.Fatal(err)
+	}
+	rec, err = s.store.device("device-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rec.UsageRxBytes != 90 || rec.UsageTxBytes != 25 {
+		t.Fatalf("second legacy report did not add delta usage=(%d,%d), want (90,25)", rec.UsageRxBytes, rec.UsageTxBytes)
 	}
 }
 
