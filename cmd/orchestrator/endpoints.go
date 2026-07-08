@@ -274,12 +274,16 @@ func discoveryAWGEndpoint(rec workerRecord) (map[string]any, bool) {
 	if strings.TrimSpace(endpoint) == "" || strings.TrimSpace(serverPublic) == "" || !ok {
 		return nil, false
 	}
-	return map[string]any{
+	out := map[string]any{
 		"priority":          effectiveWorkerPriority(rec),
 		"endpoint":          endpoint,
 		"server_public_key": serverPublic,
 		"awg_preset":        preset,
-	}, true
+	}
+	if expected := workerEgressIP(rec); expected != "" {
+		out["egress_ip"] = expected
+	}
+	return out, true
 }
 
 func discoveryRealityEndpoint(rec workerRecord) (map[string]any, bool) {
@@ -289,10 +293,17 @@ func discoveryRealityEndpoint(rec workerRecord) (map[string]any, bool) {
 	}
 	out := canonicalClientRouteParamsForClient("reality", params, "")
 	out["priority"] = effectiveWorkerPriority(rec)
-	if expected := stringFromMap(rec.SelfDescribe, "egress_ip"); expected != "" {
+	if expected := workerEgressIP(rec); expected != "" {
 		out["egress_ip"] = expected
 	}
 	return out, true
+}
+
+func workerEgressIP(rec workerRecord) string {
+	if expected := stringFromMap(rec.SelfDescribe, "egress_ip"); expected != "" {
+		return expected
+	}
+	return strings.TrimSpace(rec.EgressIPObserved)
 }
 
 func firstRawMapValue(params map[string]any, keys ...string) (any, bool) {

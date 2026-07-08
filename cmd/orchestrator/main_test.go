@@ -2101,7 +2101,7 @@ func TestClientRoutePayloadIncludesCanonicalParams(t *testing.T) {
 	if params["network"] != "tcp" {
 		t.Fatalf("reality network default = %#v, want tcp", params["network"])
 	}
-	if reality["expected_egress_ip"] != "198.51.100.8" || reality["config_url"] != "http://awg-gw:8080/tw" {
+	if reality["egress_ip"] != "198.51.100.8" || reality["expected_egress_ip"] != "198.51.100.8" || reality["config_url"] != "http://awg-gw:8080/tw" {
 		t.Fatalf("bad reality route: %#v", reality)
 	}
 	if reality["region"] != "Operator Lab" || params["region"] != "Operator Lab" {
@@ -2155,6 +2155,9 @@ func TestClientRoutePayloadIncludesCanonicalParams(t *testing.T) {
 	}
 	if awg["address"] != "worker.example" || awg["port"] != 51888 {
 		t.Fatalf("bad awg endpoint parse: %#v", awg)
+	}
+	if awg["egress_ip"] != "198.51.100.8" || awg["expected_egress_ip"] != "198.51.100.8" {
+		t.Fatalf("bad awg egress ip: %#v", awg)
 	}
 	if awgParams["server_public"] != "awg-server-pub" || awgParams["server_public_key"] != "awg-server-pub" {
 		t.Fatalf("bad awg params: %#v", awgParams)

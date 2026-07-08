@@ -1310,7 +1310,7 @@ func clientWorkerPayload(rec workerRecord) (map[string]any, bool) {
 }
 
 func clientWorkerPayloadForClient(rec workerRecord, clientVersion string) (map[string]any, bool) {
-	expected := stringFromMap(rec.SelfDescribe, "egress_ip")
+	expected := workerEgressIP(rec)
 	configURL := stringFromMap(rec.SelfDescribe, "distributor_url")
 	routes := make([]any, 0, 2)
 	if workerProtocolEnabled(rec, "reality") {
@@ -1383,6 +1383,7 @@ func clientRoutePayloadForClient(routeType string, raw any, expected, configURL,
 	route := cloneMap(routeParams)
 	route["type"] = routeType
 	route["enabled"] = true
+	route["egress_ip"] = expected
 	route["expected_egress_ip"] = expected
 	if configURL != "" {
 		route["config_url"] = strings.TrimRight(configURL, "/")

@@ -106,6 +106,45 @@ func TestDiscoveryBundleNextSinksAndClientRescuePointersAreOptional(t *testing.T
 	}
 }
 
+func TestDiscoveryAWGEndpointCarriesEgressIP(t *testing.T) {
+	route, ok := discoveryAWGEndpoint(workerRecord{
+		SelfDescribe: map[string]any{
+			"egress_ip": "198.51.100.44",
+			"awg": map[string]any{
+				"endpoint":   "worker.example:51821",
+				"public_key": "awg-server-pub",
+				"awg_preset": map[string]any{"jc": 4},
+			},
+		},
+	})
+	if !ok {
+		t.Fatal("awg discovery route was not built")
+	}
+	if route["endpoint"] != "worker.example:51821" {
+		t.Fatalf("endpoint=%#v", route["endpoint"])
+	}
+	if route["egress_ip"] != "198.51.100.44" {
+		t.Fatalf("egress_ip=%#v", route["egress_ip"])
+	}
+
+	route, ok = discoveryAWGEndpoint(workerRecord{
+		EgressIPObserved: "198.51.100.45",
+		SelfDescribe: map[string]any{
+			"awg": map[string]any{
+				"endpoint":   "worker.example:51821",
+				"public_key": "awg-server-pub",
+				"awg_preset": map[string]any{"jc": 4},
+			},
+		},
+	})
+	if !ok {
+		t.Fatal("awg discovery route with observed egress was not built")
+	}
+	if route["egress_ip"] != "198.51.100.45" {
+		t.Fatalf("observed egress_ip=%#v", route["egress_ip"])
+	}
+}
+
 func TestDiscoverySeqBumpPersistsAboveWorkerFloor(t *testing.T) {
 	s := newTestServer(t)
 	addApprovedWorker(t, s)
