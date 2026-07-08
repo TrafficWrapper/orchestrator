@@ -139,6 +139,29 @@ func TestUpdateDeviceClientVersionFromTelemetry(t *testing.T) {
 	if changed {
 		t.Fatal("same telemetry version should be a no-op")
 	}
+
+	changed, err = s.store.updateDeviceClientVersionFromTelemetry("device-a", "0.1.11")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if changed {
+		t.Fatal("older telemetry version should not roll device version back")
+	}
+	rec, err = s.store.device("device-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rec.ClientVersion != "0.1.12" {
+		t.Fatalf("older telemetry rolled device version back: %q", rec.ClientVersion)
+	}
+
+	changed, err = s.store.updateDeviceClientVersionFromTelemetry("device-a", "unknown")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if changed {
+		t.Fatal("unparseable telemetry version should not replace known version")
+	}
 }
 
 func insertDeviceRecord(t *testing.T, st *orchStore, rec deviceRecord) {

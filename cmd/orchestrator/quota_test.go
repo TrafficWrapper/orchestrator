@@ -20,7 +20,7 @@ func TestApplyDeviceUsageBlocksAtQuotaAndIsIdempotent(t *testing.T) {
 		CreatedAt:    time.Now().UTC(),
 		ConfigSeq:    1,
 	})
-	blocked, err := s.store.applyDeviceUsageAndBlocks([]deviceUsage{{
+	blocked, err := s.store.applyDeviceUsageAndBlocks("worker-a", []deviceUsage{{
 		DeviceID: "device-a",
 		RxBytes:  60,
 		TxBytes:  40,
@@ -38,7 +38,7 @@ func TestApplyDeviceUsageBlocksAtQuotaAndIsIdempotent(t *testing.T) {
 	if rec.Status != "revoked" || rec.BlockedReason != "traffic_quota_bytes" || rec.UsageRxBytes != 60 || rec.UsageTxBytes != 40 {
 		t.Fatalf("bad blocked device: %+v", rec)
 	}
-	blocked, err = s.store.applyDeviceUsageAndBlocks([]deviceUsage{{
+	blocked, err = s.store.applyDeviceUsageAndBlocks("worker-a", []deviceUsage{{
 		DeviceID: "device-a",
 		RxBytes:  60,
 		TxBytes:  40,
@@ -63,7 +63,7 @@ func TestApplyDeviceUsageQuotaZeroDoesNotBlock(t *testing.T) {
 		CreatedAt:    time.Now().UTC(),
 		ConfigSeq:    1,
 	})
-	blocked, err := s.store.applyDeviceUsageAndBlocks([]deviceUsage{{
+	blocked, err := s.store.applyDeviceUsageAndBlocks("worker-a", []deviceUsage{{
 		DeviceID: "device-a",
 		RxBytes:  1 << 30,
 		TxBytes:  1 << 30,
@@ -83,6 +83,56 @@ func TestApplyDeviceUsageQuotaZeroDoesNotBlock(t *testing.T) {
 	}
 }
 
+func TestApplyDeviceUsageSumsPerWorkerAndHandlesCounterReset(t *testing.T) {
+	s := newTestServer(t)
+	putQuotaDevice(t, s, deviceRecord{
+		ID:           "device-a",
+		Status:       "approved",
+		AWGPublicKey: "awg-pub-a",
+		InternalIP:   "10.13.13.10/32",
+		RealityUUID:  "uuid-a",
+		Limits:       deviceLimits{TrafficQuotaBytes: 0},
+		CreatedAt:    time.Now().UTC(),
+		ConfigSeq:    1,
+	})
+	now := time.Now().UTC()
+	if _, err := s.store.applyDeviceUsageAndBlocks("worker-a", []deviceUsage{{
+		AWGPublicKey: "awg-pub-a",
+		RxBytes:      50,
+		TxBytes:      5,
+	}}, now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.store.applyDeviceUsageAndBlocks("worker-b", []deviceUsage{{
+		AWGPublicKey: "awg-pub-a",
+		RxBytes:      50,
+		TxBytes:      5,
+	}}, now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.store.applyDeviceUsageAndBlocks("worker-b", []deviceUsage{{
+		AWGPublicKey: "awg-pub-a",
+		RxBytes:      50,
+		TxBytes:      5,
+	}}, now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.store.applyDeviceUsageAndBlocks("worker-a", []deviceUsage{{
+		AWGPublicKey: "awg-pub-a",
+		RxBytes:      10,
+		TxBytes:      1,
+	}}, now); err != nil {
+		t.Fatal(err)
+	}
+	rec, err := s.store.device("device-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rec.UsageRxBytes != 110 || rec.UsageTxBytes != 11 {
+		t.Fatalf("usage=(%d,%d), want (110,11)", rec.UsageRxBytes, rec.UsageTxBytes)
+	}
+}
+
 func TestApplyDeviceUsageBlocksExpiredDeviceWithoutUsage(t *testing.T) {
 	s := newTestServer(t)
 	addApprovedWorker(t, s)
@@ -97,7 +147,7 @@ func TestApplyDeviceUsageBlocksExpiredDeviceWithoutUsage(t *testing.T) {
 		CreatedAt:    time.Now().UTC(),
 		ConfigSeq:    1,
 	})
-	blocked, err := s.store.applyDeviceUsageAndBlocks(nil, time.Now().UTC())
+	blocked, err := s.store.applyDeviceUsageAndBlocks("worker-a", nil, time.Now().UTC())
 	if err != nil {
 		t.Fatal(err)
 	}

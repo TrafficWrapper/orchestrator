@@ -80,30 +80,36 @@ type adminTOTPRecord struct {
 }
 
 type deviceRecord struct {
-	ID              string                      `json:"id"`
-	Alias           string                      `json:"alias,omitempty"`
-	Status          string                      `json:"status"`
-	NoisePublicKey  string                      `json:"noise_public_key"`
-	IdentityPubKey  string                      `json:"identity_pubkey"`
-	IdentityKeyType string                      `json:"identity_key_type,omitempty"`
-	AndroidID       string                      `json:"android_id,omitempty"`
-	Model           string                      `json:"model,omitempty"`
-	EnrollmentNonce string                      `json:"enrollment_nonce,omitempty"`
-	ClientVersion   string                      `json:"client_version,omitempty"`
-	AWGPublicKey    string                      `json:"awg_public_key,omitempty"`
-	RealityUUID     string                      `json:"reality_uuid,omitempty"`
-	InternalIP      string                      `json:"internal_ip,omitempty"`
-	PSK2            string                      `json:"psk2,omitempty"`
-	AWGProfiles     map[string]deviceAWGProfile `json:"awg_profiles,omitempty"`
-	BootstrapToken  string                      `json:"bootstrap_token"`
-	Limits          deviceLimits                `json:"limits,omitempty"`
-	UsageRxBytes    uint64                      `json:"usage_rx_bytes,omitempty"`
-	UsageTxBytes    uint64                      `json:"usage_tx_bytes,omitempty"`
-	UsageUpdatedAt  *time.Time                  `json:"usage_updated_at,omitempty"`
-	BlockedAt       *time.Time                  `json:"blocked_at,omitempty"`
-	BlockedReason   string                      `json:"blocked_reason,omitempty"`
-	CreatedAt       time.Time                   `json:"created_at"`
-	ConfigSeq       int64                       `json:"config_seq"`
+	ID              string                        `json:"id"`
+	Alias           string                        `json:"alias,omitempty"`
+	Status          string                        `json:"status"`
+	NoisePublicKey  string                        `json:"noise_public_key"`
+	IdentityPubKey  string                        `json:"identity_pubkey"`
+	IdentityKeyType string                        `json:"identity_key_type,omitempty"`
+	AndroidID       string                        `json:"android_id,omitempty"`
+	Model           string                        `json:"model,omitempty"`
+	EnrollmentNonce string                        `json:"enrollment_nonce,omitempty"`
+	ClientVersion   string                        `json:"client_version,omitempty"`
+	AWGPublicKey    string                        `json:"awg_public_key,omitempty"`
+	RealityUUID     string                        `json:"reality_uuid,omitempty"`
+	InternalIP      string                        `json:"internal_ip,omitempty"`
+	PSK2            string                        `json:"psk2,omitempty"`
+	AWGProfiles     map[string]deviceAWGProfile   `json:"awg_profiles,omitempty"`
+	BootstrapToken  string                        `json:"bootstrap_token"`
+	Limits          deviceLimits                  `json:"limits,omitempty"`
+	UsageRxBytes    uint64                        `json:"usage_rx_bytes,omitempty"`
+	UsageTxBytes    uint64                        `json:"usage_tx_bytes,omitempty"`
+	UsageCounters   map[string]deviceUsageCounter `json:"usage_counters,omitempty"`
+	UsageUpdatedAt  *time.Time                    `json:"usage_updated_at,omitempty"`
+	BlockedAt       *time.Time                    `json:"blocked_at,omitempty"`
+	BlockedReason   string                        `json:"blocked_reason,omitempty"`
+	CreatedAt       time.Time                     `json:"created_at"`
+	ConfigSeq       int64                         `json:"config_seq"`
+}
+
+type deviceUsageCounter struct {
+	RxBytes uint64 `json:"rx_bytes,omitempty"`
+	TxBytes uint64 `json:"tx_bytes,omitempty"`
 }
 
 type deviceAWGProfile struct {
@@ -583,40 +589,35 @@ func (s *orchStore) createBootstrapToken(secret string, expiresAt time.Time, lim
 
 func (s *orchStore) consumeToken(secret string, workerStaticPub string) (string, error) {
 	now := time.Now().UTC()
-	var matched string
 	workerStaticPub = strings.TrimSpace(workerStaticPub)
-	err := s.db.Update(func(tx *bolt.Tx) error {
-		b := tx.Bucket(bucketTokens)
-		return b.ForEach(func(k, v []byte) error {
-			if matched != "" {
-				return nil
-			}
-			var rec tokenRecord
-			if err := json.Unmarshal(v, &rec); err != nil {
-				return err
-			}
-			if rec.Kind == "bootstrap" || !now.Before(rec.ExpiresAt) || rec.Uses >= rec.MaxUses {
-				return nil
-			}
-			if strings.TrimSpace(rec.WorkerStaticPub) != "" && strings.TrimSpace(rec.WorkerStaticPub) != workerStaticPub {
-				return nil
-			}
-			if protocol.VerifySecret(rec.Hash, secret) {
-				rec.Uses++
-				raw, _ := json.Marshal(rec)
-				if err := b.Put(k, raw); err != nil {
-					return err
-				}
-				matched = rec.ID
-			}
-			return nil
-		})
-	})
+
+	matched, err := s.findTokenID(secret, workerStaticPub, now)
 	if err != nil {
 		return "", err
 	}
 	if matched == "" {
 		return "", errors.New("invalid or exhausted enroll token")
+	}
+
+	err = s.db.Update(func(tx *bolt.Tx) error {
+		b := tx.Bucket(bucketTokens)
+		raw := b.Get([]byte(matched))
+		if raw == nil {
+			return errors.New("invalid or exhausted enroll token")
+		}
+		var rec tokenRecord
+		if err := json.Unmarshal(raw, &rec); err != nil {
+			return err
+		}
+		if !tokenRecordConsumable(rec, now, workerStaticPub) {
+			return errors.New("invalid or exhausted enroll token")
+		}
+		rec.Uses++
+		raw, _ = json.Marshal(rec)
+		return b.Put([]byte(rec.ID), raw)
+	})
+	if err != nil {
+		return "", err
 	}
 	return matched, nil
 }
@@ -624,11 +625,113 @@ func (s *orchStore) consumeToken(secret string, workerStaticPub string) (string,
 func (s *orchStore) consumeBootstrapToken(secret string, device deviceRecord, profiles []awgProfile) (tokenRecord, deviceRecord, error) {
 	now := time.Now().UTC()
 	var matched tokenRecord
-	err := s.db.Update(func(tx *bolt.Tx) error {
+	matchedID, err := s.findBootstrapTokenID(secret, now)
+	if err != nil {
+		return tokenRecord{}, deviceRecord{}, err
+	}
+	if matchedID == "" {
+		return tokenRecord{}, deviceRecord{}, errors.New("invalid, expired, or exhausted bootstrap token")
+	}
+	err = s.db.Update(func(tx *bolt.Tx) error {
 		tb := tx.Bucket(bucketTokens)
 		db := tx.Bucket(bucketDevices)
-		return tb.ForEach(func(k, v []byte) error {
-			if matched.ID != "" {
+		raw := tb.Get([]byte(matchedID))
+		if raw == nil {
+			return errors.New("invalid, expired, or exhausted bootstrap token")
+		}
+		var rec tokenRecord
+		if err := json.Unmarshal(raw, &rec); err != nil {
+			return err
+		}
+		if rec.Kind != "bootstrap" || !now.Before(rec.ExpiresAt) || rec.Uses >= rec.MaxUses {
+			return errors.New("invalid, expired, or exhausted bootstrap token")
+		}
+		rec.Uses++
+		raw, _ = json.Marshal(rec)
+		if err := tb.Put([]byte(rec.ID), raw); err != nil {
+			return err
+		}
+		device.Status = "approved"
+		device.BootstrapToken = rec.ID
+		limits, err := parseDeviceLimitsRaw(rec.Limits)
+		if err != nil {
+			return err
+		}
+		device.Limits = limits
+		device.CreatedAt = now
+		if device.RealityUUID == "" {
+			device.RealityUUID = uuidV4()
+		}
+		if device.InternalIP == "" {
+			ip, err := s.allocateDeviceIP(tx, baseAWGSubnet(profiles))
+			if err != nil {
+				return err
+			}
+			device.InternalIP = ip
+		}
+		if device.PSK2 == "" {
+			psk, err := randomBase64Key()
+			if err != nil {
+				return err
+			}
+			device.PSK2 = psk
+		}
+		if device.ConfigSeq < 1 {
+			device.ConfigSeq = 1
+		}
+		if err := s.ensureDeviceAWGProfilesTx(tx, &device, profiles, device.AWGPublicKey); err != nil {
+			return err
+		}
+		sealed, err := s.sealJSON(device)
+		if err != nil {
+			return err
+		}
+		if err := db.Put([]byte(device.ID), sealed); err != nil {
+			return err
+		}
+		if err := s.bumpWorkerSeqsTx(tx); err != nil {
+			return err
+		}
+		matched = rec
+		return nil
+	})
+	if err != nil {
+		return tokenRecord{}, deviceRecord{}, err
+	}
+	if matched.ID == "" {
+		return tokenRecord{}, deviceRecord{}, errors.New("invalid, expired, or exhausted bootstrap token")
+	}
+	return matched, device, nil
+}
+
+func (s *orchStore) findTokenID(secret, workerStaticPub string, now time.Time) (string, error) {
+	var matched string
+	err := s.db.View(func(tx *bolt.Tx) error {
+		return tx.Bucket(bucketTokens).ForEach(func(k, v []byte) error {
+			if matched != "" {
+				return nil
+			}
+			var rec tokenRecord
+			if err := json.Unmarshal(v, &rec); err != nil {
+				return err
+			}
+			if !tokenRecordConsumable(rec, now, workerStaticPub) {
+				return nil
+			}
+			if protocol.VerifySecret(rec.Hash, secret) {
+				matched = string(k)
+			}
+			return nil
+		})
+	})
+	return matched, err
+}
+
+func (s *orchStore) findBootstrapTokenID(secret string, now time.Time) (string, error) {
+	var matched string
+	err := s.db.View(func(tx *bolt.Tx) error {
+		return tx.Bucket(bucketTokens).ForEach(func(k, v []byte) error {
+			if matched != "" {
 				return nil
 			}
 			var rec tokenRecord
@@ -638,66 +741,21 @@ func (s *orchStore) consumeBootstrapToken(secret string, device deviceRecord, pr
 			if rec.Kind != "bootstrap" || !now.Before(rec.ExpiresAt) || rec.Uses >= rec.MaxUses {
 				return nil
 			}
-			if !protocol.VerifySecret(rec.Hash, secret) {
-				return nil
+			if protocol.VerifySecret(rec.Hash, secret) {
+				matched = string(k)
 			}
-			rec.Uses++
-			raw, _ := json.Marshal(rec)
-			if err := tb.Put(k, raw); err != nil {
-				return err
-			}
-			device.Status = "approved"
-			device.BootstrapToken = rec.ID
-			limits, err := parseDeviceLimitsRaw(rec.Limits)
-			if err != nil {
-				return err
-			}
-			device.Limits = limits
-			device.CreatedAt = now
-			if device.RealityUUID == "" {
-				device.RealityUUID = uuidV4()
-			}
-			if device.InternalIP == "" {
-				ip, err := s.allocateDeviceIP(tx, baseAWGSubnet(profiles))
-				if err != nil {
-					return err
-				}
-				device.InternalIP = ip
-			}
-			if device.PSK2 == "" {
-				psk, err := randomBase64Key()
-				if err != nil {
-					return err
-				}
-				device.PSK2 = psk
-			}
-			if device.ConfigSeq < 1 {
-				device.ConfigSeq = 1
-			}
-			if err := s.ensureDeviceAWGProfilesTx(tx, &device, profiles, device.AWGPublicKey); err != nil {
-				return err
-			}
-			sealed, err := s.sealJSON(device)
-			if err != nil {
-				return err
-			}
-			if err := db.Put([]byte(device.ID), sealed); err != nil {
-				return err
-			}
-			if err := s.bumpWorkerSeqsTx(tx); err != nil {
-				return err
-			}
-			matched = rec
 			return nil
 		})
 	})
-	if err != nil {
-		return tokenRecord{}, deviceRecord{}, err
+	return matched, err
+}
+
+func tokenRecordConsumable(rec tokenRecord, now time.Time, workerStaticPub string) bool {
+	if rec.Kind == "bootstrap" || !now.Before(rec.ExpiresAt) || rec.Uses >= rec.MaxUses {
+		return false
 	}
-	if matched.ID == "" {
-		return tokenRecord{}, deviceRecord{}, errors.New("invalid, expired, or exhausted bootstrap token")
-	}
-	return matched, device, nil
+	pinned := strings.TrimSpace(rec.WorkerStaticPub)
+	return pinned == "" || pinned == strings.TrimSpace(workerStaticPub)
 }
 
 func (s *orchStore) ensureDeviceAWGProfiles(id string, profiles []awgProfile, awgPublic string) (deviceRecord, error) {
@@ -908,6 +966,9 @@ func (s *orchStore) updateDeviceClientVersionFromTelemetry(id, version string) (
 		if strings.TrimSpace(rec.ClientVersion) == version {
 			return nil
 		}
+		if clientVersionWouldRollback(rec.ClientVersion, version) {
+			return nil
+		}
 		rec.ClientVersion = version
 		sealed, err := s.sealJSON(rec)
 		if err != nil {
@@ -922,7 +983,21 @@ func (s *orchStore) updateDeviceClientVersionFromTelemetry(id, version string) (
 	return changed, err
 }
 
-func (s *orchStore) applyDeviceUsageAndBlocks(reports []deviceUsage, now time.Time) (int, error) {
+func clientVersionWouldRollback(current, next string) bool {
+	current = strings.TrimSpace(current)
+	next = strings.TrimSpace(next)
+	if current == "" || next == "" {
+		return false
+	}
+	currentCode := clientVersionCode(current)
+	nextCode := clientVersionCode(next)
+	if currentCode == 0 {
+		return false
+	}
+	return nextCode == 0 || nextCode < currentCode
+}
+
+func (s *orchStore) applyDeviceUsageAndBlocks(workerID string, reports []deviceUsage, now time.Time) (int, error) {
 	byID := make(map[string]deviceUsage, len(reports))
 	byAWG := make(map[string]deviceUsage, len(reports))
 	for _, report := range reports {
@@ -946,13 +1021,13 @@ func (s *orchStore) applyDeviceUsageAndBlocks(reports []deviceUsage, now time.Ti
 			}
 			changed := false
 			if report, ok := byID[rec.ID]; ok {
-				changed = applyDeviceUsageReport(&rec, report, now) || changed
+				changed = applyDeviceUsageReport(&rec, workerID, report, now) || changed
 			} else if report, ok := byAWG[strings.TrimSpace(rec.AWGPublicKey)]; ok {
-				changed = applyDeviceUsageReport(&rec, report, now) || changed
+				changed = applyDeviceUsageReport(&rec, workerID, report, now) || changed
 			} else {
 				for _, profile := range rec.AWGProfiles {
 					if report, ok := byAWG[strings.TrimSpace(profile.AWGPublicKey)]; ok {
-						changed = applyDeviceUsageReport(&rec, report, now) || changed
+						changed = applyDeviceUsageReport(&rec, workerID, report, now) || changed
 						break
 					}
 				}
@@ -1005,14 +1080,29 @@ func (s *orchStore) applyDeviceUsageAndBlocks(reports []deviceUsage, now time.Ti
 	return blocked, nil
 }
 
-func applyDeviceUsageReport(rec *deviceRecord, report deviceUsage, now time.Time) bool {
+func applyDeviceUsageReport(rec *deviceRecord, workerID string, report deviceUsage, now time.Time) bool {
+	stateKey := deviceUsageStateKey(workerID, report)
+	if stateKey == "" {
+		return false
+	}
+	if rec.UsageCounters == nil {
+		rec.UsageCounters = map[string]deviceUsageCounter{}
+	}
+	prev := rec.UsageCounters[stateKey]
+	deltaRx := usageCounterDelta(prev.RxBytes, report.RxBytes)
+	deltaTx := usageCounterDelta(prev.TxBytes, report.TxBytes)
+	next := deviceUsageCounter{RxBytes: report.RxBytes, TxBytes: report.TxBytes}
 	changed := false
-	if report.RxBytes > rec.UsageRxBytes {
-		rec.UsageRxBytes = report.RxBytes
+	if deltaRx > 0 {
+		rec.UsageRxBytes = saturatingAddUint64(rec.UsageRxBytes, deltaRx)
 		changed = true
 	}
-	if report.TxBytes > rec.UsageTxBytes {
-		rec.UsageTxBytes = report.TxBytes
+	if deltaTx > 0 {
+		rec.UsageTxBytes = saturatingAddUint64(rec.UsageTxBytes, deltaTx)
+		changed = true
+	}
+	if prev != next {
+		rec.UsageCounters[stateKey] = next
 		changed = true
 	}
 	if changed {
@@ -1020,6 +1110,35 @@ func applyDeviceUsageReport(rec *deviceRecord, report deviceUsage, now time.Time
 		rec.UsageUpdatedAt = &updatedAt
 	}
 	return changed
+}
+
+func deviceUsageStateKey(workerID string, report deviceUsage) string {
+	key := strings.TrimSpace(report.AWGPublicKey)
+	if key == "" {
+		key = strings.TrimSpace(report.DeviceID)
+	}
+	if key == "" {
+		return ""
+	}
+	workerID = strings.TrimSpace(workerID)
+	if workerID == "" {
+		workerID = "unknown-worker"
+	}
+	return workerID + "\x00" + key
+}
+
+func usageCounterDelta(previous, current uint64) uint64 {
+	if current >= previous {
+		return current - previous
+	}
+	return current
+}
+
+func saturatingAddUint64(a, b uint64) uint64 {
+	if ^uint64(0)-a < b {
+		return ^uint64(0)
+	}
+	return a + b
 }
 
 func (s *orchStore) telemetrySnapshots() (map[string]telemetrySnapshotRecord, error) {
@@ -1350,8 +1469,12 @@ func (s *orchStore) updateAck(id string, applied int64, observed string, self ma
 		if len(self) > 0 {
 			rec.SelfDescribe = self
 		}
+		wasInactive := rec.Status == "inactive"
 		if (rec.Status == "approved" || rec.Status == "inactive") && rec.DesiredSeq == applied {
 			rec.Status = "active"
+			if wasInactive {
+				forceWorkerResync(rec, applied)
+			}
 		}
 		return nil
 	})
@@ -1418,11 +1541,24 @@ func (s *orchStore) updateWorkerHeartbeat(id string, haveSeq int64, self map[str
 		if len(self) > 0 {
 			rec.SelfDescribe = self
 		}
+		wasInactive := rec.Status == "inactive"
 		if (rec.Status == "approved" || rec.Status == "inactive") && rec.DesiredSeq <= haveSeq {
 			rec.Status = "active"
+			if wasInactive {
+				forceWorkerResync(rec, haveSeq)
+			}
 		}
 		return nil
 	})
+}
+
+func forceWorkerResync(rec *workerRecord, haveSeq int64) {
+	if rec.DesiredSeq <= haveSeq {
+		rec.DesiredSeq = haveSeq + 1
+	}
+	if rec.DesiredSeq < 1 {
+		rec.DesiredSeq = 1
+	}
 }
 
 func (s *orchStore) updateWorker(id string, fn func(*workerRecord) error) error {

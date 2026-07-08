@@ -18,6 +18,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -157,6 +158,86 @@ func TestDeviceEnrollConsumesBootstrapOnceAndReturnsClientConfig(t *testing.T) {
 	}
 	if strings.Contains(revokedBundle.ConfigJSON, resp.RealityUUID) {
 		t.Fatalf("revoked device still present in worker config: %s", revokedBundle.ConfigJSON)
+	}
+}
+
+func TestBootstrapTokenConcurrentConsumeDoesNotExceedMaxUses(t *testing.T) {
+	s := newTestServer(t)
+	secret := "single-use-bootstrap"
+	if _, err := s.store.createBootstrapToken(secret, time.Now().Add(time.Hour), nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	results := make(chan error, 2)
+	for _, id := range []string{"device-a", "device-b"} {
+		id := id
+		go func() {
+			_, _, err := s.store.consumeBootstrapToken(secret, deviceRecord{
+				ID:             id,
+				Status:         "approved",
+				IdentityPubKey: id + "-identity",
+				AWGPublicKey:   id + "-awg",
+				RealityUUID:    id + "-uuid",
+				InternalIP:     "10.13.13.10/32",
+				PSK2:           id + "-psk",
+				ConfigSeq:      1,
+			}, nil)
+			results <- err
+		}()
+	}
+	successes := 0
+	for i := 0; i < 2; i++ {
+		if <-results == nil {
+			successes++
+		}
+	}
+	if successes != 1 {
+		t.Fatalf("successful consumes=%d want 1", successes)
+	}
+}
+
+func TestInactiveWorkerReactivationForcesFreshBundleAfterRevocation(t *testing.T) {
+	s := newTestServer(t)
+	worker := addApprovedWorkerWithStatic(t, s, "worker-static")
+	secret := "bootstrap-reactivation"
+	if _, err := s.store.createBootstrapToken(secret, time.Now().Add(time.Hour), nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	enroll := enrollDeviceForTest(t, s, secret)
+	if !enroll.OK {
+		t.Fatalf("enroll failed: %s", enroll.Error)
+	}
+	if _, err := s.store.markStaleWorkersInactive(time.Now().UTC().Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.store.revokeDevice(enroll.DeviceID); err != nil {
+		t.Fatal(err)
+	}
+	inactive, err := s.store.worker(worker.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if inactive.Status != "inactive" {
+		t.Fatalf("worker status=%s want inactive", inactive.Status)
+	}
+	haveSeq := inactive.DesiredSeq
+	if err := s.store.updateWorkerHeartbeat(inactive.ID, haveSeq, nil); err != nil {
+		t.Fatal(err)
+	}
+	reactivated, err := s.store.worker(inactive.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reactivated.Status != "active" || reactivated.DesiredSeq <= haveSeq {
+		t.Fatalf("reactivation did not force resync: before=%+v after=%+v", inactive, reactivated)
+	}
+	devices, err := s.store.approvedDevices()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, device := range devices {
+		if device.ID == enroll.DeviceID {
+			t.Fatalf("revoked device remains approved after reactivation: %+v", device)
+		}
 	}
 }
 
@@ -530,6 +611,14 @@ func TestWorkerTelemetryRequiresDeviceSignatureAndStoresSnapshot(t *testing.T) {
 	if resp["ok"] != true {
 		t.Fatalf("telemetry rejected: %+v", resp)
 	}
+	replayRaw, err := s.handleWorkerTelemetry(workerPeer, reqRaw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	replay := replayRaw.(map[string]any)
+	if replay["ok"] == true || !strings.Contains(replay["error"].(string), "replay") {
+		t.Fatalf("telemetry replay accepted: %+v", replay)
+	}
 	live, err := s.store.telemetrySnapshots()
 	if err != nil {
 		t.Fatal(err)
@@ -544,6 +633,22 @@ func TestWorkerTelemetryRequiresDeviceSignatureAndStoresSnapshot(t *testing.T) {
 	}
 	if deviceAfterTelemetry.ClientVersion != "public-1.0.5" {
 		t.Fatalf("telemetry did not self-heal device client version: %q", deviceAfterTelemetry.ClientVersion)
+	}
+
+	staleHeaders := signedTelemetryHeadersForTestAt(t, identityKey, enroll.DeviceID, identityPub, payload, time.Now().UTC().Add(-10*time.Minute), "stale-nonce")
+	staleReq, _ := json.Marshal(workerTelemetryRequest{
+		WorkerID:      worker.ID,
+		PayloadBase64: base64.StdEncoding.EncodeToString(payload),
+		Headers:       staleHeaders,
+		ReceivedAt:    time.Now().UTC().Format(time.RFC3339Nano),
+	})
+	staleRaw, err := s.handleWorkerTelemetry(workerPeer, staleReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stale := staleRaw.(map[string]any)
+	if stale["ok"] == true || !strings.Contains(stale["error"].(string), "freshness") {
+		t.Fatalf("stale telemetry accepted: %+v", stale)
 	}
 
 	headers["X-TW-Sig"] = base64.StdEncoding.EncodeToString([]byte("bad-signature"))
@@ -1459,13 +1564,17 @@ func insertBootstrapToken(t *testing.T, st *orchStore, secret string, expiresAt 
 
 func signedTelemetryHeadersForTest(t *testing.T, key *ecdsa.PrivateKey, deviceID, publicKey string, payload []byte) map[string]string {
 	t.Helper()
+	return signedTelemetryHeadersForTestAt(t, key, deviceID, publicKey, payload, time.Now().UTC(), "test-nonce")
+}
+
+func signedTelemetryHeadersForTestAt(t *testing.T, key *ecdsa.PrivateKey, deviceID, publicKey string, payload []byte, ts time.Time, nonce string) map[string]string {
+	t.Helper()
 	sum := sha256.Sum256(payload)
-	ts := "1710000000001"
-	nonce := "test-nonce"
+	tsText := strconv.FormatInt(ts.UnixMilli(), 10)
 	canonical := strings.Join([]string{
 		telemetrySignatureDomain,
 		deviceID,
-		ts,
+		tsText,
 		nonce,
 		hex.EncodeToString(sum[:]),
 	}, "\n")
@@ -1478,7 +1587,7 @@ func signedTelemetryHeadersForTest(t *testing.T, key *ecdsa.PrivateKey, deviceID
 		"X-TW-Device":  deviceID,
 		"X-TW-Pub":     publicKey,
 		"X-TW-KeyType": "ecdsa-p256-sha256",
-		"X-TW-Ts":      ts,
+		"X-TW-Ts":      tsText,
 		"X-TW-Nonce":   nonce,
 		"X-TW-Sig":     base64.StdEncoding.EncodeToString(sig),
 	}

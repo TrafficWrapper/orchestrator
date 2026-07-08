@@ -57,25 +57,27 @@ type orchConfig struct {
 }
 
 type server struct {
-	cfg            orchConfig
-	store          *orchStore
-	signer         configSigner
-	static         noise.DHKey
-	sessions       sync.Map
-	sessionCount   atomic.Int64
-	handshakeMu    sync.Mutex
-	handshakeRates map[string]handshakeRate
-	handshakePrune time.Time
-	loginLimiterMu sync.Mutex
-	loginLimiter   *loginLimiter
-	audit          *auditLog
-	discoverySeqMu sync.Mutex
-	adminSessions  sync.Map
-	botMu          sync.Mutex
-	authApprover   authApprover
-	bot            *telegramBot
-	botCancel      context.CancelFunc
-	botFactory     telegramClientFactory
+	cfg              orchConfig
+	store            *orchStore
+	signer           configSigner
+	static           noise.DHKey
+	sessions         sync.Map
+	sessionCount     atomic.Int64
+	handshakeMu      sync.Mutex
+	handshakeRates   map[string]handshakeRate
+	handshakePrune   time.Time
+	telemetryNonceMu sync.Mutex
+	telemetryNonces  map[string]map[string]time.Time
+	loginLimiterMu   sync.Mutex
+	loginLimiter     *loginLimiter
+	audit            *auditLog
+	discoverySeqMu   sync.Mutex
+	adminSessions    sync.Map
+	botMu            sync.Mutex
+	authApprover     authApprover
+	bot              *telegramBot
+	botCancel        context.CancelFunc
+	botFactory       telegramClientFactory
 }
 
 type noiseSession struct {
@@ -237,6 +239,9 @@ type workerTelemetryRequest struct {
 const (
 	telemetrySignatureDomain = "TrafficWrapper telemetry v1"
 	telemetryMaxPayloadBytes = 64 << 10
+	telemetryMaxClockSkew    = 120 * time.Second
+	telemetryNonceLRUMax     = 4096
+	telemetryNonceDeviceMax  = 16 * 1024
 	noiseSessionTTL          = 30 * time.Second
 	noiseSessionJanitorEvery = 5 * time.Second
 	maxNoiseSessions         = 1024
@@ -845,7 +850,7 @@ func (s *server) handleAck(peer []byte, raw []byte) (any, error) {
 	if err := s.store.updateAck(rec.ID, req.AppliedVersion, req.EgressIPObserved, req.SelfDescribe); err != nil {
 		return nil, err
 	}
-	quotaBlocks, err := s.store.applyDeviceUsageAndBlocks(req.Usage, time.Now().UTC())
+	quotaBlocks, err := s.store.applyDeviceUsageAndBlocks(rec.ID, req.Usage, time.Now().UTC())
 	if err != nil {
 		return nil, err
 	}
@@ -889,8 +894,15 @@ func (s *server) handleWorkerTelemetry(peer []byte, raw []byte) (any, error) {
 	if device.Status != "approved" {
 		return map[string]any{"ok": false, "error": "device is not approved"}, nil
 	}
-	if err := verifyTelemetrySignature(device, payload, req.Headers); err != nil {
+	claims, err := verifyTelemetrySignature(device, payload, req.Headers)
+	if err != nil {
 		return map[string]any{"ok": false, "error": err.Error()}, nil
+	}
+	if err := verifyTelemetryFreshness(claims.Timestamp, time.Now().UTC()); err != nil {
+		return map[string]any{"ok": false, "error": err.Error()}, nil
+	}
+	if !s.consumeTelemetryNonce(device.ID, claims.Nonce) {
+		return map[string]any{"ok": false, "error": "telemetry replay detected"}, nil
 	}
 	snapshot, err := summarizeTelemetryPayload(device.ID, rec.ID, payload, req.ReceivedAt)
 	if err != nil {
@@ -905,38 +917,47 @@ func (s *server) handleWorkerTelemetry(peer []byte, raw []byte) (any, error) {
 	return map[string]any{"ok": true}, nil
 }
 
-func verifyTelemetrySignature(device deviceRecord, payload []byte, headers map[string]string) error {
+type telemetrySignatureClaims struct {
+	Timestamp time.Time
+	Nonce     string
+}
+
+func verifyTelemetrySignature(device deviceRecord, payload []byte, headers map[string]string) (telemetrySignatureClaims, error) {
 	deviceID := strings.TrimSpace(headers["X-TW-Device"])
 	if deviceID == "" || deviceID != device.ID {
-		return errors.New("telemetry device mismatch")
+		return telemetrySignatureClaims{}, errors.New("telemetry device mismatch")
 	}
 	if strings.TrimSpace(headers["X-TW-KeyType"]) != "ecdsa-p256-sha256" {
-		return errors.New("telemetry key type mismatch")
+		return telemetrySignatureClaims{}, errors.New("telemetry key type mismatch")
 	}
 	if strings.TrimSpace(headers["X-TW-Pub"]) != strings.TrimSpace(device.IdentityPubKey) {
-		return errors.New("telemetry public key mismatch")
+		return telemetrySignatureClaims{}, errors.New("telemetry public key mismatch")
 	}
 	ts := strings.TrimSpace(headers["X-TW-Ts"])
 	nonce := strings.TrimSpace(headers["X-TW-Nonce"])
 	sigText := strings.TrimSpace(headers["X-TW-Sig"])
 	if ts == "" || nonce == "" || sigText == "" {
-		return errors.New("telemetry signature headers missing")
+		return telemetrySignatureClaims{}, errors.New("telemetry signature headers missing")
+	}
+	tsTime, err := parseTelemetryTimestamp(ts)
+	if err != nil {
+		return telemetrySignatureClaims{}, err
 	}
 	pubRaw, err := base64.StdEncoding.DecodeString(device.IdentityPubKey)
 	if err != nil {
-		return err
+		return telemetrySignatureClaims{}, err
 	}
 	parsedPub, err := x509.ParsePKIXPublicKey(pubRaw)
 	if err != nil {
-		return err
+		return telemetrySignatureClaims{}, err
 	}
 	pub, ok := parsedPub.(*ecdsa.PublicKey)
 	if !ok {
-		return errors.New("telemetry public key is not ecdsa")
+		return telemetrySignatureClaims{}, errors.New("telemetry public key is not ecdsa")
 	}
 	sig, err := base64.StdEncoding.DecodeString(sigText)
 	if err != nil {
-		return err
+		return telemetrySignatureClaims{}, err
 	}
 	sum := sha256.Sum256(payload)
 	canonical := strings.Join([]string{
@@ -948,9 +969,73 @@ func verifyTelemetrySignature(device deviceRecord, payload []byte, headers map[s
 	}, "\n")
 	canonicalHash := sha256.Sum256([]byte(canonical))
 	if !ecdsa.VerifyASN1(pub, canonicalHash[:], sig) {
-		return errors.New("telemetry signature invalid")
+		return telemetrySignatureClaims{}, errors.New("telemetry signature invalid")
+	}
+	return telemetrySignatureClaims{Timestamp: tsTime, Nonce: nonce}, nil
+}
+
+func parseTelemetryTimestamp(value string) (time.Time, error) {
+	n, err := strconv.ParseInt(strings.TrimSpace(value), 10, 64)
+	if err != nil {
+		return time.Time{}, errors.New("telemetry timestamp invalid")
+	}
+	if n > 1_000_000_000_000 {
+		return time.UnixMilli(n).UTC(), nil
+	}
+	return time.Unix(n, 0).UTC(), nil
+}
+
+func verifyTelemetryFreshness(ts, now time.Time) error {
+	if ts.IsZero() {
+		return errors.New("telemetry timestamp invalid")
+	}
+	delta := now.Sub(ts)
+	if delta < 0 {
+		delta = -delta
+	}
+	if delta > telemetryMaxClockSkew {
+		return errors.New("telemetry timestamp outside freshness window")
 	}
 	return nil
+}
+
+func (s *server) consumeTelemetryNonce(deviceID, nonce string) bool {
+	deviceID = strings.TrimSpace(deviceID)
+	nonce = strings.TrimSpace(nonce)
+	if deviceID == "" || nonce == "" {
+		return false
+	}
+	now := time.Now().UTC()
+	s.telemetryNonceMu.Lock()
+	defer s.telemetryNonceMu.Unlock()
+	if s.telemetryNonces == nil {
+		s.telemetryNonces = map[string]map[string]time.Time{}
+	}
+	deviceNonces := s.telemetryNonces[deviceID]
+	if deviceNonces == nil {
+		if len(s.telemetryNonces) >= telemetryNonceDeviceMax {
+			for key := range s.telemetryNonces {
+				delete(s.telemetryNonces, key)
+				break
+			}
+		}
+		deviceNonces = map[string]time.Time{}
+		s.telemetryNonces[deviceID] = deviceNonces
+	}
+	if seenAt, exists := deviceNonces[nonce]; exists {
+		if now.Sub(seenAt) <= 2*telemetryMaxClockSkew {
+			return false
+		}
+		delete(deviceNonces, nonce)
+	}
+	if len(deviceNonces) >= telemetryNonceLRUMax {
+		for key := range deviceNonces {
+			delete(deviceNonces, key)
+			break
+		}
+	}
+	deviceNonces[nonce] = now
+	return true
 }
 
 func summarizeTelemetryPayload(deviceID, workerID string, payload []byte, receivedAtRaw string) (telemetrySnapshotRecord, error) {
