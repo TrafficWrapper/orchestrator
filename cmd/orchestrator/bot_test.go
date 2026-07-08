@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -341,11 +342,20 @@ func TestTelegramBotProblemNotifyDebounceCooldownRecovery(t *testing.T) {
 	putQuotaDevice(t, s, deviceRecord{
 		ID:           deviceID,
 		Status:       "approved",
-		CreatedAt:    time.Now().UTC().Add(-botProblemDeviceOfflineAfter - time.Minute),
+		CreatedAt:    time.Now().UTC().Add(-time.Hour),
 		AWGPublicKey: "awg",
 		InternalIP:   "10.13.13.9/32",
 		RealityUUID:  "uuid",
 	})
+	if err := s.store.setTelemetrySnapshot(telemetrySnapshotRecord{
+		DeviceID:   deviceID,
+		WorkerID:   "worker-a",
+		ReceivedAt: time.Now().UTC().Add(-botProblemDeviceOfflineAfter - time.Minute),
+		Health:     "ok",
+		Carry:      true,
+	}); err != nil {
+		t.Fatal(err)
+	}
 	mock := &mockTelegramAPI{}
 	bot := newTelegramBot(s, botSettingsRecord{Token: "test-token", OwnerID: 1001}, mock)
 
@@ -409,11 +419,113 @@ func TestBotProblemSnapshotIncludesQuotaAndWorkerDown(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, ok := problems["device:twpk_quota:quota100"]; !ok {
+	if entry, ok := problems["device:twpk_quota:quota"]; !ok || entry.Level != "exhausted" {
 		t.Fatalf("quota problem missing: %+v", problems)
 	}
 	if _, ok := problems["worker:"+worker.ID+":worker_down"]; !ok {
 		t.Fatalf("worker down problem missing: %+v", problems)
+	}
+}
+
+func TestBotProblemQuotaEscalatesWithoutPhantomRecovery(t *testing.T) {
+	now := time.Date(2026, 7, 8, 12, 0, 0, 0, time.UTC)
+	near := botProblemEntry{Scope: "device", ID: "twpk_q", Kind: "quota", Level: "near", Label: "twpk_q", Detail: "92 / 100"}
+	exhausted := near
+	exhausted.Level = "exhausted"
+	exhausted.Detail = "100 / 100"
+	key := botProblemKey(near)
+
+	state := buildBotProblemState(botProblemState{}, map[string]botProblemEntry{key: near}, now)
+	notices := botProblemNotices(botProblemState{}, state, false)
+	if len(notices) != 0 {
+		t.Fatalf("first quota poll emitted notice: %+v", notices)
+	}
+	prev := state
+	state = buildBotProblemState(prev, map[string]botProblemEntry{key: near}, now.Add(time.Minute))
+	notices = botProblemNotices(prev, state, true)
+	if len(notices) != 1 || !strings.Contains(notices[0].Text, "near limit") {
+		t.Fatalf("near quota notice missing: %+v", notices)
+	}
+	markBotProblemNoticesSent(&state, notices)
+
+	prev = state
+	state = buildBotProblemState(prev, map[string]botProblemEntry{key: exhausted}, now.Add(2*time.Minute))
+	notices = botProblemNotices(prev, state, true)
+	if len(notices) != 1 || !strings.Contains(notices[0].Text, "exhausted") {
+		t.Fatalf("exhausted escalation notice missing: %+v", notices)
+	}
+	if strings.Contains(notices[0].Text, "recovered") || len(state.Recovering) != 0 {
+		t.Fatalf("quota escalation produced recovery: notices=%+v recovering=%+v", notices, state.Recovering)
+	}
+	markBotProblemNoticesSent(&state, notices)
+
+	prev = state
+	state = buildBotProblemState(prev, nil, now.Add(3*time.Minute))
+	notices = botProblemNotices(prev, state, true)
+	if len(notices) != 0 {
+		t.Fatalf("quota recovery emitted before debounce: %+v", notices)
+	}
+	prev = state
+	state = buildBotProblemState(prev, nil, now.Add(4*time.Minute))
+	notices = botProblemNotices(prev, state, true)
+	if len(notices) != 1 || !strings.Contains(notices[0].Text, "quota recovered") {
+		t.Fatalf("quota recovery notice missing: %+v", notices)
+	}
+}
+
+func TestBotProblemOfflineRequiresTelemetrySnapshot(t *testing.T) {
+	now := time.Now().UTC()
+	device := deviceRecord{
+		ID:        "twpk_optout",
+		Status:    "approved",
+		CreatedAt: now.Add(-24 * time.Hour),
+	}
+	if entries := botDeviceProblemEntries(device, telemetrySnapshotRecord{}, now); len(entries) != 0 {
+		t.Fatalf("device without telemetry snapshot flagged offline: %+v", entries)
+	}
+	oldSnapshot := telemetrySnapshotRecord{DeviceID: device.ID, ReceivedAt: now.Add(-botProblemDeviceOfflineAfter - time.Minute)}
+	entries := botDeviceProblemEntries(device, oldSnapshot, now)
+	if len(entries) != 1 || entries[0].Kind != "device_offline" {
+		t.Fatalf("stale telemetry did not flag offline: %+v", entries)
+	}
+}
+
+func TestBotProblemRecoveryCleanupIgnoresSendCap(t *testing.T) {
+	now := time.Date(2026, 7, 8, 12, 0, 0, 0, time.UTC)
+	prev := botProblemState{
+		Active:        map[string]botProblemEntry{},
+		PendingPolls:  map[string]int{},
+		Recovering:    map[string]botProblemEntry{},
+		RecoveryPolls: map[string]int{},
+		LastNotified:  map[string]time.Time{},
+	}
+	problems := map[string]botProblemEntry{}
+	for i := 0; i < botProblemMaxNoticesPerPoll+2; i++ {
+		entry := botProblemEntry{Scope: "device", ID: fmt.Sprintf("twpk_%02d", i), Kind: "device_offline", Label: fmt.Sprintf("twpk_%02d", i)}
+		key := botProblemKey(entry)
+		prev.Active[key] = entry
+		prev.PendingPolls[key] = botProblemPollsBeforeAlert
+		prev.LastNotified[key] = now.Add(-botProblemRepeatCooldown - time.Minute)
+		problems[key] = entry
+	}
+	recovered := botProblemEntry{Scope: "worker", ID: "worker-recovered", Kind: "worker_down", Label: "worker-recovered"}
+	recoveredKey := botProblemKey(recovered)
+	prev.Recovering[recoveredKey] = recovered
+	prev.RecoveryPolls[recoveredKey] = botProblemRecoveryPollsBeforeNote - 1
+	prev.LastNotified[recoveredKey] = now.Add(-time.Hour)
+
+	current := buildBotProblemState(prev, problems, now)
+	notices := botProblemNotices(prev, current, true)
+	if len(notices) != botProblemMaxNoticesPerPoll {
+		t.Fatalf("send cap not enforced: got %d", len(notices))
+	}
+	markBotProblemNoticesSent(&current, notices)
+	cleanupRecoveredBotProblems(&current)
+	if _, ok := current.Recovering[recoveredKey]; ok {
+		t.Fatalf("recovery state was not cleaned under send cap")
+	}
+	if _, ok := current.LastNotified[recoveredKey]; ok {
+		t.Fatalf("recovered last_notified was not cleaned under send cap")
 	}
 }
 

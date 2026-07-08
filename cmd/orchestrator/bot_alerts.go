@@ -33,6 +33,7 @@ type botProblemEntry struct {
 	Scope  string `json:"scope"`
 	ID     string `json:"id"`
 	Kind   string `json:"kind"`
+	Level  string `json:"level,omitempty"`
 	Label  string `json:"label"`
 	Detail string `json:"detail,omitempty"`
 }
@@ -67,6 +68,7 @@ func (b *telegramBot) notifyProblemTransitions(ctx context.Context) {
 		}
 		markBotProblemNoticesSent(&current, notices)
 	}
+	cleanupRecoveredBotProblems(&current)
 	if err := b.server.store.putBotProblemState(current); err != nil {
 		log.Printf("telegram problem notify state save failed: %v", err)
 	}
@@ -109,11 +111,8 @@ func botDeviceProblemEntries(device deviceRecord, telemetry telemetrySnapshotRec
 	if entry, ok := botDeviceQuotaProblem(device, label); ok {
 		out = append(out, entry)
 	}
-	if device.Status == "approved" && botDeviceTelemetryOffline(device, telemetry, now) {
-		detail := "нет свежей телеметрии"
-		if !telemetry.ReceivedAt.IsZero() {
-			detail = "last_seen=" + telemetry.ReceivedAt.UTC().Format(time.RFC3339)
-		}
+	if device.Status == "approved" && botDeviceTelemetryOffline(telemetry, now) {
+		detail := "last_seen=" + telemetry.ReceivedAt.UTC().Format(time.RFC3339)
 		out = append(out, botProblemEntry{
 			Scope:  "device",
 			ID:     id,
@@ -132,19 +131,20 @@ func botDeviceQuotaProblem(device deviceRecord, label string) (botProblemEntry, 
 		return botProblemEntry{}, false
 	}
 	usage := saturatingAddUint64(device.UsageRxBytes, device.UsageTxBytes)
-	kind := ""
+	level := ""
 	switch {
 	case strings.TrimSpace(device.BlockedReason) == "traffic_quota_bytes" || usage >= quota:
-		kind = "quota100"
+		level = "exhausted"
 	case quotaUsagePercent(usage, quota) >= botProblemQuotaNearPercent:
-		kind = "quota90"
+		level = "near"
 	default:
 		return botProblemEntry{}, false
 	}
 	return botProblemEntry{
 		Scope:  "device",
 		ID:     id,
-		Kind:   kind,
+		Kind:   "quota",
+		Level:  level,
 		Label:  label,
 		Detail: fmt.Sprintf("%s / %s", humanBytes(usage), humanBytes(quota)),
 	}, true
@@ -163,14 +163,11 @@ func quotaUsagePercent(usage, quota uint64) int {
 	return int((usage * 100) / quota)
 }
 
-func botDeviceTelemetryOffline(device deviceRecord, telemetry telemetrySnapshotRecord, now time.Time) bool {
+func botDeviceTelemetryOffline(telemetry telemetrySnapshotRecord, now time.Time) bool {
 	if !telemetry.ReceivedAt.IsZero() {
 		return now.Sub(telemetry.ReceivedAt.UTC()) >= botProblemDeviceOfflineAfter
 	}
-	if device.CreatedAt.IsZero() {
-		return true
-	}
-	return now.Sub(device.CreatedAt.UTC()) >= botProblemDeviceOfflineAfter
+	return false
 }
 
 func botWorkerProblemEntry(worker workerRecord, now time.Time) (botProblemEntry, bool) {
@@ -251,25 +248,44 @@ func botProblemNotices(prev, current botProblemState, initialized bool) []botPro
 		return nil
 	}
 	var notices []botProblemNotice
+	sent := 0
+	recoveryKeys := sortedBotProblemKeys(current.Recovering)
+	recoveryBudget := botProblemMaxNoticesPerPoll / 4
+	if recoveryBudget < 1 {
+		recoveryBudget = 1
+	}
+	for _, key := range recoveryKeys {
+		if sent >= recoveryBudget || current.RecoveryPolls[key] < botProblemRecoveryPollsBeforeNote {
+			continue
+		}
+		entry := current.Recovering[key]
+		notices = append(notices, botProblemNotice{Key: key, Text: botProblemRecoveredText(entry), Recovery: true})
+		sent++
+	}
 	for _, key := range sortedBotProblemKeys(current.Active) {
 		entry := current.Active[key]
 		if botProblemNoticeOnCooldown(prev, current, key) {
 			continue
 		}
 		notices = append(notices, botProblemNotice{Key: key, Text: botProblemIssueText(entry)})
-		if len(notices) >= botProblemMaxNoticesPerPoll {
+		sent++
+		if sent >= botProblemMaxNoticesPerPoll {
 			return notices
 		}
 	}
-	for _, key := range sortedBotProblemKeys(current.Recovering) {
+	for _, key := range recoveryKeys {
+		if sent >= botProblemMaxNoticesPerPoll {
+			return notices
+		}
 		if current.RecoveryPolls[key] < botProblemRecoveryPollsBeforeNote {
+			continue
+		}
+		if containsBotProblemNotice(notices, key) {
 			continue
 		}
 		entry := current.Recovering[key]
 		notices = append(notices, botProblemNotice{Key: key, Text: botProblemRecoveredText(entry), Recovery: true})
-		if len(notices) >= botProblemMaxNoticesPerPoll {
-			return notices
-		}
+		sent++
 	}
 	return notices
 }
@@ -289,10 +305,11 @@ func botProblemIssueText(entry botProblemEntry) string {
 	switch entry.Kind {
 	case "device_offline":
 		return fmt.Sprintf("Device %s offline: %s", entry.Label, dashText(entry.Detail))
-	case "quota90":
+	case "quota":
+		if entry.Level == "exhausted" {
+			return fmt.Sprintf("Device %s quota exhausted: %s", entry.Label, dashText(entry.Detail))
+		}
 		return fmt.Sprintf("Device %s quota near limit: %s", entry.Label, dashText(entry.Detail))
-	case "quota100":
-		return fmt.Sprintf("Device %s quota exhausted: %s", entry.Label, dashText(entry.Detail))
 	case "worker_down":
 		return fmt.Sprintf("Worker %s down: %s", entry.Label, dashText(entry.Detail))
 	default:
@@ -304,7 +321,7 @@ func botProblemRecoveredText(entry botProblemEntry) string {
 	switch entry.Kind {
 	case "device_offline":
 		return "Device " + entry.Label + " recovered"
-	case "quota90", "quota100":
+	case "quota":
 		return "Device " + entry.Label + " quota recovered"
 	case "worker_down":
 		return "Worker " + entry.Label + " recovered"
@@ -314,11 +331,32 @@ func botProblemRecoveredText(entry botProblemEntry) string {
 }
 
 func botProblemNoticeOnCooldown(prev, current botProblemState, key string) bool {
+	if botProblemEscalated(prev.Active[key], current.Active[key]) {
+		return false
+	}
 	last := prev.LastNotified[key]
 	if last.IsZero() {
 		return false
 	}
 	return current.UpdatedAt.Sub(last.UTC()) < botProblemRepeatCooldown
+}
+
+func botProblemEscalated(old, current botProblemEntry) bool {
+	if old.Kind != "quota" || current.Kind != "quota" {
+		return false
+	}
+	return quotaProblemLevelRank(current.Level) > quotaProblemLevelRank(old.Level)
+}
+
+func quotaProblemLevelRank(level string) int {
+	switch strings.TrimSpace(level) {
+	case "exhausted":
+		return 2
+	case "near":
+		return 1
+	default:
+		return 0
+	}
 }
 
 func markBotProblemNoticesSent(state *botProblemState, notices []botProblemNotice) {
@@ -341,6 +379,29 @@ func markBotProblemNoticesSent(state *botProblemState, notices []botProblemNotic
 		}
 		state.LastNotified[notice.Key] = now.UTC()
 	}
+}
+
+func cleanupRecoveredBotProblems(state *botProblemState) {
+	if state == nil {
+		return
+	}
+	for key := range state.Recovering {
+		if state.RecoveryPolls[key] < botProblemRecoveryPollsBeforeNote {
+			continue
+		}
+		delete(state.Recovering, key)
+		delete(state.RecoveryPolls, key)
+		delete(state.LastNotified, key)
+	}
+}
+
+func containsBotProblemNotice(notices []botProblemNotice, key string) bool {
+	for _, notice := range notices {
+		if notice.Key == key {
+			return true
+		}
+	}
+	return false
 }
 
 func botProblemKey(entry botProblemEntry) string {
