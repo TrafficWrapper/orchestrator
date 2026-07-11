@@ -437,14 +437,25 @@ func runServe(cfg orchConfig) error {
 	mux.HandleFunc("/admin/v1/status", s.handleAdminStatus)
 	addr := cfg.Listen
 	log.Printf("orchestrator serve listen=%s tls=%t public_key=%s", addr, cfg.TLS, protocol.KeyToBase64(static.Public))
+	httpServer := newOrchestratorHTTPServer(addr, mux)
 	if cfg.TLS {
 		cert, key, err := loadOrCreateTLS(cfg)
 		if err != nil {
 			return err
 		}
-		return http.ListenAndServeTLS(addr, cert, key, mux)
+		return httpServer.ListenAndServeTLS(cert, key)
 	}
-	return http.ListenAndServe(addr, mux)
+	return httpServer.ListenAndServe()
+}
+
+func newOrchestratorHTTPServer(addr string, handler http.Handler) *http.Server {
+	return &http.Server{
+		Addr:              addr,
+		Handler:           handler,
+		TLSConfig:         &tls.Config{MinVersion: tls.VersionTLS12},
+		ReadHeaderTimeout: 15 * time.Second,
+		IdleTimeout:       120 * time.Second,
+	}
 }
 
 func (s *server) handleHandshakeStart(w http.ResponseWriter, r *http.Request) {
