@@ -72,6 +72,11 @@ type server struct {
 	loginLimiter     *loginLimiter
 	audit            *auditLog
 	discoverySeqMu   sync.Mutex
+	discoveryCacheMu sync.Mutex
+	discoveryCache   discoveryBundleCache
+	discoveryBuilds  atomic.Int64
+	discoveryRateMu  sync.Mutex
+	discoveryRates   map[string]discoveryRequestRate
 	adminSessions    sync.Map
 	botMu            sync.Mutex
 	authApprover     authApprover

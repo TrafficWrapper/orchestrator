@@ -2,6 +2,9 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"testing"
@@ -9,6 +12,108 @@ import (
 
 	"aead.dev/minisign"
 )
+
+func TestDiscoveryHandlersCacheAndInvalidate(t *testing.T) {
+	s := newTestServer(t)
+	writeDiscoverySigningKeyForTest(t, s)
+	addApprovedWorker(t, s)
+
+	var firstJSON string
+	for i := 0; i < 6; i++ {
+		req := httptest.NewRequest(http.MethodGet, "/discovery/endpoints.json", nil)
+		req.RemoteAddr = "198.51.100.10:1234"
+		rr := httptest.NewRecorder()
+		s.handleDiscoveryEndpointsJSON(rr, req)
+		if rr.Code != http.StatusOK {
+			t.Fatalf("cached discovery GET %d status=%d body=%s", i, rr.Code, rr.Body.String())
+		}
+		if i == 0 {
+			firstJSON = rr.Body.String()
+		} else if rr.Body.String() != firstJSON {
+			t.Fatal("cache returned different JSON for unchanged worker set")
+		}
+		sigReq := httptest.NewRequest(http.MethodGet, "/discovery/endpoints.json.minisig", nil)
+		sigReq.RemoteAddr = "198.51.100.10:1234"
+		sigRR := httptest.NewRecorder()
+		s.handleDiscoveryEndpointsMinisig(sigRR, sigReq)
+		if sigRR.Code != http.StatusOK || sigRR.Body.Len() == 0 {
+			t.Fatalf("cached discovery signature GET %d status=%d body=%s", i, sigRR.Code, sigRR.Body.String())
+		}
+	}
+	if builds := s.discoveryBuilds.Load(); builds != 1 {
+		t.Fatalf("discovery generations=%d want 1", builds)
+	}
+
+	if _, err := s.bumpDiscoverySeq(); err != nil {
+		t.Fatal(err)
+	}
+	bumpedJSON := discoveryJSONViaHandler(t, s)
+	if builds := s.discoveryBuilds.Load(); builds != 2 {
+		t.Fatalf("discovery generations after bump=%d want 2", builds)
+	}
+	if discoverySeqFromText(t, bumpedJSON) <= discoverySeqFromText(t, firstJSON) {
+		t.Fatal("admin bump did not advance cached discovery seq")
+	}
+
+	workers, err := s.store.workers()
+	if err != nil || len(workers) != 1 {
+		t.Fatalf("workers=%d err=%v", len(workers), err)
+	}
+	self := workers[0].SelfDescribe
+	self["egress_ip"] = "203.0.113.99"
+	if err := s.store.updateWorkerSelfDescribe(workers[0].ID, self); err != nil {
+		t.Fatal(err)
+	}
+	changedJSON := discoveryJSONViaHandler(t, s)
+	if builds := s.discoveryBuilds.Load(); builds != 3 {
+		t.Fatalf("discovery generations after worker change=%d want 3", builds)
+	}
+	if changedJSON == bumpedJSON {
+		t.Fatal("worker endpoint change did not invalidate discovery cache")
+	}
+
+	s.discoveryCacheMu.Lock()
+	s.discoveryCache.GeneratedAt = time.Now().UTC().Add(-discoveryBundleCacheTTL)
+	s.discoveryCacheMu.Unlock()
+	_ = discoveryJSONViaHandler(t, s)
+	if builds := s.discoveryBuilds.Load(); builds != 4 {
+		t.Fatalf("discovery generations after TTL=%d want 4", builds)
+	}
+}
+
+func TestDiscoveryEndpointRateLimitIsBounded(t *testing.T) {
+	s := newTestServer(t)
+	now := time.Now().UTC()
+	key := rateLimitKey("198.51.100.20")
+	for i := 0; i < discoveryRateLimit; i++ {
+		if !s.reserveDiscoveryRequestForKey(key, now) {
+			t.Fatalf("request %d rejected before limit", i)
+		}
+	}
+	if s.reserveDiscoveryRequestForKey(key, now) {
+		t.Fatal("request above discovery rate limit accepted")
+	}
+	req := httptest.NewRequest(http.MethodGet, "/discovery/endpoints.json", nil)
+	req.RemoteAddr = "198.51.100.20:4321"
+	rr := httptest.NewRecorder()
+	s.handleDiscoveryEndpointsJSON(rr, req)
+	if rr.Code != http.StatusTooManyRequests {
+		t.Fatalf("rate-limited handler status=%d want 429", rr.Code)
+	}
+
+	for i := 0; i < maxDiscoveryRateKeys+100; i++ {
+		floodKey := rateLimitKey(fmt.Sprintf("2001:db8:%x:%x::1", i/0x10000, i%0x10000))
+		if !s.reserveDiscoveryRequestForKey(floodKey, now) {
+			t.Fatalf("new discovery key rejected at cap: %s", floodKey)
+		}
+	}
+	s.discoveryRateMu.Lock()
+	got := len(s.discoveryRates)
+	s.discoveryRateMu.Unlock()
+	if got != maxDiscoveryRateKeys {
+		t.Fatalf("discovery rate keys=%d want cap %d", got, maxDiscoveryRateKeys)
+	}
+}
 
 func TestSignedDiscoveryBundleUsesUpdateKey(t *testing.T) {
 	pub, priv, err := minisign.GenerateKey(nil)
@@ -238,4 +343,44 @@ func addApprovedDiscoveryWorker(t *testing.T, s *server, staticPub string, addre
 	if err := s.store.approveWorker(rec.ID); err != nil {
 		t.Fatal(err)
 	}
+}
+
+func writeDiscoverySigningKeyForTest(t *testing.T, s *server) minisign.PublicKey {
+	t.Helper()
+	pub, priv, err := minisign.GenerateKey(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.cfg.UpdatePublicKey = mustText(pub)
+	privText, err := priv.MarshalText()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(s.cfg.StateDir, "update.key"), privText, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return pub
+}
+
+func discoveryJSONViaHandler(t *testing.T, s *server) string {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodGet, "/discovery/endpoints.json", nil)
+	req.RemoteAddr = "198.51.100.30:1234"
+	rr := httptest.NewRecorder()
+	s.handleDiscoveryEndpointsJSON(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("discovery status=%d body=%s", rr.Code, rr.Body.String())
+	}
+	return rr.Body.String()
+}
+
+func discoverySeqFromText(t *testing.T, jsonText string) int64 {
+	t.Helper()
+	var root struct {
+		Seq int64 `json:"seq"`
+	}
+	if err := json.Unmarshal([]byte(jsonText), &root); err != nil {
+		t.Fatal(err)
+	}
+	return root.Seq
 }

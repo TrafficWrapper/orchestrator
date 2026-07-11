@@ -13,9 +13,34 @@ import (
 	"aead.dev/minisign"
 )
 
+const (
+	discoveryBundleCacheTTL = 30 * time.Second
+	discoveryRateWindow     = time.Minute
+	discoveryRateLimit      = 60
+	maxDiscoveryRateKeys    = 16 * 1024
+)
+
+type discoveryBundleCache struct {
+	JSON           string
+	Minisig        string
+	PublicKey      string
+	GeneratedAt    time.Time
+	WorkerRevision uint64
+}
+
+type discoveryRequestRate struct {
+	WindowStart time.Time
+	Count       int
+}
+
 func (s *server) handleDiscoveryEndpointsJSON(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if !s.reserveDiscoveryRequest(r) {
+		w.Header().Set("Retry-After", "60")
+		http.Error(w, "discovery request rate exceeded", http.StatusTooManyRequests)
 		return
 	}
 	jsonText, _, _, err := s.signedDiscoveryBundle()
@@ -30,6 +55,11 @@ func (s *server) handleDiscoveryEndpointsJSON(w http.ResponseWriter, r *http.Req
 func (s *server) handleDiscoveryEndpointsMinisig(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if !s.reserveDiscoveryRequest(r) {
+		w.Header().Set("Retry-After", "60")
+		http.Error(w, "discovery request rate exceeded", http.StatusTooManyRequests)
 		return
 	}
 	_, minisigText, _, err := s.signedDiscoveryBundle()
@@ -58,15 +88,71 @@ func (s *server) handleAdminDiscoveryBump(w http.ResponseWriter, r *http.Request
 }
 
 func (s *server) signedDiscoveryBundle() (string, string, string, error) {
+	now := time.Now().UTC()
+	revision := s.store.discoveryRevision()
+	s.discoveryCacheMu.Lock()
+	defer s.discoveryCacheMu.Unlock()
+	age := now.Sub(s.discoveryCache.GeneratedAt)
+	if s.discoveryCache.JSON != "" &&
+		s.discoveryCache.WorkerRevision == revision &&
+		age >= 0 && age < discoveryBundleCacheTTL {
+		return s.discoveryCache.JSON, s.discoveryCache.Minisig, s.discoveryCache.PublicKey, nil
+	}
 	priv, pubText, err := s.loadServerUpdateSigningKey()
 	if err != nil {
 		return "", "", "", err
 	}
-	jsonText, err := s.discoveryBundleJSON(time.Now().UTC())
+	jsonText, err := s.discoveryBundleJSON(now)
 	if err != nil {
 		return "", "", "", err
 	}
-	return jsonText, string(minisign.Sign(priv, []byte(jsonText))), pubText, nil
+	minisigText := string(minisign.Sign(priv, []byte(jsonText)))
+	s.discoveryCache = discoveryBundleCache{
+		JSON:           jsonText,
+		Minisig:        minisigText,
+		PublicKey:      pubText,
+		GeneratedAt:    now,
+		WorkerRevision: revision,
+	}
+	s.discoveryBuilds.Add(1)
+	return jsonText, minisigText, pubText, nil
+}
+
+func (s *server) invalidateDiscoveryCache() {
+	s.discoveryCacheMu.Lock()
+	s.discoveryCache = discoveryBundleCache{}
+	s.discoveryCacheMu.Unlock()
+}
+
+func (s *server) reserveDiscoveryRequest(r *http.Request) bool {
+	return s.reserveDiscoveryRequestForKey(rateLimitKey(clientIP(r)), time.Now().UTC())
+}
+
+func (s *server) reserveDiscoveryRequestForKey(key string, now time.Time) bool {
+	s.discoveryRateMu.Lock()
+	defer s.discoveryRateMu.Unlock()
+	if s.discoveryRates == nil {
+		s.discoveryRates = make(map[string]discoveryRequestRate)
+	}
+	rate, exists := s.discoveryRates[key]
+	if exists && now.Sub(rate.WindowStart) >= discoveryRateWindow {
+		rate = discoveryRequestRate{WindowStart: now}
+	}
+	if !exists {
+		if len(s.discoveryRates) >= maxDiscoveryRateKeys {
+			for staleKey := range s.discoveryRates {
+				delete(s.discoveryRates, staleKey)
+				break
+			}
+		}
+		rate = discoveryRequestRate{WindowStart: now}
+	}
+	if rate.Count >= discoveryRateLimit {
+		return false
+	}
+	rate.Count++
+	s.discoveryRates[key] = rate
+	return true
 }
 
 func (s *server) discoveryPublicKey() string {
@@ -187,23 +273,29 @@ func (s *server) discoverySeqForHash(hash string) (int64, error) {
 
 func (s *server) bumpDiscoverySeq() (int64, error) {
 	s.discoverySeqMu.Lock()
-	defer s.discoverySeqMu.Unlock()
-	current, err := s.readDiscoverySeqLocked()
-	if err != nil {
-		return 0, err
+	next, err := func() (int64, error) {
+		current, err := s.readDiscoverySeqLocked()
+		if err != nil {
+			return 0, err
+		}
+		if current < 1 {
+			current = 1
+		}
+		next := current + 1
+		hash, err := s.readDiscoveryHashLocked()
+		if err != nil {
+			return 0, err
+		}
+		if err := s.writeDiscoverySeqStateLocked(next, hash); err != nil {
+			return 0, err
+		}
+		return next, nil
+	}()
+	s.discoverySeqMu.Unlock()
+	if err == nil {
+		s.invalidateDiscoveryCache()
 	}
-	if current < 1 {
-		current = 1
-	}
-	next := current + 1
-	hash, err := s.readDiscoveryHashLocked()
-	if err != nil {
-		return 0, err
-	}
-	if err := s.writeDiscoverySeqStateLocked(next, hash); err != nil {
-		return 0, err
-	}
-	return next, nil
+	return next, err
 }
 
 func (s *server) readDiscoverySeqLocked() (int64, error) {

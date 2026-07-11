@@ -15,6 +15,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	bolt "go.etcd.io/bbolt"
@@ -37,8 +38,9 @@ var (
 )
 
 type orchStore struct {
-	db   *bolt.DB
-	aead cipher.AEAD
+	db                      *bolt.DB
+	aead                    cipher.AEAD
+	discoveryWorkerRevision atomic.Uint64
 }
 
 type tokenRecord struct {
@@ -1353,12 +1355,15 @@ func (s *orchStore) deleteDevice(id string) error {
 func (s *orchStore) upsertPendingWorker(staticPub string, self map[string]any) (workerRecord, error) {
 	id := workerID(staticPub)
 	var rec workerRecord
+	changed := false
 	err := s.db.Update(func(tx *bolt.Tx) error {
 		b := tx.Bucket(bucketWorkers)
+		var before [sha256.Size]byte
 		if raw := b.Get([]byte(id)); raw != nil {
 			if err := s.openJSON(raw, &rec); err != nil {
 				return err
 			}
+			before = workerDiscoveryFingerprint(rec, time.Now().UTC())
 			rec.SelfDescribe = self
 		} else {
 			rec = workerRecord{
@@ -1373,8 +1378,12 @@ func (s *orchStore) upsertPendingWorker(staticPub string, self map[string]any) (
 		if err != nil {
 			return err
 		}
+		changed = before != workerDiscoveryFingerprint(rec, time.Now().UTC())
 		return b.Put([]byte(id), sealed)
 	})
+	if err == nil && changed {
+		s.touchDiscoveryWorkerRevision()
+	}
 	return rec, err
 }
 
@@ -1401,7 +1410,8 @@ type workerPolicyPatch struct {
 }
 
 func (s *orchStore) updateWorkerPolicy(id string, patch workerPolicyPatch) error {
-	return s.db.Update(func(tx *bolt.Tx) error {
+	changed := false
+	err := s.db.Update(func(tx *bolt.Tx) error {
 		b := tx.Bucket(bucketWorkers)
 		raw := b.Get([]byte(strings.TrimSpace(id)))
 		if raw == nil {
@@ -1411,6 +1421,7 @@ func (s *orchStore) updateWorkerPolicy(id string, patch workerPolicyPatch) error
 		if err := s.openJSON(raw, &rec); err != nil {
 			return err
 		}
+		before := workerDiscoveryFingerprint(rec, time.Now().UTC())
 		if patch.Enabled != nil {
 			rec.Disabled = !*patch.Enabled
 		}
@@ -1451,8 +1462,13 @@ func (s *orchStore) updateWorkerPolicy(id string, patch workerPolicyPatch) error
 		if err := b.Put([]byte(rec.ID), sealed); err != nil {
 			return err
 		}
+		changed = before != workerDiscoveryFingerprint(rec, time.Now().UTC())
 		return s.bumpWorkerSeqsTx(tx)
 	})
+	if err == nil && changed {
+		s.touchDiscoveryWorkerRevision()
+	}
+	return err
 }
 
 func (s *orchStore) currentAPKRelease() (apkReleaseRecord, bool, error) {
@@ -1588,6 +1604,9 @@ func (s *orchStore) markStaleWorkersInactive(cutoff time.Time) (int, error) {
 			return nil
 		})
 	})
+	if err == nil && updated > 0 {
+		s.touchDiscoveryWorkerRevision()
+	}
 	return updated, err
 }
 
@@ -1651,7 +1670,8 @@ func forceWorkerResync(rec *workerRecord, haveSeq int64) {
 }
 
 func (s *orchStore) updateWorker(id string, fn func(*workerRecord) error) error {
-	return s.db.Update(func(tx *bolt.Tx) error {
+	changed := false
+	err := s.db.Update(func(tx *bolt.Tx) error {
 		b := tx.Bucket(bucketWorkers)
 		raw := b.Get([]byte(id))
 		if raw == nil {
@@ -1661,6 +1681,7 @@ func (s *orchStore) updateWorker(id string, fn func(*workerRecord) error) error 
 		if err := s.openJSON(raw, &rec); err != nil {
 			return err
 		}
+		before := workerDiscoveryFingerprint(rec, time.Now().UTC())
 		if err := fn(&rec); err != nil {
 			return err
 		}
@@ -1668,8 +1689,42 @@ func (s *orchStore) updateWorker(id string, fn func(*workerRecord) error) error 
 		if err != nil {
 			return err
 		}
+		changed = before != workerDiscoveryFingerprint(rec, time.Now().UTC())
 		return b.Put([]byte(id), sealed)
 	})
+	if err == nil && changed {
+		s.touchDiscoveryWorkerRevision()
+	}
+	return err
+}
+
+func (s *orchStore) discoveryRevision() uint64 {
+	return s.discoveryWorkerRevision.Load()
+}
+
+func (s *orchStore) touchDiscoveryWorkerRevision() {
+	s.discoveryWorkerRevision.Add(1)
+}
+
+func workerDiscoveryFingerprint(rec workerRecord, now time.Time) [sha256.Size]byte {
+	if rec.Disabled || (rec.Status != "approved" && rec.Status != "active") || !workerFreshForClients(rec, now) {
+		return [sha256.Size]byte{}
+	}
+	payload := struct {
+		SelfDescribe    map[string]any  `json:"self_describe"`
+		EgressIP        string          `json:"egress_ip"`
+		ConfigPriority  *int            `json:"config_priority"`
+		ConfigWeight    *int            `json:"config_weight"`
+		ProtocolEnabled map[string]bool `json:"protocol_enabled"`
+	}{
+		SelfDescribe:    rec.SelfDescribe,
+		EgressIP:        rec.EgressIPObserved,
+		ConfigPriority:  rec.ConfigPriority,
+		ConfigWeight:    rec.ConfigWeight,
+		ProtocolEnabled: rec.ProtocolEnabled,
+	}
+	raw, _ := json.Marshal(payload)
+	return sha256.Sum256(raw)
 }
 
 func (s *orchStore) bumpWorkerSeqsTx(tx *bolt.Tx) error {
