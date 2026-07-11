@@ -7,6 +7,7 @@ import (
 	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/sha256"
+	"crypto/subtle"
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
@@ -631,8 +632,13 @@ func (s *server) handleNoiseContext(fn func(context.Context, []byte, []byte) (an
 			writeJSON(w, noiseEnvelopeResponse{OK: false, Error: err.Error()})
 			return
 		}
+		plain, err := decryptBytes(recvCipher, payload)
+		if err != nil {
+			writeJSON(w, noiseEnvelopeResponse{OK: false, Error: "noise decrypt failed"})
+			return
+		}
 		peer := append([]byte(nil), sess.hs.PeerStatic()...)
-		resp, err := fn(r.Context(), peer, decryptBytes(recvCipher, payload))
+		resp, err := fn(r.Context(), peer, plain)
 		if err != nil {
 			resp = map[string]any{"ok": false, "error": err.Error()}
 		}
@@ -645,12 +651,12 @@ func (s *server) handleNoiseContext(fn func(context.Context, []byte, []byte) (an
 	}
 }
 
-func decryptBytes(cipher *noise.CipherState, payload []byte) []byte {
+func decryptBytes(cipher *noise.CipherState, payload []byte) ([]byte, error) {
 	plain, err := cipher.Decrypt(nil, nil, payload)
 	if err != nil {
-		return []byte(`{"_decrypt_error":"` + err.Error() + `"}`)
+		return nil, errors.New("noise decrypt failed")
 	}
-	return plain
+	return plain, nil
 }
 
 func (s *server) handleEnroll(peer []byte, raw []byte) (any, error) {
@@ -2052,7 +2058,7 @@ func (s *server) requireAdmin(w http.ResponseWriter, r *http.Request) bool {
 		return false
 	}
 	if source == "cookie" && r.Method != http.MethodGet && r.Method != http.MethodHead {
-		if session.CSRFToken == "" || r.Header.Get("x-csrf-token") != session.CSRFToken {
+		if !csrfTokenMatches(session.CSRFToken, r.Header.Get("x-csrf-token")) {
 			http.Error(w, "csrf token required", http.StatusForbidden)
 			return false
 		}
@@ -2075,7 +2081,7 @@ func (s *server) handleAdminPasswordChange(w http.ResponseWriter, r *http.Reques
 		http.Error(w, "admin session invalid", http.StatusForbidden)
 		return
 	}
-	if source == "cookie" && (session.CSRFToken == "" || r.Header.Get("x-csrf-token") != session.CSRFToken) {
+	if source == "cookie" && !csrfTokenMatches(session.CSRFToken, r.Header.Get("x-csrf-token")) {
 		http.Error(w, "csrf token required", http.StatusForbidden)
 		return
 	}
@@ -2122,6 +2128,12 @@ func (s *server) handleAdminPasswordChange(w http.ResponseWriter, r *http.Reques
 		}
 	}
 	s.createAdminSession(w, false)
+}
+
+func csrfTokenMatches(expected, provided string) bool {
+	expectedHash := sha256.Sum256([]byte(expected))
+	providedHash := sha256.Sum256([]byte(provided))
+	return expected != "" && subtle.ConstantTimeCompare(expectedHash[:], providedHash[:]) == 1
 }
 
 func (s *server) handleAdminPasswordForceSet(w http.ResponseWriter, r *http.Request) {
