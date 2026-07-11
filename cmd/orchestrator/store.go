@@ -1032,15 +1032,23 @@ func clientVersionWouldRollback(current, next string) bool {
 }
 
 func (s *orchStore) applyDeviceUsageAndBlocks(workerID string, reports []deviceUsage, now time.Time) (int, error) {
-	byID := make(map[string]deviceUsage, len(reports))
+	byID := make(map[string][]deviceUsage, len(reports))
 	byAWG := make(map[string]deviceUsage, len(reports))
 	for _, report := range reports {
 		report.DeviceID = strings.TrimSpace(report.DeviceID)
 		report.AWGPublicKey = strings.TrimSpace(report.AWGPublicKey)
-		if report.DeviceID != "" {
-			byID[report.DeviceID] = report
+		rawSource := report.Source
+		report.Source = normalizeDeviceUsageSource(report.Source)
+		if strings.TrimSpace(rawSource) != "" && report.Source == "" {
+			continue
 		}
-		if report.AWGPublicKey != "" {
+		if report.Source != "" && report.DeviceID == "" {
+			continue
+		}
+		if report.DeviceID != "" {
+			byID[report.DeviceID] = append(byID[report.DeviceID], report)
+		}
+		if report.Source == "" && report.AWGPublicKey != "" {
 			byAWG[report.AWGPublicKey] = report
 		}
 	}
@@ -1054,8 +1062,10 @@ func (s *orchStore) applyDeviceUsageAndBlocks(workerID string, reports []deviceU
 				return err
 			}
 			changed := false
-			if report, ok := byID[rec.ID]; ok {
-				changed = applyDeviceUsageReport(&rec, workerID, report, now) || changed
+			if deviceReports := byID[rec.ID]; len(deviceReports) > 0 {
+				for _, report := range deviceReports {
+					changed = applyDeviceUsageReport(&rec, workerID, report, now) || changed
+				}
 			} else if report, ok := byAWG[strings.TrimSpace(rec.AWGPublicKey)]; ok {
 				changed = applyDeviceUsageReport(&rec, workerID, report, now) || changed
 			} else {
@@ -1069,7 +1079,7 @@ func (s *orchStore) applyDeviceUsageAndBlocks(workerID string, reports []deviceU
 			reason := ""
 			if deviceLimitsExpired(rec.Limits, now) {
 				reason = "expires_at"
-			} else if rec.Limits.TrafficQuotaBytes > 0 && rec.UsageRxBytes+rec.UsageTxBytes >= rec.Limits.TrafficQuotaBytes {
+			} else if rec.Limits.TrafficQuotaBytes > 0 && saturatingAddUint64(rec.UsageRxBytes, rec.UsageTxBytes) >= rec.Limits.TrafficQuotaBytes {
 				reason = "traffic_quota_bytes"
 			}
 			if reason != "" && rec.Status == "approved" {
@@ -1126,6 +1136,10 @@ func applyDeviceUsageReport(rec *deviceRecord, workerID string, report deviceUsa
 	prev, ok := rec.UsageCounters[stateKey]
 	if !ok {
 		rec.UsageCounters[stateKey] = next
+		if report.Source != "" {
+			rec.UsageRxBytes = saturatingAddUint64(rec.UsageRxBytes, report.RxBytes)
+			rec.UsageTxBytes = saturatingAddUint64(rec.UsageTxBytes, report.TxBytes)
+		}
 		updatedAt := now.UTC()
 		rec.UsageUpdatedAt = &updatedAt
 		return true
@@ -1153,6 +1167,17 @@ func applyDeviceUsageReport(rec *deviceRecord, workerID string, report deviceUsa
 }
 
 func deviceUsageStateKey(workerID string, report deviceUsage) string {
+	if source := normalizeDeviceUsageSource(report.Source); source != "" {
+		deviceID := strings.TrimSpace(report.DeviceID)
+		if deviceID == "" {
+			return ""
+		}
+		workerID = strings.TrimSpace(workerID)
+		if workerID == "" {
+			workerID = "unknown-worker"
+		}
+		return workerID + "\x00" + source + "\x00" + deviceID
+	}
 	key := strings.TrimSpace(report.AWGPublicKey)
 	if key == "" {
 		key = strings.TrimSpace(report.DeviceID)
@@ -1165,6 +1190,15 @@ func deviceUsageStateKey(workerID string, report deviceUsage) string {
 		workerID = "unknown-worker"
 	}
 	return workerID + "\x00" + key
+}
+
+func normalizeDeviceUsageSource(source string) string {
+	switch strings.ToLower(strings.TrimSpace(source)) {
+	case "reality":
+		return "reality"
+	default:
+		return ""
+	}
 }
 
 func usageCounterDelta(previous, current uint64) uint64 {

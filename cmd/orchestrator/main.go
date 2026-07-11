@@ -219,6 +219,7 @@ type ackResponse struct {
 type deviceUsage struct {
 	DeviceID     string `json:"device_id,omitempty"`
 	AWGPublicKey string `json:"awg_public_key,omitempty"`
+	Source       string `json:"source,omitempty"`
 	RxBytes      uint64 `json:"rx_bytes,omitempty"`
 	TxBytes      uint64 `json:"tx_bytes,omitempty"`
 }

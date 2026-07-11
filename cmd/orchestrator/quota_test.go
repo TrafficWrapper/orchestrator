@@ -154,6 +154,142 @@ func TestApplyDeviceUsageSumsPerWorkerAndHandlesCounterReset(t *testing.T) {
 	}
 }
 
+func TestApplyDeviceUsageCountsRealityAndBlocksAtQuota(t *testing.T) {
+	s := newTestServer(t)
+	addApprovedWorker(t, s)
+	putQuotaDevice(t, s, deviceRecord{
+		ID:           "device-a",
+		Status:       "approved",
+		AWGPublicKey: "awg-pub-a",
+		RealityUUID:  "uuid-a",
+		Limits:       deviceLimits{TrafficQuotaBytes: 100},
+		CreatedAt:    time.Now().UTC(),
+		ConfigSeq:    1,
+	})
+	blocked, err := s.store.applyDeviceUsageAndBlocks("worker-a", []deviceUsage{{
+		DeviceID: "device-a",
+		Source:   "reality",
+		RxBytes:  60,
+		TxBytes:  40,
+	}}, time.Now().UTC())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if blocked != 1 {
+		t.Fatalf("blocked=%d want 1", blocked)
+	}
+	rec, err := s.store.device("device-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rec.Status != "revoked" || rec.BlockedReason != "traffic_quota_bytes" || rec.UsageRxBytes != 60 || rec.UsageTxBytes != 40 {
+		t.Fatalf("bad reality quota block: %+v", rec)
+	}
+}
+
+func TestApplyDeviceUsageSumsAWGAndRealitySources(t *testing.T) {
+	s := newTestServer(t)
+	putQuotaDevice(t, s, deviceRecord{
+		ID:           "device-a",
+		Status:       "approved",
+		AWGPublicKey: "awg-pub-a",
+		RealityUUID:  "uuid-a",
+		CreatedAt:    time.Now().UTC(),
+		ConfigSeq:    1,
+	})
+	now := time.Now().UTC()
+	if _, err := s.store.applyDeviceUsageAndBlocks("worker-a", []deviceUsage{{
+		DeviceID:     "device-a",
+		AWGPublicKey: "awg-pub-a",
+	}}, now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.store.applyDeviceUsageAndBlocks("worker-a", []deviceUsage{{
+		DeviceID:     "device-a",
+		AWGPublicKey: "awg-pub-a",
+		RxBytes:      50,
+		TxBytes:      5,
+	}, {
+		DeviceID: "device-a",
+		Source:   "reality",
+		RxBytes:  30,
+		TxBytes:  15,
+	}}, now.Add(time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	rec, err := s.store.device("device-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rec.UsageRxBytes != 80 || rec.UsageTxBytes != 20 {
+		t.Fatalf("usage=(%d,%d), want (80,20)", rec.UsageRxBytes, rec.UsageTxBytes)
+	}
+}
+
+func TestApplyDeviceUsageRealityCounterResetAddsNewInterval(t *testing.T) {
+	s := newTestServer(t)
+	putQuotaDevice(t, s, deviceRecord{
+		ID:          "device-a",
+		Status:      "approved",
+		RealityUUID: "uuid-a",
+		CreatedAt:   time.Now().UTC(),
+		ConfigSeq:   1,
+	})
+	now := time.Now().UTC()
+	if _, err := s.store.applyDeviceUsageAndBlocks("worker-a", []deviceUsage{{
+		DeviceID: "device-a",
+		Source:   "reality",
+		RxBytes:  100,
+		TxBytes:  50,
+	}}, now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.store.applyDeviceUsageAndBlocks("worker-a", []deviceUsage{{
+		DeviceID: "device-a",
+		Source:   "reality",
+		RxBytes:  100,
+		TxBytes:  50,
+	}}, now.Add(30*time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.store.applyDeviceUsageAndBlocks("worker-a", []deviceUsage{{
+		DeviceID: "device-a",
+		Source:   "reality",
+		RxBytes:  25,
+		TxBytes:  10,
+	}}, now.Add(time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	rec, err := s.store.device("device-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rec.UsageRxBytes != 125 || rec.UsageTxBytes != 60 {
+		t.Fatalf("reset usage=(%d,%d), want (125,60)", rec.UsageRxBytes, rec.UsageTxBytes)
+	}
+}
+
+func TestApplyDeviceUsageQuotaTotalSaturates(t *testing.T) {
+	s := newTestServer(t)
+	addApprovedWorker(t, s)
+	putQuotaDevice(t, s, deviceRecord{
+		ID:           "device-a",
+		Status:       "approved",
+		UsageRxBytes: ^uint64(0) - 5,
+		UsageTxBytes: 10,
+		Limits:       deviceLimits{TrafficQuotaBytes: ^uint64(0)},
+		CreatedAt:    time.Now().UTC(),
+		ConfigSeq:    1,
+	})
+	blocked, err := s.store.applyDeviceUsageAndBlocks("worker-a", nil, time.Now().UTC())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if blocked != 1 {
+		t.Fatalf("blocked=%d want 1", blocked)
+	}
+}
+
 func TestApplyDeviceUsageAdoptsFirstBaselineForLegacyUsage(t *testing.T) {
 	s := newTestServer(t)
 	putQuotaDevice(t, s, deviceRecord{
