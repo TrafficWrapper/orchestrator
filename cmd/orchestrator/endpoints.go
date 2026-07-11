@@ -16,8 +16,15 @@ import (
 const (
 	discoveryBundleCacheTTL = 30 * time.Second
 	discoveryRateWindow     = time.Minute
-	discoveryRateLimit      = 60
+	discoveryRateLimit      = 1200
 	maxDiscoveryRateKeys    = 16 * 1024
+)
+
+type discoveryRateAsset uint8
+
+const (
+	discoveryRateAssetJSON discoveryRateAsset = iota
+	discoveryRateAssetMinisig
 )
 
 type discoveryBundleCache struct {
@@ -29,8 +36,9 @@ type discoveryBundleCache struct {
 }
 
 type discoveryRequestRate struct {
-	WindowStart time.Time
-	Count       int
+	WindowStart  time.Time
+	JSONCount    int
+	MinisigCount int
 }
 
 func (s *server) handleDiscoveryEndpointsJSON(w http.ResponseWriter, r *http.Request) {
@@ -38,7 +46,7 @@ func (s *server) handleDiscoveryEndpointsJSON(w http.ResponseWriter, r *http.Req
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	if !s.reserveDiscoveryRequest(r) {
+	if !s.reserveDiscoveryRequest(r, discoveryRateAssetJSON) {
 		w.Header().Set("Retry-After", "60")
 		http.Error(w, "discovery request rate exceeded", http.StatusTooManyRequests)
 		return
@@ -57,7 +65,7 @@ func (s *server) handleDiscoveryEndpointsMinisig(w http.ResponseWriter, r *http.
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	if !s.reserveDiscoveryRequest(r) {
+	if !s.reserveDiscoveryRequest(r, discoveryRateAssetMinisig) {
 		w.Header().Set("Retry-After", "60")
 		http.Error(w, "discovery request rate exceeded", http.StatusTooManyRequests)
 		return
@@ -124,11 +132,11 @@ func (s *server) invalidateDiscoveryCache() {
 	s.discoveryCacheMu.Unlock()
 }
 
-func (s *server) reserveDiscoveryRequest(r *http.Request) bool {
-	return s.reserveDiscoveryRequestForKey(rateLimitKey(clientIP(r)), time.Now().UTC())
+func (s *server) reserveDiscoveryRequest(r *http.Request, asset discoveryRateAsset) bool {
+	return s.reserveDiscoveryRequestForKey(rateLimitKey(clientIP(r)), asset, time.Now().UTC())
 }
 
-func (s *server) reserveDiscoveryRequestForKey(key string, now time.Time) bool {
+func (s *server) reserveDiscoveryRequestForKey(key string, asset discoveryRateAsset, now time.Time) bool {
 	s.discoveryRateMu.Lock()
 	defer s.discoveryRateMu.Unlock()
 	if s.discoveryRates == nil {
@@ -147,10 +155,20 @@ func (s *server) reserveDiscoveryRequestForKey(key string, now time.Time) bool {
 		}
 		rate = discoveryRequestRate{WindowStart: now}
 	}
-	if rate.Count >= discoveryRateLimit {
+	switch asset {
+	case discoveryRateAssetJSON:
+		if rate.JSONCount >= discoveryRateLimit {
+			return false
+		}
+		rate.JSONCount++
+	case discoveryRateAssetMinisig:
+		if rate.MinisigCount >= discoveryRateLimit {
+			return false
+		}
+		rate.MinisigCount++
+	default:
 		return false
 	}
-	rate.Count++
 	s.discoveryRates[key] = rate
 	return true
 }

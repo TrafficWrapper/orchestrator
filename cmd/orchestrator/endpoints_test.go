@@ -86,12 +86,15 @@ func TestDiscoveryEndpointRateLimitIsBounded(t *testing.T) {
 	now := time.Now().UTC()
 	key := rateLimitKey("198.51.100.20")
 	for i := 0; i < discoveryRateLimit; i++ {
-		if !s.reserveDiscoveryRequestForKey(key, now) {
+		if !s.reserveDiscoveryRequestForKey(key, discoveryRateAssetJSON, now) {
 			t.Fatalf("request %d rejected before limit", i)
 		}
 	}
-	if s.reserveDiscoveryRequestForKey(key, now) {
+	if s.reserveDiscoveryRequestForKey(key, discoveryRateAssetJSON, now) {
 		t.Fatal("request above discovery rate limit accepted")
+	}
+	if !s.reserveDiscoveryRequestForKey(key, discoveryRateAssetMinisig, now) {
+		t.Fatal("JSON flood incorrectly exhausted the minisig bucket")
 	}
 	req := httptest.NewRequest(http.MethodGet, "/discovery/endpoints.json", nil)
 	req.RemoteAddr = "198.51.100.20:4321"
@@ -103,7 +106,7 @@ func TestDiscoveryEndpointRateLimitIsBounded(t *testing.T) {
 
 	for i := 0; i < maxDiscoveryRateKeys+100; i++ {
 		floodKey := rateLimitKey(fmt.Sprintf("2001:db8:%x:%x::1", i/0x10000, i%0x10000))
-		if !s.reserveDiscoveryRequestForKey(floodKey, now) {
+		if !s.reserveDiscoveryRequestForKey(floodKey, discoveryRateAssetJSON, now) {
 			t.Fatalf("new discovery key rejected at cap: %s", floodKey)
 		}
 	}
@@ -112,6 +115,39 @@ func TestDiscoveryEndpointRateLimitIsBounded(t *testing.T) {
 	s.discoveryRateMu.Unlock()
 	if got != maxDiscoveryRateKeys {
 		t.Fatalf("discovery rate keys=%d want cap %d", got, maxDiscoveryRateKeys)
+	}
+}
+
+func TestDiscoveryRateLimitAllowsCGNATBootstrapPairs(t *testing.T) {
+	s := newTestServer(t)
+	now := time.Now().UTC()
+	key := rateLimitKey("198.51.100.21")
+	const clients = 1000
+	for i := 0; i < clients; i++ {
+		if !s.reserveDiscoveryRequestForKey(key, discoveryRateAssetJSON, now) {
+			t.Fatalf("CGNAT client %d JSON fetch rejected", i)
+		}
+		if !s.reserveDiscoveryRequestForKey(key, discoveryRateAssetMinisig, now) {
+			t.Fatalf("CGNAT client %d minisig fetch rejected", i)
+		}
+	}
+	for i := clients; i < discoveryRateLimit; i++ {
+		if !s.reserveDiscoveryRequestForKey(key, discoveryRateAssetJSON, now) ||
+			!s.reserveDiscoveryRequestForKey(key, discoveryRateAssetMinisig, now) {
+			t.Fatalf("bootstrap pair %d rejected before logical limit", i)
+		}
+	}
+	if s.reserveDiscoveryRequestForKey(key, discoveryRateAssetJSON, now) {
+		t.Fatal("extreme JSON flood above logical limit accepted")
+	}
+	if s.reserveDiscoveryRequestForKey(key, discoveryRateAssetMinisig, now) {
+		t.Fatal("extreme minisig flood above logical limit accepted")
+	}
+	s.discoveryRateMu.Lock()
+	got := len(s.discoveryRates)
+	s.discoveryRateMu.Unlock()
+	if got != 1 {
+		t.Fatalf("JSON+minisig pair used %d source-map entries want 1", got)
 	}
 }
 
