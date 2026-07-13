@@ -47,7 +47,7 @@ func TestDiscoveryHandlersCacheAndInvalidate(t *testing.T) {
 	if _, err := s.bumpDiscoverySeq(); err != nil {
 		t.Fatal(err)
 	}
-	bumpedJSON := discoveryJSONViaHandler(t, s)
+	bumpedJSON := discoveryPairViaHandlers(t, s, "198.51.100.30:1234")
 	if builds := s.discoveryBuilds.Load(); builds != 2 {
 		t.Fatalf("discovery generations after bump=%d want 2", builds)
 	}
@@ -64,7 +64,7 @@ func TestDiscoveryHandlersCacheAndInvalidate(t *testing.T) {
 	if err := s.store.updateWorkerSelfDescribe(workers[0].ID, self); err != nil {
 		t.Fatal(err)
 	}
-	changedJSON := discoveryJSONViaHandler(t, s)
+	changedJSON := discoveryPairViaHandlers(t, s, "198.51.100.31:1234")
 	if builds := s.discoveryBuilds.Load(); builds != 3 {
 		t.Fatalf("discovery generations after worker change=%d want 3", builds)
 	}
@@ -75,7 +75,7 @@ func TestDiscoveryHandlersCacheAndInvalidate(t *testing.T) {
 	s.discoveryCacheMu.Lock()
 	s.discoveryCache.Current.GeneratedAt = time.Now().UTC().Add(-discoveryBundleCacheTTL)
 	s.discoveryCacheMu.Unlock()
-	_ = discoveryJSONViaHandler(t, s)
+	_ = discoveryPairViaHandlers(t, s, "198.51.100.32:1234")
 	if builds := s.discoveryBuilds.Load(); builds != 4 {
 		t.Fatalf("discovery generations after TTL=%d want 4", builds)
 	}
@@ -159,16 +159,16 @@ func TestDiscoveryRateLimitAllowsCGNATBootstrapPairs(t *testing.T) {
 		if !ok || served != bundle {
 			t.Fatalf("bootstrap pair %d JSON rejected", i)
 		}
-		served, _, ok, matches := s.reserveDiscoveryMinisigForKey(key, "", now)
-		if !ok || !matches || served != bundle {
+		served, matches := s.discoveryMinisigRevisionForKey(key, "", now)
+		if !matches || served != bundle {
 			t.Fatalf("bootstrap pair %d minisig rejected", i)
 		}
 	}
 	if _, _, ok := s.reserveDiscoveryJSONForKey(key, bundle, now); ok {
 		t.Fatal("JSON above the 1200-pair limit accepted")
 	}
-	if _, _, ok, _ := s.reserveDiscoveryMinisigForKey(key, "", now); ok {
-		t.Fatal("minisig-only request above the 1200-pair limit accepted")
+	if served, matches := s.discoveryMinisigRevisionForKey(key, "", now); !matches || served != bundle {
+		t.Fatal("minisig for an accepted JSON pair was rejected at the JSON limit")
 	}
 	s.discoveryRateMu.Lock()
 	got := len(s.discoveryRates)
@@ -195,9 +195,18 @@ func TestDiscoveryHandlerRateLimitKeepsPairAtomic(t *testing.T) {
 	}
 
 	jsonRR := discoveryJSONResponse(t, s, remoteAddr)
+	for i := 0; i < 2*discoveryRateLimit; i++ {
+		foreignSigRR := discoveryMinisigResponse(t, s, remoteAddr, "")
+		if foreignSigRR.Code != http.StatusOK {
+			t.Fatalf("foreign minisig flood request %d status=%d body=%s", i, foreignSigRR.Code, foreignSigRR.Body.String())
+		}
+	}
 	sigRR := discoveryMinisigResponse(t, s, remoteAddr, jsonRR.Header().Get("ETag"))
 	if sigRR.Code != http.StatusOK {
 		t.Fatalf("minisig for accepted final pair status=%d body=%s", sigRR.Code, sigRR.Body.String())
+	}
+	if sigRR.Header().Get("ETag") != jsonRR.Header().Get("ETag") {
+		t.Fatalf("paired minisig revision=%q want JSON revision=%q", sigRR.Header().Get("ETag"), jsonRR.Header().Get("ETag"))
 	}
 
 	nextJSON := httptest.NewRecorder()
@@ -208,25 +217,40 @@ func TestDiscoveryHandlerRateLimitKeepsPairAtomic(t *testing.T) {
 		t.Fatalf("JSON beyond pair limit status=%d want 429", nextJSON.Code)
 	}
 	nextMinisig := discoveryMinisigResponse(t, s, remoteAddr, "")
-	if nextMinisig.Code != http.StatusTooManyRequests {
-		t.Fatalf("minisig-only beyond pair limit status=%d want 429", nextMinisig.Code)
+	if nextMinisig.Code != http.StatusOK {
+		t.Fatalf("minisig at the JSON pair limit status=%d want 200", nextMinisig.Code)
 	}
 	if retryAfter := nextJSON.Header().Get("Retry-After"); retryAfter != "1" && retryAfter != "2" {
 		t.Fatalf("dynamic Retry-After=%q want remaining 1-2 seconds", retryAfter)
 	}
 }
 
-func TestDiscoveryMinisigOnlyConsumesPairBudget(t *testing.T) {
+func TestDiscoveryMinisigOnlyDoesNotConsumeJSONPairBudget(t *testing.T) {
 	s := newTestServer(t)
 	now := time.Now()
 	key := discoveryRateKey("198.51.100.22")
-	for i := 0; i < discoveryRateLimit; i++ {
-		if _, _, ok, matches := s.reserveDiscoveryMinisigForKey(key, "", now); !ok || !matches {
-			t.Fatalf("minisig-only request %d rejected before limit", i)
+	for i := 0; i < 2*discoveryRateLimit; i++ {
+		if revision, matches := s.discoveryMinisigRevisionForKey(key, "", now); !matches || revision != "" {
+			t.Fatalf("minisig-only request %d unexpectedly changed state", i)
 		}
 	}
-	if _, _, ok, _ := s.reserveDiscoveryMinisigForKey(key, "", now); ok {
-		t.Fatal("minisig-only flood bypassed the pair limit")
+	if got := len(s.discoveryRates); got != 0 {
+		t.Fatalf("minisig-only flood created %d rate-map entries", got)
+	}
+	bundle := discoverySnapshotForRateTest("minisig-only")
+	for i := 0; i < discoveryRateLimit; i++ {
+		if _, _, ok := s.reserveDiscoveryJSONForKey(key, bundle, now); !ok {
+			t.Fatalf("JSON pair %d rejected after minisig-only flood", i)
+		}
+		if _, matches := s.discoveryMinisigRevisionForKey(key, "", now); !matches {
+			t.Fatalf("paired minisig %d rejected", i)
+		}
+	}
+	if _, _, ok := s.reserveDiscoveryJSONForKey(key, bundle, now); ok {
+		t.Fatal("JSON flood bypassed the 1200-pair limit")
+	}
+	if got := s.discoveryRates[key].PairCount; got != discoveryRateLimit {
+		t.Fatalf("PairCount=%d want %d JSON pairs", got, discoveryRateLimit)
 	}
 }
 
@@ -239,7 +263,7 @@ func TestDiscoveryRateLimitResetsAfterClockRollback(t *testing.T) {
 		if _, _, ok := s.reserveDiscoveryJSONForKey(key, bundle, now); !ok {
 			t.Fatalf("pair %d rejected before limit", i)
 		}
-		if _, _, ok, _ := s.reserveDiscoveryMinisigForKey(key, "", now); !ok {
+		if _, matches := s.discoveryMinisigRevisionForKey(key, "", now); !matches {
 			t.Fatalf("pair %d minisig rejected before limit", i)
 		}
 	}
@@ -258,7 +282,7 @@ func TestDiscoveryRetryAfterUsesRemainingWindow(t *testing.T) {
 		if _, _, ok := s.reserveDiscoveryJSONForKey(key, bundle, now); !ok {
 			t.Fatalf("pair %d rejected before limit", i)
 		}
-		if _, _, ok, _ := s.reserveDiscoveryMinisigForKey(key, "", now); !ok {
+		if _, matches := s.discoveryMinisigRevisionForKey(key, "", now); !matches {
 			t.Fatalf("pair %d minisig rejected before limit", i)
 		}
 	}
@@ -289,7 +313,7 @@ func TestDiscoveryIPv6RateKeyAggregatesWithin48(t *testing.T) {
 		if _, _, ok := s.reserveDiscoveryJSONForKey(key, bundle, now); !ok {
 			t.Fatalf("IPv6 pair %d rejected before limit", i)
 		}
-		if _, _, ok, _ := s.reserveDiscoveryMinisigForKey(key, "", now); !ok {
+		if _, matches := s.discoveryMinisigRevisionForKey(key, "", now); !matches {
 			t.Fatalf("IPv6 pair %d minisig rejected before limit", i)
 		}
 	}
@@ -310,7 +334,7 @@ func TestDiscoveryRateMapDoesNotEvictLiveCountersAtCapacity(t *testing.T) {
 		if _, _, ok := s.reserveDiscoveryJSONForKey(legitimateKey, bundle, now); !ok {
 			t.Fatalf("legitimate pair %d rejected", i)
 		}
-		if _, _, ok, _ := s.reserveDiscoveryMinisigForKey(legitimateKey, "", now); !ok {
+		if _, matches := s.discoveryMinisigRevisionForKey(legitimateKey, "", now); !matches {
 			t.Fatalf("legitimate pair %d minisig rejected", i)
 		}
 	}
@@ -319,7 +343,7 @@ func TestDiscoveryRateMapDoesNotEvictLiveCountersAtCapacity(t *testing.T) {
 		if _, _, ok := s.reserveDiscoveryJSONForKey(key, bundle, now); !ok {
 			t.Fatalf("fill key %d rejected before map capacity", i)
 		}
-		if _, _, ok, _ := s.reserveDiscoveryMinisigForKey(key, "", now); !ok {
+		if _, matches := s.discoveryMinisigRevisionForKey(key, "", now); !matches {
 			t.Fatalf("fill key %d minisig rejected before map capacity", i)
 		}
 	}
@@ -333,7 +357,7 @@ func TestDiscoveryRateMapDoesNotEvictLiveCountersAtCapacity(t *testing.T) {
 	if _, _, ok := s.reserveDiscoveryJSONForKey(legitimateKey, bundle, now); !ok {
 		t.Fatal("legitimate counter was evicted while filling the map")
 	}
-	if _, _, ok, _ := s.reserveDiscoveryMinisigForKey(legitimateKey, "", now); !ok {
+	if _, matches := s.discoveryMinisigRevisionForKey(legitimateKey, "", now); !matches {
 		t.Fatal("paired minisig was rejected at the exact limit")
 	}
 	if _, _, ok := s.reserveDiscoveryJSONForKey(legitimateKey, bundle, now); ok {
@@ -606,11 +630,6 @@ func writeDiscoverySigningKeyForTest(t *testing.T, s *server) minisign.PublicKey
 		t.Fatal(err)
 	}
 	return pub
-}
-
-func discoveryJSONViaHandler(t *testing.T, s *server) string {
-	t.Helper()
-	return discoveryPairViaHandlers(t, s, "198.51.100.30:1234")
 }
 
 func discoveryPairViaHandlers(t *testing.T, s *server, remoteAddr string) string {

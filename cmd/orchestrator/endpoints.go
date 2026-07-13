@@ -41,7 +41,6 @@ type discoveryBundleCache struct {
 type discoveryRequestRate struct {
 	WindowStart     time.Time
 	PairCount       int
-	PendingPairs    int
 	PendingUntil    time.Time
 	PendingRevision string
 }
@@ -83,17 +82,13 @@ func (s *server) handleDiscoveryEndpointsMinisig(w http.ResponseWriter, r *http.
 		return
 	}
 	requestedRevision := requestedDiscoveryRevision(r)
-	revision, retryAfter, ok, revisionMatches := s.reserveDiscoveryMinisigForKey(
+	revision, revisionMatches := s.discoveryMinisigRevisionForKey(
 		discoveryRateKey(clientIP(r)),
 		requestedRevision,
 		time.Now(),
 	)
 	if !revisionMatches {
 		http.Error(w, "discovery revision precondition failed", http.StatusPreconditionFailed)
-		return
-	}
-	if !ok {
-		writeDiscoveryRateExceeded(w, retryAfter)
 		return
 	}
 	var bundle *discoveryBundleSnapshot
@@ -189,7 +184,7 @@ func (s *server) rememberDiscoverySnapshotLocked(bundle *discoveryBundleSnapshot
 		}
 	}
 	s.discoveryCache.History = append([]*discoveryBundleSnapshot{bundle}, s.discoveryCache.History...)
-	// Pending pairs keep only a revision string; this bounded history supplies
+	// Pending sources keep only a revision string; this bounded history supplies
 	// the exact immutable JSON+minisig snapshot after a cache rebuild.
 	if len(s.discoveryCache.History) > discoveryBundleHistory {
 		s.discoveryCache.History = s.discoveryCache.History[:discoveryBundleHistory]
@@ -232,46 +227,39 @@ func (s *server) reserveDiscoveryJSONForKey(
 	}
 	rate.PairCount++
 	// Old clients issue two independent GETs without carrying an ETag back.
-	// Pin all outstanding pairs for this source to one immutable revision.
-	if rate.PendingPairs == 0 || rate.PendingRevision == "" {
+	// Pin this source to one immutable revision for a grace window. Minisig
+	// requests cannot consume the pin because a CGNAT key represents many
+	// independent clients.
+	if rate.PendingRevision == "" {
 		rate.PendingRevision = revision
 		rate.PendingUntil = now.Add(discoveryPairTTL)
 	}
-	rate.PendingPairs++
 	s.discoveryRates[key] = rate
 	return rate.PendingRevision, 0, true
 }
 
-func (s *server) reserveDiscoveryMinisigForKey(
+func (s *server) discoveryMinisigRevisionForKey(
 	key string,
 	requestedRevision string,
 	now time.Time,
-) (string, int, bool, bool) {
+) (string, bool) {
 	s.discoveryRateMu.Lock()
 	defer s.discoveryRateMu.Unlock()
-	rate, ok, retryAfter := s.discoveryRateForKeyLocked(key, now)
-	if !ok {
-		return "", retryAfter, false, true
+	rate, exists := s.discoveryRates[key]
+	if !exists {
+		// A minisig without a preceding JSON fetch is not a useful discovery
+		// pair. It neither consumes JSON-pair budget nor creates rate-map state.
+		return requestedRevision, true
 	}
-	if rate.PendingPairs > 0 && rate.PendingRevision != "" {
-		if requestedRevision != "" && requestedRevision != rate.PendingRevision {
-			return "", 0, true, false
-		}
-		revision := rate.PendingRevision
-		rate.PendingPairs--
-		if rate.PendingPairs == 0 {
-			rate.PendingRevision = ""
-			rate.PendingUntil = time.Time{}
-		}
-		s.discoveryRates[key] = rate
-		return revision, 0, true, true
-	}
-	if rate.PairCount >= discoveryRateLimit {
-		return "", discoveryRetryAfterSeconds(rate.WindowStart.Add(discoveryRateWindow), now), false, true
-	}
-	rate.PairCount++
+	rate = normalizeDiscoveryRequestRate(rate, now)
 	s.discoveryRates[key] = rate
-	return requestedRevision, 0, true, true
+	if rate.PendingRevision != "" && !rate.PendingUntil.IsZero() && now.Before(rate.PendingUntil) {
+		if requestedRevision != "" && requestedRevision != rate.PendingRevision {
+			return "", false
+		}
+		return rate.PendingRevision, true
+	}
+	return requestedRevision, true
 }
 
 func (s *server) discoveryRateForKeyLocked(key string, now time.Time) (discoveryRequestRate, bool, int) {
@@ -308,13 +296,12 @@ func normalizeDiscoveryRequestRate(rate discoveryRequestRate, now time.Time) dis
 	if now.Before(rate.WindowStart) {
 		rate.WindowStart = now
 		rate.PairCount = 0
-		if rate.PendingPairs > 0 && rate.PendingRevision != "" {
+		if rate.PendingRevision != "" {
 			rate.PendingUntil = now.Add(discoveryPairTTL)
 		}
 		return rate
 	}
-	if !rate.PendingUntil.IsZero() && !now.Before(rate.PendingUntil) {
-		rate.PendingPairs = 0
+	if rate.PendingRevision != "" && (rate.PendingUntil.IsZero() || !now.Before(rate.PendingUntil)) {
 		rate.PendingRevision = ""
 		rate.PendingUntil = time.Time{}
 	}
@@ -329,13 +316,13 @@ func discoveryRequestRateExpired(rate discoveryRequestRate, now time.Time) bool 
 	if rate.WindowStart.IsZero() || now.Before(rate.WindowStart) {
 		return true
 	}
-	pending := rate.PendingPairs > 0 && !rate.PendingUntil.IsZero() && now.Before(rate.PendingUntil)
+	pending := rate.PendingRevision != "" && !rate.PendingUntil.IsZero() && now.Before(rate.PendingUntil)
 	return now.Sub(rate.WindowStart) >= discoveryRateWindow && !pending
 }
 
 func discoveryRequestRateRetryAfter(rate discoveryRequestRate, now time.Time) int {
 	deadline := rate.WindowStart.Add(discoveryRateWindow)
-	if rate.PendingPairs > 0 && now.Before(rate.PendingUntil) && deadline.Before(rate.PendingUntil) {
+	if rate.PendingRevision != "" && now.Before(rate.PendingUntil) && deadline.Before(rate.PendingUntil) {
 		deadline = rate.PendingUntil
 	}
 	return discoveryRetryAfterSeconds(deadline, now)
