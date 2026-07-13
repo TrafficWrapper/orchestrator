@@ -73,7 +73,7 @@ func TestDiscoveryHandlersCacheAndInvalidate(t *testing.T) {
 	}
 
 	s.discoveryCacheMu.Lock()
-	s.discoveryCache.GeneratedAt = time.Now().UTC().Add(-discoveryBundleCacheTTL)
+	s.discoveryCache.Current.GeneratedAt = time.Now().UTC().Add(-discoveryBundleCacheTTL)
 	s.discoveryCacheMu.Unlock()
 	_ = discoveryJSONViaHandler(t, s)
 	if builds := s.discoveryBuilds.Load(); builds != 4 {
@@ -81,73 +81,283 @@ func TestDiscoveryHandlersCacheAndInvalidate(t *testing.T) {
 	}
 }
 
-func TestDiscoveryEndpointRateLimitIsBounded(t *testing.T) {
-	s := newTestServer(t)
-	now := time.Now().UTC()
-	key := rateLimitKey("198.51.100.20")
-	for i := 0; i < discoveryRateLimit; i++ {
-		if !s.reserveDiscoveryRequestForKey(key, discoveryRateAssetJSON, now) {
-			t.Fatalf("request %d rejected before limit", i)
-		}
-	}
-	if s.reserveDiscoveryRequestForKey(key, discoveryRateAssetJSON, now) {
-		t.Fatal("request above discovery rate limit accepted")
-	}
-	if !s.reserveDiscoveryRequestForKey(key, discoveryRateAssetMinisig, now) {
-		t.Fatal("JSON flood incorrectly exhausted the minisig bucket")
-	}
-	req := httptest.NewRequest(http.MethodGet, "/discovery/endpoints.json", nil)
-	req.RemoteAddr = "198.51.100.20:4321"
-	rr := httptest.NewRecorder()
-	s.handleDiscoveryEndpointsJSON(rr, req)
-	if rr.Code != http.StatusTooManyRequests {
-		t.Fatalf("rate-limited handler status=%d want 429", rr.Code)
-	}
+func TestDiscoveryPairRemainsVerifiableAcrossCacheRebuild(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		invalidate func(*testing.T, *server)
+	}{
+		{
+			name: "ttl",
+			invalidate: func(t *testing.T, s *server) {
+				t.Helper()
+				s.discoveryCacheMu.Lock()
+				s.discoveryCache.Current.GeneratedAt = time.Now().UTC().Add(-discoveryBundleCacheTTL)
+				s.discoveryCacheMu.Unlock()
+				time.Sleep(1100 * time.Millisecond)
+			},
+		},
+		{
+			name: "worker_revision",
+			invalidate: func(t *testing.T, s *server) {
+				t.Helper()
+				workers, err := s.store.workers()
+				if err != nil || len(workers) != 1 {
+					t.Fatalf("workers=%d err=%v", len(workers), err)
+				}
+				self := workers[0].SelfDescribe
+				self["egress_ip"] = "203.0.113.199"
+				if err := s.store.updateWorkerSelfDescribe(workers[0].ID, self); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			s := newTestServer(t)
+			pub := writeDiscoverySigningKeyForTest(t, s)
+			addApprovedWorker(t, s)
 
-	for i := 0; i < maxDiscoveryRateKeys+100; i++ {
-		floodKey := rateLimitKey(fmt.Sprintf("2001:db8:%x:%x::1", i/0x10000, i%0x10000))
-		if !s.reserveDiscoveryRequestForKey(floodKey, discoveryRateAssetJSON, now) {
-			t.Fatalf("new discovery key rejected at cap: %s", floodKey)
-		}
-	}
-	s.discoveryRateMu.Lock()
-	got := len(s.discoveryRates)
-	s.discoveryRateMu.Unlock()
-	if got != maxDiscoveryRateKeys {
-		t.Fatalf("discovery rate keys=%d want cap %d", got, maxDiscoveryRateKeys)
+			jsonRR := discoveryJSONResponse(t, s, "198.51.100.40:1234")
+			firstJSON := jsonRR.Body.String()
+			firstETag := jsonRR.Header().Get("ETag")
+			if firstETag == "" {
+				t.Fatal("discovery JSON did not expose an ETag revision")
+			}
+			test.invalidate(t, s)
+			changedJSON := discoveryPairViaHandlers(t, s, "198.51.100.41:1234")
+			if changedJSON == firstJSON {
+				t.Fatal("cache rebuild did not produce a new discovery revision")
+			}
+
+			sigRR := discoveryMinisigResponse(t, s, "198.51.100.40:1234", "")
+			if sigRR.Code != http.StatusOK {
+				t.Fatalf("paired minisig status=%d body=%s", sigRR.Code, sigRR.Body.String())
+			}
+			if sigRR.Header().Get("ETag") != firstETag {
+				t.Fatalf("paired ETag=%q want %q", sigRR.Header().Get("ETag"), firstETag)
+			}
+			if !minisign.Verify(pub, []byte(firstJSON), sigRR.Body.Bytes()) {
+				t.Fatal("minisig after cache rebuild did not verify the original JSON")
+			}
+
+			versionedSigRR := discoveryMinisigResponse(t, s, "198.51.100.42:1234", firstETag)
+			if versionedSigRR.Code != http.StatusOK ||
+				!minisign.Verify(pub, []byte(firstJSON), versionedSigRR.Body.Bytes()) {
+				t.Fatalf("versioned minisig status=%d body=%s", versionedSigRR.Code, versionedSigRR.Body.String())
+			}
+		})
 	}
 }
 
 func TestDiscoveryRateLimitAllowsCGNATBootstrapPairs(t *testing.T) {
 	s := newTestServer(t)
-	now := time.Now().UTC()
-	key := rateLimitKey("198.51.100.21")
-	const clients = 1000
-	for i := 0; i < clients; i++ {
-		if !s.reserveDiscoveryRequestForKey(key, discoveryRateAssetJSON, now) {
-			t.Fatalf("CGNAT client %d JSON fetch rejected", i)
+	now := time.Now()
+	key := discoveryRateKey("198.51.100.21")
+	bundle := discoverySnapshotForRateTest("cgnat")
+	for i := 0; i < discoveryRateLimit; i++ {
+		served, _, ok := s.reserveDiscoveryJSONForKey(key, bundle, now)
+		if !ok || served != bundle {
+			t.Fatalf("bootstrap pair %d JSON rejected", i)
 		}
-		if !s.reserveDiscoveryRequestForKey(key, discoveryRateAssetMinisig, now) {
-			t.Fatalf("CGNAT client %d minisig fetch rejected", i)
-		}
-	}
-	for i := clients; i < discoveryRateLimit; i++ {
-		if !s.reserveDiscoveryRequestForKey(key, discoveryRateAssetJSON, now) ||
-			!s.reserveDiscoveryRequestForKey(key, discoveryRateAssetMinisig, now) {
-			t.Fatalf("bootstrap pair %d rejected before logical limit", i)
+		served, _, ok, matches := s.reserveDiscoveryMinisigForKey(key, "", now)
+		if !ok || !matches || served != bundle {
+			t.Fatalf("bootstrap pair %d minisig rejected", i)
 		}
 	}
-	if s.reserveDiscoveryRequestForKey(key, discoveryRateAssetJSON, now) {
-		t.Fatal("extreme JSON flood above logical limit accepted")
+	if _, _, ok := s.reserveDiscoveryJSONForKey(key, bundle, now); ok {
+		t.Fatal("JSON above the 1200-pair limit accepted")
 	}
-	if s.reserveDiscoveryRequestForKey(key, discoveryRateAssetMinisig, now) {
-		t.Fatal("extreme minisig flood above logical limit accepted")
+	if _, _, ok, _ := s.reserveDiscoveryMinisigForKey(key, "", now); ok {
+		t.Fatal("minisig-only request above the 1200-pair limit accepted")
 	}
 	s.discoveryRateMu.Lock()
 	got := len(s.discoveryRates)
 	s.discoveryRateMu.Unlock()
 	if got != 1 {
-		t.Fatalf("JSON+minisig pair used %d source-map entries want 1", got)
+		t.Fatalf("JSON+minisig pairs used %d source-map entries want 1", got)
+	}
+}
+
+func TestDiscoveryHandlerRateLimitKeepsPairAtomic(t *testing.T) {
+	s := newTestServer(t)
+	writeDiscoverySigningKeyForTest(t, s)
+	addApprovedWorker(t, s)
+	if _, err := s.signedDiscoverySnapshot(); err != nil {
+		t.Fatal(err)
+	}
+	const remoteAddr = "198.51.100.43:1234"
+	key := discoveryRateKey("198.51.100.43")
+	s.discoveryRates = map[string]discoveryRequestRate{
+		key: {
+			WindowStart: time.Now().Add(-58 * time.Second),
+			PairCount:   discoveryRateLimit - 1,
+		},
+	}
+
+	jsonRR := discoveryJSONResponse(t, s, remoteAddr)
+	sigRR := discoveryMinisigResponse(t, s, remoteAddr, jsonRR.Header().Get("ETag"))
+	if sigRR.Code != http.StatusOK {
+		t.Fatalf("minisig for accepted final pair status=%d body=%s", sigRR.Code, sigRR.Body.String())
+	}
+
+	nextJSON := httptest.NewRecorder()
+	nextJSONRequest := httptest.NewRequest(http.MethodGet, "/discovery/endpoints.json", nil)
+	nextJSONRequest.RemoteAddr = remoteAddr
+	s.handleDiscoveryEndpointsJSON(nextJSON, nextJSONRequest)
+	if nextJSON.Code != http.StatusTooManyRequests {
+		t.Fatalf("JSON beyond pair limit status=%d want 429", nextJSON.Code)
+	}
+	nextMinisig := discoveryMinisigResponse(t, s, remoteAddr, "")
+	if nextMinisig.Code != http.StatusTooManyRequests {
+		t.Fatalf("minisig-only beyond pair limit status=%d want 429", nextMinisig.Code)
+	}
+	if retryAfter := nextJSON.Header().Get("Retry-After"); retryAfter != "1" && retryAfter != "2" {
+		t.Fatalf("dynamic Retry-After=%q want remaining 1-2 seconds", retryAfter)
+	}
+}
+
+func TestDiscoveryMinisigOnlyConsumesPairBudget(t *testing.T) {
+	s := newTestServer(t)
+	now := time.Now()
+	key := discoveryRateKey("198.51.100.22")
+	for i := 0; i < discoveryRateLimit; i++ {
+		if _, _, ok, matches := s.reserveDiscoveryMinisigForKey(key, "", now); !ok || !matches {
+			t.Fatalf("minisig-only request %d rejected before limit", i)
+		}
+	}
+	if _, _, ok, _ := s.reserveDiscoveryMinisigForKey(key, "", now); ok {
+		t.Fatal("minisig-only flood bypassed the pair limit")
+	}
+}
+
+func TestDiscoveryRateLimitResetsAfterClockRollback(t *testing.T) {
+	s := newTestServer(t)
+	now := time.Now()
+	key := discoveryRateKey("198.51.100.23")
+	bundle := discoverySnapshotForRateTest("clock")
+	for i := 0; i < discoveryRateLimit; i++ {
+		if _, _, ok := s.reserveDiscoveryJSONForKey(key, bundle, now); !ok {
+			t.Fatalf("pair %d rejected before limit", i)
+		}
+		if _, _, ok, _ := s.reserveDiscoveryMinisigForKey(key, "", now); !ok {
+			t.Fatalf("pair %d minisig rejected before limit", i)
+		}
+	}
+	rolledBack := now.Add(-5 * time.Minute)
+	if _, _, ok := s.reserveDiscoveryJSONForKey(key, bundle, rolledBack); !ok {
+		t.Fatal("clock rollback left the source frozen at its old limit")
+	}
+}
+
+func TestDiscoveryRetryAfterUsesRemainingWindow(t *testing.T) {
+	s := newTestServer(t)
+	now := time.Now()
+	key := discoveryRateKey("198.51.100.24")
+	bundle := discoverySnapshotForRateTest("retry")
+	for i := 0; i < discoveryRateLimit; i++ {
+		if _, _, ok := s.reserveDiscoveryJSONForKey(key, bundle, now); !ok {
+			t.Fatalf("pair %d rejected before limit", i)
+		}
+		if _, _, ok, _ := s.reserveDiscoveryMinisigForKey(key, "", now); !ok {
+			t.Fatalf("pair %d minisig rejected before limit", i)
+		}
+	}
+	_, retryAfter, ok := s.reserveDiscoveryJSONForKey(
+		key,
+		bundle,
+		now.Add(discoveryRateWindow-500*time.Millisecond),
+	)
+	if ok {
+		t.Fatal("request above limit was accepted")
+	}
+	if retryAfter != 1 {
+		t.Fatalf("Retry-After=%d want ceil 1", retryAfter)
+	}
+}
+
+func TestDiscoveryIPv6RateKeyAggregatesWithin48(t *testing.T) {
+	s := newTestServer(t)
+	now := time.Now()
+	bundle := discoverySnapshotForRateTest("ipv6")
+	firstKey := discoveryRateKey("2001:db8:1234:1::1")
+	lastKey := discoveryRateKey("2001:db8:1234:ffff::1")
+	if firstKey != lastKey || firstKey != "2001:db8:1234::/48" {
+		t.Fatalf("IPv6 discovery keys differ: first=%q last=%q", firstKey, lastKey)
+	}
+	for i := 0; i < discoveryRateLimit; i++ {
+		key := discoveryRateKey(fmt.Sprintf("2001:db8:1234:%x::1", i))
+		if _, _, ok := s.reserveDiscoveryJSONForKey(key, bundle, now); !ok {
+			t.Fatalf("IPv6 pair %d rejected before limit", i)
+		}
+		if _, _, ok, _ := s.reserveDiscoveryMinisigForKey(key, "", now); !ok {
+			t.Fatalf("IPv6 pair %d minisig rejected before limit", i)
+		}
+	}
+	if _, _, ok := s.reserveDiscoveryJSONForKey(lastKey, bundle, now); ok {
+		t.Fatal("rotating /64 addresses inside one /48 bypassed the pair limit")
+	}
+	if got := len(s.discoveryRates); got != 1 {
+		t.Fatalf("one IPv6 /48 created %d rate keys", got)
+	}
+}
+
+func TestDiscoveryRateMapDoesNotEvictLiveCountersAtCapacity(t *testing.T) {
+	s := newTestServer(t)
+	now := time.Now()
+	bundle := discoverySnapshotForRateTest("capacity")
+	legitimateKey := discoveryRateKey("198.51.100.25")
+	for i := 0; i < discoveryRateLimit-1; i++ {
+		if _, _, ok := s.reserveDiscoveryJSONForKey(legitimateKey, bundle, now); !ok {
+			t.Fatalf("legitimate pair %d rejected", i)
+		}
+		if _, _, ok, _ := s.reserveDiscoveryMinisigForKey(legitimateKey, "", now); !ok {
+			t.Fatalf("legitimate pair %d minisig rejected", i)
+		}
+	}
+	for i := 0; i < maxDiscoveryRateKeys-1; i++ {
+		key := discoveryRateKey(fmt.Sprintf("198.18.%d.%d", i/256, i%256))
+		if _, _, ok := s.reserveDiscoveryJSONForKey(key, bundle, now); !ok {
+			t.Fatalf("fill key %d rejected before map capacity", i)
+		}
+		if _, _, ok, _ := s.reserveDiscoveryMinisigForKey(key, "", now); !ok {
+			t.Fatalf("fill key %d minisig rejected before map capacity", i)
+		}
+	}
+	if got := len(s.discoveryRates); got != maxDiscoveryRateKeys {
+		t.Fatalf("discovery rate keys=%d want cap %d", got, maxDiscoveryRateKeys)
+	}
+	newKey := discoveryRateKey("203.0.113.250")
+	if _, _, ok := s.reserveDiscoveryJSONForKey(newKey, bundle, now); ok {
+		t.Fatal("new key displaced a live rate entry at capacity")
+	}
+	if _, _, ok := s.reserveDiscoveryJSONForKey(legitimateKey, bundle, now); !ok {
+		t.Fatal("legitimate counter was evicted while filling the map")
+	}
+	if _, _, ok, _ := s.reserveDiscoveryMinisigForKey(legitimateKey, "", now); !ok {
+		t.Fatal("paired minisig was rejected at the exact limit")
+	}
+	if _, _, ok := s.reserveDiscoveryJSONForKey(legitimateKey, bundle, now); ok {
+		t.Fatal("legitimate source counter was reset by map pressure")
+	}
+}
+
+func TestDiscoveryRateMapPrunesExpiredEntriesAtCapacity(t *testing.T) {
+	s := newTestServer(t)
+	now := time.Now()
+	s.discoveryRates = make(map[string]discoveryRequestRate, maxDiscoveryRateKeys)
+	for i := 0; i < maxDiscoveryRateKeys; i++ {
+		key := discoveryRateKey(fmt.Sprintf("198.19.%d.%d", i/256, i%256))
+		s.discoveryRates[key] = discoveryRequestRate{
+			WindowStart: now.Add(-2 * discoveryRateWindow),
+			PairCount:   discoveryRateLimit,
+		}
+	}
+	newKey := discoveryRateKey("203.0.113.251")
+	if _, _, ok := s.reserveDiscoveryJSONForKey(newKey, discoverySnapshotForRateTest("reused"), now); !ok {
+		t.Fatal("expired entries prevented a new source from using bounded capacity")
+	}
+	if got := len(s.discoveryRates); got != 1 {
+		t.Fatalf("expired rate entries were not pruned: got=%d want 1", got)
 	}
 }
 
@@ -400,14 +610,53 @@ func writeDiscoverySigningKeyForTest(t *testing.T, s *server) minisign.PublicKey
 
 func discoveryJSONViaHandler(t *testing.T, s *server) string {
 	t.Helper()
+	return discoveryPairViaHandlers(t, s, "198.51.100.30:1234")
+}
+
+func discoveryPairViaHandlers(t *testing.T, s *server, remoteAddr string) string {
+	t.Helper()
+	jsonRR := discoveryJSONResponse(t, s, remoteAddr)
+	sigRR := discoveryMinisigResponse(t, s, remoteAddr, jsonRR.Header().Get("ETag"))
+	if sigRR.Code != http.StatusOK {
+		t.Fatalf("discovery minisig status=%d body=%s", sigRR.Code, sigRR.Body.String())
+	}
+	if sigRR.Header().Get("ETag") != jsonRR.Header().Get("ETag") {
+		t.Fatalf("discovery pair ETag mismatch: json=%q minisig=%q", jsonRR.Header().Get("ETag"), sigRR.Header().Get("ETag"))
+	}
+	return jsonRR.Body.String()
+}
+
+func discoveryJSONResponse(t *testing.T, s *server, remoteAddr string) *httptest.ResponseRecorder {
+	t.Helper()
 	req := httptest.NewRequest(http.MethodGet, "/discovery/endpoints.json", nil)
-	req.RemoteAddr = "198.51.100.30:1234"
+	req.RemoteAddr = remoteAddr
 	rr := httptest.NewRecorder()
 	s.handleDiscoveryEndpointsJSON(rr, req)
 	if rr.Code != http.StatusOK {
 		t.Fatalf("discovery status=%d body=%s", rr.Code, rr.Body.String())
 	}
-	return rr.Body.String()
+	return rr
+}
+
+func discoveryMinisigResponse(
+	t *testing.T,
+	s *server,
+	remoteAddr string,
+	etag string,
+) *httptest.ResponseRecorder {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodGet, "/discovery/endpoints.json.minisig", nil)
+	req.RemoteAddr = remoteAddr
+	if etag != "" {
+		req.Header.Set("If-Match", etag)
+	}
+	rr := httptest.NewRecorder()
+	s.handleDiscoveryEndpointsMinisig(rr, req)
+	return rr
+}
+
+func discoverySnapshotForRateTest(revision string) string {
+	return revision
 }
 
 func discoverySeqFromText(t *testing.T, jsonText string) int64 {

@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"net/http"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -15,30 +16,34 @@ import (
 
 const (
 	discoveryBundleCacheTTL = 30 * time.Second
+	discoveryBundleHistory  = 8
+	discoveryPairTTL        = 2 * discoveryBundleCacheTTL
 	discoveryRateWindow     = time.Minute
 	discoveryRateLimit      = 1200
 	maxDiscoveryRateKeys    = 16 * 1024
 )
 
-type discoveryRateAsset uint8
-
-const (
-	discoveryRateAssetJSON discoveryRateAsset = iota
-	discoveryRateAssetMinisig
-)
-
-type discoveryBundleCache struct {
+type discoveryBundleSnapshot struct {
 	JSON           string
 	Minisig        string
 	PublicKey      string
+	Revision       string
 	GeneratedAt    time.Time
 	WorkerRevision uint64
 }
 
+type discoveryBundleCache struct {
+	Current     *discoveryBundleSnapshot
+	History     []*discoveryBundleSnapshot
+	Invalidated bool
+}
+
 type discoveryRequestRate struct {
-	WindowStart  time.Time
-	JSONCount    int
-	MinisigCount int
+	WindowStart     time.Time
+	PairCount       int
+	PendingPairs    int
+	PendingUntil    time.Time
+	PendingRevision string
 }
 
 func (s *server) handleDiscoveryEndpointsJSON(w http.ResponseWriter, r *http.Request) {
@@ -46,18 +51,30 @@ func (s *server) handleDiscoveryEndpointsJSON(w http.ResponseWriter, r *http.Req
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	if !s.reserveDiscoveryRequest(r, discoveryRateAssetJSON) {
-		w.Header().Set("Retry-After", "60")
-		http.Error(w, "discovery request rate exceeded", http.StatusTooManyRequests)
-		return
-	}
-	jsonText, _, _, err := s.signedDiscoveryBundle()
+	bundle, err := s.signedDiscoverySnapshot()
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusServiceUnavailable)
 		return
 	}
+	revision, retryAfter, ok := s.reserveDiscoveryJSONForKey(
+		discoveryRateKey(clientIP(r)),
+		bundle.Revision,
+		time.Now(),
+	)
+	if !ok {
+		writeDiscoveryRateExceeded(w, retryAfter)
+		return
+	}
+	if revision != bundle.Revision {
+		bundle = s.cachedDiscoverySnapshot(revision)
+		if bundle == nil {
+			http.Error(w, "discovery revision unavailable", http.StatusServiceUnavailable)
+			return
+		}
+	}
+	setDiscoveryBundleHeaders(w, bundle)
 	w.Header().Set("Content-Type", "application/json")
-	_, _ = w.Write([]byte(jsonText))
+	_, _ = w.Write([]byte(bundle.JSON))
 }
 
 func (s *server) handleDiscoveryEndpointsMinisig(w http.ResponseWriter, r *http.Request) {
@@ -65,18 +82,39 @@ func (s *server) handleDiscoveryEndpointsMinisig(w http.ResponseWriter, r *http.
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	if !s.reserveDiscoveryRequest(r, discoveryRateAssetMinisig) {
-		w.Header().Set("Retry-After", "60")
-		http.Error(w, "discovery request rate exceeded", http.StatusTooManyRequests)
+	requestedRevision := requestedDiscoveryRevision(r)
+	revision, retryAfter, ok, revisionMatches := s.reserveDiscoveryMinisigForKey(
+		discoveryRateKey(clientIP(r)),
+		requestedRevision,
+		time.Now(),
+	)
+	if !revisionMatches {
+		http.Error(w, "discovery revision precondition failed", http.StatusPreconditionFailed)
 		return
 	}
-	_, minisigText, _, err := s.signedDiscoveryBundle()
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusServiceUnavailable)
+	if !ok {
+		writeDiscoveryRateExceeded(w, retryAfter)
 		return
 	}
+	var bundle *discoveryBundleSnapshot
+	if revision != "" {
+		bundle = s.cachedDiscoverySnapshot(revision)
+		if bundle == nil {
+			http.Error(w, "discovery revision unavailable", http.StatusPreconditionFailed)
+			return
+		}
+	}
+	if bundle == nil {
+		var err error
+		bundle, err = s.signedDiscoverySnapshot()
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusServiceUnavailable)
+			return
+		}
+	}
+	setDiscoveryBundleHeaders(w, bundle)
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-	_, _ = w.Write([]byte(minisigText))
+	_, _ = w.Write([]byte(bundle.Minisig))
 }
 
 func (s *server) handleAdminDiscoveryBump(w http.ResponseWriter, r *http.Request) {
@@ -95,82 +133,271 @@ func (s *server) handleAdminDiscoveryBump(w http.ResponseWriter, r *http.Request
 	writeJSON(w, map[string]any{"ok": true, "seq": seq})
 }
 
-func (s *server) signedDiscoveryBundle() (string, string, string, error) {
+func (s *server) signedDiscoverySnapshot() (*discoveryBundleSnapshot, error) {
 	now := time.Now().UTC()
 	revision := s.store.discoveryRevision()
 	s.discoveryCacheMu.Lock()
 	defer s.discoveryCacheMu.Unlock()
-	age := now.Sub(s.discoveryCache.GeneratedAt)
-	if s.discoveryCache.JSON != "" &&
-		s.discoveryCache.WorkerRevision == revision &&
+	current := s.discoveryCache.Current
+	age := time.Duration(-1)
+	if current != nil {
+		age = now.Sub(current.GeneratedAt)
+	}
+	if current != nil && !s.discoveryCache.Invalidated &&
+		current.WorkerRevision == revision &&
 		age >= 0 && age < discoveryBundleCacheTTL {
-		return s.discoveryCache.JSON, s.discoveryCache.Minisig, s.discoveryCache.PublicKey, nil
+		return current, nil
 	}
 	priv, pubText, err := s.loadServerUpdateSigningKey()
 	if err != nil {
-		return "", "", "", err
+		return nil, err
 	}
 	jsonText, err := s.discoveryBundleJSON(now)
 	if err != nil {
-		return "", "", "", err
+		return nil, err
 	}
-	minisigText := string(minisign.Sign(priv, []byte(jsonText)))
-	s.discoveryCache = discoveryBundleCache{
+	next := &discoveryBundleSnapshot{
 		JSON:           jsonText,
-		Minisig:        minisigText,
+		Minisig:        string(minisign.Sign(priv, []byte(jsonText))),
 		PublicKey:      pubText,
+		Revision:       discoveryHash(jsonText),
 		GeneratedAt:    now,
 		WorkerRevision: revision,
 	}
+	s.rememberDiscoverySnapshotLocked(current)
+	s.discoveryCache.Current = next
+	s.discoveryCache.Invalidated = false
 	s.discoveryBuilds.Add(1)
-	return jsonText, minisigText, pubText, nil
+	return next, nil
+}
+
+func (s *server) signedDiscoveryBundle() (string, string, string, error) {
+	bundle, err := s.signedDiscoverySnapshot()
+	if err != nil {
+		return "", "", "", err
+	}
+	return bundle.JSON, bundle.Minisig, bundle.PublicKey, nil
+}
+
+func (s *server) rememberDiscoverySnapshotLocked(bundle *discoveryBundleSnapshot) {
+	if bundle == nil {
+		return
+	}
+	for _, previous := range s.discoveryCache.History {
+		if previous.Revision == bundle.Revision {
+			return
+		}
+	}
+	s.discoveryCache.History = append([]*discoveryBundleSnapshot{bundle}, s.discoveryCache.History...)
+	// Pending pairs keep only a revision string; this bounded history supplies
+	// the exact immutable JSON+minisig snapshot after a cache rebuild.
+	if len(s.discoveryCache.History) > discoveryBundleHistory {
+		s.discoveryCache.History = s.discoveryCache.History[:discoveryBundleHistory]
+	}
+}
+
+func (s *server) cachedDiscoverySnapshot(revision string) *discoveryBundleSnapshot {
+	s.discoveryCacheMu.Lock()
+	defer s.discoveryCacheMu.Unlock()
+	if current := s.discoveryCache.Current; current != nil && current.Revision == revision {
+		return current
+	}
+	for _, previous := range s.discoveryCache.History {
+		if previous.Revision == revision {
+			return previous
+		}
+	}
+	return nil
 }
 
 func (s *server) invalidateDiscoveryCache() {
 	s.discoveryCacheMu.Lock()
-	s.discoveryCache = discoveryBundleCache{}
+	s.discoveryCache.Invalidated = true
 	s.discoveryCacheMu.Unlock()
 }
 
-func (s *server) reserveDiscoveryRequest(r *http.Request, asset discoveryRateAsset) bool {
-	return s.reserveDiscoveryRequestForKey(rateLimitKey(clientIP(r)), asset, time.Now().UTC())
-}
-
-func (s *server) reserveDiscoveryRequestForKey(key string, asset discoveryRateAsset, now time.Time) bool {
+func (s *server) reserveDiscoveryJSONForKey(
+	key string,
+	revision string,
+	now time.Time,
+) (string, int, bool) {
 	s.discoveryRateMu.Lock()
 	defer s.discoveryRateMu.Unlock()
+	rate, ok, retryAfter := s.discoveryRateForKeyLocked(key, now)
+	if !ok {
+		return "", retryAfter, false
+	}
+	if rate.PairCount >= discoveryRateLimit {
+		return "", discoveryRetryAfterSeconds(rate.WindowStart.Add(discoveryRateWindow), now), false
+	}
+	rate.PairCount++
+	// Old clients issue two independent GETs without carrying an ETag back.
+	// Pin all outstanding pairs for this source to one immutable revision.
+	if rate.PendingPairs == 0 || rate.PendingRevision == "" {
+		rate.PendingRevision = revision
+		rate.PendingUntil = now.Add(discoveryPairTTL)
+	}
+	rate.PendingPairs++
+	s.discoveryRates[key] = rate
+	return rate.PendingRevision, 0, true
+}
+
+func (s *server) reserveDiscoveryMinisigForKey(
+	key string,
+	requestedRevision string,
+	now time.Time,
+) (string, int, bool, bool) {
+	s.discoveryRateMu.Lock()
+	defer s.discoveryRateMu.Unlock()
+	rate, ok, retryAfter := s.discoveryRateForKeyLocked(key, now)
+	if !ok {
+		return "", retryAfter, false, true
+	}
+	if rate.PendingPairs > 0 && rate.PendingRevision != "" {
+		if requestedRevision != "" && requestedRevision != rate.PendingRevision {
+			return "", 0, true, false
+		}
+		revision := rate.PendingRevision
+		rate.PendingPairs--
+		if rate.PendingPairs == 0 {
+			rate.PendingRevision = ""
+			rate.PendingUntil = time.Time{}
+		}
+		s.discoveryRates[key] = rate
+		return revision, 0, true, true
+	}
+	if rate.PairCount >= discoveryRateLimit {
+		return "", discoveryRetryAfterSeconds(rate.WindowStart.Add(discoveryRateWindow), now), false, true
+	}
+	rate.PairCount++
+	s.discoveryRates[key] = rate
+	return requestedRevision, 0, true, true
+}
+
+func (s *server) discoveryRateForKeyLocked(key string, now time.Time) (discoveryRequestRate, bool, int) {
 	if s.discoveryRates == nil {
 		s.discoveryRates = make(map[string]discoveryRequestRate)
 	}
-	rate, exists := s.discoveryRates[key]
-	if exists && now.Sub(rate.WindowStart) >= discoveryRateWindow {
-		rate = discoveryRequestRate{WindowStart: now}
+	if rate, exists := s.discoveryRates[key]; exists {
+		rate = normalizeDiscoveryRequestRate(rate, now)
+		return rate, true, 0
 	}
-	if !exists {
-		if len(s.discoveryRates) >= maxDiscoveryRateKeys {
-			for staleKey := range s.discoveryRates {
-				delete(s.discoveryRates, staleKey)
-				break
+	if len(s.discoveryRates) >= maxDiscoveryRateKeys {
+		retryAfter := int(discoveryRateWindow / time.Second)
+		for existingKey, rate := range s.discoveryRates {
+			if discoveryRequestRateExpired(rate, now) {
+				delete(s.discoveryRates, existingKey)
+				continue
+			}
+			candidate := discoveryRequestRateRetryAfter(rate, now)
+			if candidate < retryAfter {
+				retryAfter = candidate
 			}
 		}
-		rate = discoveryRequestRate{WindowStart: now}
-	}
-	switch asset {
-	case discoveryRateAssetJSON:
-		if rate.JSONCount >= discoveryRateLimit {
-			return false
+		if len(s.discoveryRates) >= maxDiscoveryRateKeys {
+			return discoveryRequestRate{}, false, retryAfter
 		}
-		rate.JSONCount++
-	case discoveryRateAssetMinisig:
-		if rate.MinisigCount >= discoveryRateLimit {
-			return false
-		}
-		rate.MinisigCount++
-	default:
-		return false
 	}
-	s.discoveryRates[key] = rate
-	return true
+	return discoveryRequestRate{WindowStart: now}, true, 0
+}
+
+func normalizeDiscoveryRequestRate(rate discoveryRequestRate, now time.Time) discoveryRequestRate {
+	if rate.WindowStart.IsZero() {
+		return discoveryRequestRate{WindowStart: now}
+	}
+	if now.Before(rate.WindowStart) {
+		rate.WindowStart = now
+		rate.PairCount = 0
+		if rate.PendingPairs > 0 && rate.PendingRevision != "" {
+			rate.PendingUntil = now.Add(discoveryPairTTL)
+		}
+		return rate
+	}
+	if !rate.PendingUntil.IsZero() && !now.Before(rate.PendingUntil) {
+		rate.PendingPairs = 0
+		rate.PendingRevision = ""
+		rate.PendingUntil = time.Time{}
+	}
+	if now.Sub(rate.WindowStart) >= discoveryRateWindow {
+		rate.WindowStart = now
+		rate.PairCount = 0
+	}
+	return rate
+}
+
+func discoveryRequestRateExpired(rate discoveryRequestRate, now time.Time) bool {
+	if rate.WindowStart.IsZero() || now.Before(rate.WindowStart) {
+		return true
+	}
+	pending := rate.PendingPairs > 0 && !rate.PendingUntil.IsZero() && now.Before(rate.PendingUntil)
+	return now.Sub(rate.WindowStart) >= discoveryRateWindow && !pending
+}
+
+func discoveryRequestRateRetryAfter(rate discoveryRequestRate, now time.Time) int {
+	deadline := rate.WindowStart.Add(discoveryRateWindow)
+	if rate.PendingPairs > 0 && now.Before(rate.PendingUntil) && deadline.Before(rate.PendingUntil) {
+		deadline = rate.PendingUntil
+	}
+	return discoveryRetryAfterSeconds(deadline, now)
+}
+
+func discoveryRetryAfterSeconds(deadline time.Time, now time.Time) int {
+	remaining := deadline.Sub(now)
+	if remaining <= 0 {
+		return 1
+	}
+	seconds := int(remaining / time.Second)
+	if remaining%time.Second != 0 {
+		seconds++
+	}
+	if seconds < 1 {
+		return 1
+	}
+	return seconds
+}
+
+func discoveryRateKey(value string) string {
+	value = strings.TrimSpace(value)
+	addr, err := netip.ParseAddr(value)
+	if err != nil {
+		return rateLimitKey(value)
+	}
+	if addr.Is4() || addr.Is4In6() {
+		return addr.Unmap().String()
+	}
+	// Discovery is a CGNAT-scale public endpoint; /48 aggregation prevents one
+	// routed IPv6 allocation from rotating through 65,536 independent /64 keys.
+	addr = addr.WithZone("")
+	return netip.PrefixFrom(addr, 48).Masked().String()
+}
+
+func requestedDiscoveryRevision(r *http.Request) string {
+	if revision := strings.TrimSpace(r.URL.Query().Get("revision")); revision != "" {
+		return revision
+	}
+	value := strings.TrimSpace(r.Header.Get("If-Match"))
+	if value == "" || value == "*" {
+		return ""
+	}
+	value = strings.TrimSpace(strings.TrimPrefix(value, "W/"))
+	if comma := strings.IndexByte(value, ','); comma >= 0 {
+		value = value[:comma]
+	}
+	return strings.Trim(strings.TrimSpace(value), `"`)
+}
+
+func setDiscoveryBundleHeaders(w http.ResponseWriter, bundle *discoveryBundleSnapshot) {
+	w.Header().Set("ETag", `"`+bundle.Revision+`"`)
+	w.Header().Set("X-Discovery-Revision", bundle.Revision)
+	w.Header().Set("Cache-Control", "no-store")
+}
+
+func writeDiscoveryRateExceeded(w http.ResponseWriter, retryAfter int) {
+	if retryAfter < 1 {
+		retryAfter = 1
+	}
+	w.Header().Set("Retry-After", strconv.Itoa(retryAfter))
+	http.Error(w, "discovery request rate exceeded", http.StatusTooManyRequests)
 }
 
 func (s *server) discoveryPublicKey() string {
