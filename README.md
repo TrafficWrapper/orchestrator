@@ -312,7 +312,7 @@ This project is free and developed in spare time. If it helps you, any support i
 appreciated — thank you!
 
 - **Bitcoin (BTC):** `bc1qd7q4gq2ekm3auplqhnjal4nfyav8xq0apja7et`
-- **Ethereum (ETH):** `0x03666a20d495fec59abbccc4c291786ec5c77f9f`
+- **Ethereum (ETH):** `0x03666a20D495feC59aBBccC4c291786eC5C77F9F`
 - **Solana (SOL):** `AdLMjpxAUa94yFGEmTfGNHFyREmAaZzzKhDWjJEhbGC3`
 - **TRON (TRX):** `TBtM4zLxZCEDWofPyAQB5ghTEDz1zXY69i`
 - **Toncoin (TON):** `UQD_InCvoP55lrzV9F5QoTee3-W5CwDmK6ajwaJOZk5lEIxy`
