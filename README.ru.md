@@ -308,11 +308,11 @@ unset TW_BOT_TOKEN
 Проект бесплатный и развивается на энтузиазме. Если он вам помогает — спасибо за
 любую поддержку!
 
-- **Bitcoin (BTC):** `bc1qdlqer9rtej6tpzdjzljdwltj7vxr4h6tv9eucp`
-- **Ethereum (ETH):** `0xbe945043EaB956149ca24793c01d4927E90F878d`
-- **USDT (ERC-20):** `0xbe945043EaB956149ca24793c01d4927E90F878d`
-- **TRON (TRX):** `TGo4JyQnwH9Zb4ZZ37T3oaWuboy9qE7siq`
-- **USDT (TRC-20):** `TGo4JyQnwH9Zb4ZZ37T3oaWuboy9qE7siq`
+- **Bitcoin (BTC):** `bc1qd7q4gq2ekm3auplqhnjal4nfyav8xq0apja7et`
+- **Ethereum (ETH):** `0x03666a20d495fec59abbccc4c291786ec5c77f9f`
+- **Solana (SOL):** `AdLMjpxAUa94yFGEmTfGNHFyREmAaZzzKhDWjJEhbGC3`
+- **TRON (TRX):** `TBtM4zLxZCEDWofPyAQB5ghTEDz1zXY69i`
+- **Toncoin (TON):** `UQD_InCvoP55lrzV9F5QoTee3-W5CwDmK6ajwaJOZk5lEIxy`
 
 С благодарностью за вашу поддержку! 🙏
 
