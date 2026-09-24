@@ -37,6 +37,9 @@ var (
 	metaBotSettings = []byte("bot_settings")
 	metaBotProblems = []byte("bot_problem_state")
 	metaAdminTOTP   = []byte("admin_totp")
+	// metaSealedFormat records that every sealed record uses the bound v2
+	// format; from then on legacy (unbound) ciphertexts are rejected.
+	metaSealedFormat = []byte("sealed_format")
 )
 
 type orchStore struct {
@@ -44,6 +47,10 @@ type orchStore struct {
 	aead                    cipher.AEAD
 	tokenLookupKey          []byte
 	discoveryWorkerRevision atomic.Uint64
+	// rejectLegacySealed is set once migration has bound every record, so an
+	// old unbound ciphertext (e.g. from a backup) cannot be planted under
+	// another key.
+	rejectLegacySealed atomic.Bool
 
 	// approvedCache holds decrypted approved devices for the committed DB
 	// state identified by approvedCacheTx (see approvedDevices).
@@ -2227,7 +2234,15 @@ func (s *orchStore) openJSON(bucket, key, raw []byte, v any) error {
 // records, plain JSON such as tokens or the APK release) are left untouched.
 func (s *orchStore) migrateSealedRecords() (int, error) {
 	migrated := 0
+	done := false
 	err := s.db.Update(func(tx *bolt.Tx) error {
+		// Once every record is bound, never accept (and rebind) legacy
+		// ciphertexts again: one planted from an old backup while the service
+		// was stopped would otherwise be re-sealed under the wrong key.
+		if tx.Bucket(bucketMeta).Get(metaSealedFormat) != nil {
+			done = true
+			return nil
+		}
 		for _, name := range [][]byte{bucketWorkers, bucketDevices, bucketTelemetry, bucketMeta} {
 			err := rewriteBucket(tx.Bucket(name), func(k, v []byte) ([]byte, error) {
 				if strings.HasPrefix(string(v), sealedRecordV2Prefix) {
@@ -2244,8 +2259,11 @@ func (s *orchStore) migrateSealedRecords() (int, error) {
 				return err
 			}
 		}
-		return nil
+		return tx.Bucket(bucketMeta).Put(metaSealedFormat, []byte("2"))
 	})
+	if err == nil || done {
+		s.rejectLegacySealed.Store(true)
+	}
 	return migrated, err
 }
 
@@ -2256,6 +2274,8 @@ func (s *orchStore) openSealed(bucket, key, raw []byte) ([]byte, error) {
 	if rest, ok := strings.CutPrefix(text, sealedRecordV2Prefix); ok {
 		text = rest
 		ad = sealedRecordAD(bucket, key)
+	} else if s.rejectLegacySealed.Load() {
+		return nil, errors.New("unbound legacy sealed record rejected")
 	}
 	nonceText, ciphertextText, ok := strings.Cut(text, ".")
 	if !ok {
