@@ -114,16 +114,9 @@ func (s *server) handleDiscoveryEndpointsMinisig(w http.ResponseWriter, r *http.
 }
 
 func (s *server) handleAdminDiscoveryBump(w http.ResponseWriter, r *http.Request) {
-	if !s.requireAdmin(w, r) {
-		return
-	}
-	if r.Method != http.MethodPost {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
 	seq, err := s.bumpDiscoverySeq()
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		writeStoreError(w, http.StatusInternalServerError, err)
 		return
 	}
 	writeJSON(w, map[string]any{"ok": true, "seq": seq})
@@ -211,14 +204,6 @@ func (s *server) buildDiscoverySnapshot(now time.Time, revision uint64) (*discov
 		GeneratedAt:    now,
 		WorkerRevision: revision,
 	}, nil
-}
-
-func (s *server) signedDiscoveryBundle() (string, string, string, error) {
-	bundle, err := s.signedDiscoverySnapshot()
-	if err != nil {
-		return "", "", "", err
-	}
-	return bundle.JSON, bundle.Minisig, bundle.PublicKey, nil
 }
 
 func (s *server) rememberDiscoverySnapshotLocked(bundle *discoveryBundleSnapshot) {
@@ -517,12 +502,6 @@ func discoveryConfiguredURLs(values []string) []string {
 		out = append(out, trimmed)
 	}
 	return out
-}
-
-func (s *server) discoverySeq() (int64, error) {
-	s.discoverySeqMu.Lock()
-	defer s.discoverySeqMu.Unlock()
-	return s.readDiscoverySeqLocked()
 }
 
 func (s *server) discoverySeqForHash(hash string) (int64, error) {

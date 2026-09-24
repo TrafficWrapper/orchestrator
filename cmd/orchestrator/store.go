@@ -423,24 +423,6 @@ func (s *orchStore) verifyAdminPassword(secret string) (bool, bool, error) {
 	return ok, rec.MustChange, nil
 }
 
-func (s *orchStore) adminTOTP() (adminTOTPRecord, bool, error) {
-	var rec adminTOTPRecord
-	err := s.db.View(func(tx *bolt.Tx) error {
-		raw := tx.Bucket(bucketMeta).Get(metaAdminTOTP)
-		if raw == nil {
-			return nil
-		}
-		return s.openJSON(bucketMeta, metaAdminTOTP, raw, &rec)
-	})
-	if err != nil {
-		return adminTOTPRecord{}, false, err
-	}
-	if strings.TrimSpace(rec.Secret) == "" {
-		return adminTOTPRecord{}, false, nil
-	}
-	return rec, rec.Enabled, nil
-}
-
 func (s *orchStore) startAdminTOTPEnrollment() (adminTOTPRecord, error) {
 	secret, err := generateTOTPSecret()
 	if err != nil {
@@ -556,48 +538,21 @@ func (s *orchStore) setBotSettings(token string, ownerID int64) error {
 	if ownerID <= 0 {
 		return errors.New("owner telegram id is required")
 	}
-	rec := botSettingsRecord{Token: token, OwnerID: ownerID, UpdatedAt: time.Now().UTC()}
-	sealed, err := s.sealJSON(bucketMeta, metaBotSettings, rec)
-	if err != nil {
-		return err
-	}
-	return s.db.Update(func(tx *bolt.Tx) error {
-		return tx.Bucket(bucketMeta).Put(metaBotSettings, sealed)
-	})
+	return putMeta(s, metaBotSettings, botSettingsRecord{Token: token, OwnerID: ownerID, UpdatedAt: time.Now().UTC()})
 }
 
 func (s *orchStore) botSettings() (botSettingsRecord, bool, error) {
-	var rec botSettingsRecord
-	err := s.db.View(func(tx *bolt.Tx) error {
-		raw := tx.Bucket(bucketMeta).Get(metaBotSettings)
-		if raw == nil {
-			return nil
-		}
-		return s.openJSON(bucketMeta, metaBotSettings, raw, &rec)
-	})
-	if err != nil {
+	rec, _, err := getMeta[botSettingsRecord](s, metaBotSettings)
+	if err != nil || strings.TrimSpace(rec.Token) == "" || rec.OwnerID <= 0 {
 		return botSettingsRecord{}, false, err
-	}
-	if strings.TrimSpace(rec.Token) == "" || rec.OwnerID <= 0 {
-		return botSettingsRecord{}, false, nil
 	}
 	return rec, true, nil
 }
 
 func (s *orchStore) getBotProblemState() (botProblemState, bool, error) {
-	var rec botProblemState
-	err := s.db.View(func(tx *bolt.Tx) error {
-		raw := tx.Bucket(bucketMeta).Get(metaBotProblems)
-		if raw == nil {
-			return nil
-		}
-		return s.openJSON(bucketMeta, metaBotProblems, raw, &rec)
-	})
-	if err != nil {
+	rec, _, err := getMeta[botProblemState](s, metaBotProblems)
+	if err != nil || rec.Version == 0 {
 		return botProblemState{}, false, err
-	}
-	if rec.Version == 0 {
-		return botProblemState{}, false, nil
 	}
 	return rec, true, nil
 }
@@ -605,13 +560,7 @@ func (s *orchStore) getBotProblemState() (botProblemState, bool, error) {
 func (s *orchStore) putBotProblemState(rec botProblemState) error {
 	rec.Version = 1
 	rec.UpdatedAt = rec.UpdatedAt.UTC()
-	sealed, err := s.sealJSON(bucketMeta, metaBotProblems, rec)
-	if err != nil {
-		return err
-	}
-	return s.db.Update(func(tx *bolt.Tx) error {
-		return tx.Bucket(bucketMeta).Put(metaBotProblems, sealed)
-	})
+	return putMeta(s, metaBotProblems, rec)
 }
 
 func (s *orchStore) botPendingWorkerNotified(workerID string) (bool, error) {
@@ -952,7 +901,7 @@ func (s *orchStore) ensureDeviceAWGProfiles(id string, profiles []awgProfile, aw
 	if err := s.db.View(func(tx *bolt.Tx) error {
 		raw := tx.Bucket(bucketDevices).Get([]byte(id))
 		if raw == nil {
-			return errors.New("device not found")
+			return errDeviceNotFound
 		}
 		var rec deviceRecord
 		if err := s.openJSON(bucketDevices, []byte(id), raw, &rec); err != nil {
@@ -983,7 +932,7 @@ func (s *orchStore) ensureDeviceAWGProfiles(id string, profiles []awgProfile, aw
 		b := tx.Bucket(bucketDevices)
 		raw := b.Get([]byte(id))
 		if raw == nil {
-			return errors.New("device not found")
+			return errDeviceNotFound
 		}
 		var rec deviceRecord
 		if err := s.openJSON(bucketDevices, []byte(id), raw, &rec); err != nil {
@@ -1091,75 +1040,26 @@ func baseAWGSubnet(profiles []awgProfile) string {
 
 func (s *orchStore) devices() ([]deviceRecord, error) {
 	var out []deviceRecord
-	err := s.db.View(func(tx *bolt.Tx) error {
-		return tx.Bucket(bucketDevices).ForEach(func(k, raw []byte) error {
-			var rec deviceRecord
-			if err := s.openJSON(bucketDevices, k, raw, &rec); err != nil {
-				return err
-			}
-			out = append(out, rec)
-			return nil
-		})
-	})
+	err := listSealed(s, bucketDevices, func(_ string, rec deviceRecord) { out = append(out, rec) })
 	return out, err
 }
 
 func (s *orchStore) device(id string) (deviceRecord, error) {
-	var rec deviceRecord
-	err := s.db.View(func(tx *bolt.Tx) error {
-		raw := tx.Bucket(bucketDevices).Get([]byte(strings.TrimSpace(id)))
-		if raw == nil {
-			return errors.New("device not found")
-		}
-		return s.openJSON(bucketDevices, []byte(strings.TrimSpace(id)), raw, &rec)
-	})
-	return rec, err
+	return getSealed[deviceRecord](s, bucketDevices, strings.TrimSpace(id), errDeviceNotFound)
 }
 
 func (s *orchStore) setDeviceLimits(id string, limits deviceLimits) error {
-	id = strings.TrimSpace(id)
-	if id == "" {
+	if strings.TrimSpace(id) == "" {
 		return errors.New("device id is required")
 	}
-	return s.db.Update(func(tx *bolt.Tx) error {
-		b := tx.Bucket(bucketDevices)
-		raw := b.Get([]byte(id))
-		if raw == nil {
-			return errors.New("device not found")
-		}
-		var rec deviceRecord
-		if err := s.openJSON(bucketDevices, []byte(id), raw, &rec); err != nil {
-			return err
-		}
-		applyDeviceLimitsChange(&rec, limits, time.Now().UTC())
+	_, err := s.updateDevice(id, true, func(rec *deviceRecord) error {
+		applyDeviceLimitsChange(rec, limits, time.Now().UTC())
 		if rec.ConfigSeq < 1 {
 			rec.ConfigSeq = 1
 		}
-		sealed, err := s.sealJSON(bucketDevices, []byte(rec.ID), rec)
-		if err != nil {
-			return err
-		}
-		if err := b.Put([]byte(rec.ID), sealed); err != nil {
-			return err
-		}
-		return s.bumpWorkerSeqsTx(tx)
+		return nil
 	})
-}
-
-func (s *orchStore) setTelemetrySnapshot(rec telemetrySnapshotRecord) error {
-	if strings.TrimSpace(rec.DeviceID) == "" {
-		return errors.New("telemetry device_id is required")
-	}
-	if rec.ReceivedAt.IsZero() {
-		rec.ReceivedAt = time.Now().UTC()
-	}
-	sealed, err := s.sealJSON(bucketTelemetry, []byte(rec.DeviceID), rec)
-	if err != nil {
-		return err
-	}
-	return s.db.Update(func(tx *bolt.Tx) error {
-		return tx.Bucket(bucketTelemetry).Put([]byte(rec.DeviceID), sealed)
-	})
+	return err
 }
 
 // recordTelemetry stores a device's telemetry snapshot and, when it reports a
@@ -1186,7 +1086,7 @@ func (s *orchStore) recordTelemetry(rec telemetrySnapshotRecord) error {
 		b := tx.Bucket(bucketDevices)
 		raw := b.Get([]byte(rec.DeviceID))
 		if raw == nil {
-			return errors.New("device not found")
+			return errDeviceNotFound
 		}
 		var device deviceRecord
 		if err := s.openJSON(bucketDevices, []byte(rec.DeviceID), raw, &device); err != nil {
@@ -1202,46 +1102,6 @@ func (s *orchStore) recordTelemetry(rec telemetrySnapshotRecord) error {
 		}
 		return b.Put([]byte(rec.DeviceID), out)
 	})
-}
-
-func (s *orchStore) updateDeviceClientVersionFromTelemetry(id, version string) (bool, error) {
-	id = strings.TrimSpace(id)
-	version = strings.TrimSpace(version)
-	if id == "" {
-		return false, errors.New("device id is required")
-	}
-	if version == "" {
-		return false, nil
-	}
-	changed := false
-	err := s.db.Update(func(tx *bolt.Tx) error {
-		b := tx.Bucket(bucketDevices)
-		raw := b.Get([]byte(id))
-		if raw == nil {
-			return errors.New("device not found")
-		}
-		var rec deviceRecord
-		if err := s.openJSON(bucketDevices, []byte(id), raw, &rec); err != nil {
-			return err
-		}
-		if strings.TrimSpace(rec.ClientVersion) == version {
-			return nil
-		}
-		if clientVersionWouldRollback(rec.ClientVersion, version) {
-			return nil
-		}
-		rec.ClientVersion = version
-		sealed, err := s.sealJSON(bucketDevices, []byte(rec.ID), rec)
-		if err != nil {
-			return err
-		}
-		if err := b.Put([]byte(rec.ID), sealed); err != nil {
-			return err
-		}
-		changed = true
-		return nil
-	})
-	return changed, err
 }
 
 func clientVersionWouldRollback(current, next string) bool {
@@ -1470,22 +1330,6 @@ func (s *orchStore) sweepDeviceUsageTx(tx *bolt.Tx, workerID string, grouped dev
 	return blocked, nil
 }
 
-// applyReportedDeviceUsage is the ack hot path: devices are loaded by id, and
-// the full scan only runs when a report cannot be attributed that way (legacy
-// reports keyed solely by AWG public key).
-func (s *orchStore) applyReportedDeviceUsage(workerID string, reports []deviceUsage, now time.Time) (int, error) {
-	blocked := 0
-	err := s.db.Update(func(tx *bolt.Tx) error {
-		var err error
-		blocked, err = s.applyReportedDeviceUsageTx(tx, workerID, reports, now)
-		return err
-	})
-	if err != nil {
-		return 0, err
-	}
-	return blocked, nil
-}
-
 func (s *orchStore) applyReportedDeviceUsageTx(tx *bolt.Tx, workerID string, reports []deviceUsage, now time.Time) (int, error) {
 	grouped := groupDeviceUsageReports(reports)
 	if len(grouped.byID) == 0 && len(grouped.byAWG) == 0 {
@@ -1646,16 +1490,7 @@ func saturatingAddUint64(a, b uint64) uint64 {
 
 func (s *orchStore) telemetrySnapshots() (map[string]telemetrySnapshotRecord, error) {
 	out := map[string]telemetrySnapshotRecord{}
-	err := s.db.View(func(tx *bolt.Tx) error {
-		return tx.Bucket(bucketTelemetry).ForEach(func(k, raw []byte) error {
-			var rec telemetrySnapshotRecord
-			if err := s.openJSON(bucketTelemetry, k, raw, &rec); err != nil {
-				return err
-			}
-			out[string(k)] = rec
-			return nil
-		})
-	})
+	err := listSealed(s, bucketTelemetry, func(key string, rec telemetrySnapshotRecord) { out[key] = rec })
 	return out, err
 }
 
@@ -1707,65 +1542,31 @@ func (s *orchStore) approvedDevices() ([]deviceRecord, error) {
 }
 
 func (s *orchStore) revokeDevice(id string) error {
-	return s.db.Update(func(tx *bolt.Tx) error {
-		db := tx.Bucket(bucketDevices)
-		raw := db.Get([]byte(strings.TrimSpace(id)))
-		if raw == nil {
-			return errors.New("device not found")
-		}
-		var rec deviceRecord
-		if err := s.openJSON(bucketDevices, []byte(strings.TrimSpace(id)), raw, &rec); err != nil {
-			return err
-		}
+	_, err := s.updateDevice(id, true, func(rec *deviceRecord) error {
 		rec.Status = "revoked"
 		// A manual revoke overrides any automatic block so that later limit
 		// changes cannot silently restore the device.
 		rec.BlockedReason = "manual"
 		now := time.Now().UTC()
 		rec.BlockedAt = &now
-		sealed, err := s.sealJSON(bucketDevices, []byte(rec.ID), rec)
-		if err != nil {
-			return err
-		}
-		if err := db.Put([]byte(rec.ID), sealed); err != nil {
-			return err
-		}
-		return s.bumpWorkerSeqsTx(tx)
+		return nil
 	})
+	return err
 }
 
 func (s *orchStore) setDeviceAlias(id, alias string) (deviceRecord, error) {
-	id = strings.TrimSpace(id)
-	if id == "" {
+	if strings.TrimSpace(id) == "" {
 		return deviceRecord{}, errors.New("device id is required")
 	}
 	alias, err := sanitizeDeviceAlias(alias)
 	if err != nil {
 		return deviceRecord{}, err
 	}
-	var out deviceRecord
-	err = s.db.Update(func(tx *bolt.Tx) error {
-		db := tx.Bucket(bucketDevices)
-		raw := db.Get([]byte(id))
-		if raw == nil {
-			return errors.New("device not found")
-		}
-		var rec deviceRecord
-		if err := s.openJSON(bucketDevices, []byte(id), raw, &rec); err != nil {
-			return err
-		}
+	// The alias is not part of worker config: no seq bump.
+	return s.updateDevice(id, false, func(rec *deviceRecord) error {
 		rec.Alias = alias
-		sealed, err := s.sealJSON(bucketDevices, []byte(rec.ID), rec)
-		if err != nil {
-			return err
-		}
-		if err := db.Put([]byte(rec.ID), sealed); err != nil {
-			return err
-		}
-		out = rec
 		return nil
 	})
-	return out, err
 }
 
 func sanitizeDeviceAlias(value string) (string, error) {
@@ -1797,7 +1598,7 @@ func (s *orchStore) deleteDevice(id string) error {
 		db := tx.Bucket(bucketDevices)
 		raw := db.Get([]byte(id))
 		if raw == nil {
-			return errors.New("device not found")
+			return errDeviceNotFound
 		}
 		var rec deviceRecord
 		if err := s.openJSON(bucketDevices, []byte(id), raw, &rec); err != nil {
@@ -1880,7 +1681,7 @@ func (s *orchStore) updateWorkerPolicy(id string, patch workerPolicyPatch) error
 		b := tx.Bucket(bucketWorkers)
 		raw := b.Get([]byte(strings.TrimSpace(id)))
 		if raw == nil {
-			return errors.New("worker not found")
+			return errWorkerNotFound
 		}
 		var rec workerRecord
 		if err := s.openJSON(bucketWorkers, []byte(strings.TrimSpace(id)), raw, &rec); err != nil {
@@ -1989,34 +1790,13 @@ func (s *orchStore) setAPKRelease(rec apkReleaseRecord) error {
 }
 
 func (s *orchStore) worker(id string) (workerRecord, error) {
-	var rec workerRecord
-	err := s.db.View(func(tx *bolt.Tx) error {
-		raw := tx.Bucket(bucketWorkers).Get([]byte(id))
-		if raw == nil {
-			return errors.New("worker not found")
-		}
-		return s.openJSON(bucketWorkers, []byte(id), raw, &rec)
-	})
-	return rec, err
+	return getSealed[workerRecord](s, bucketWorkers, id, errWorkerNotFound)
 }
 
 func (s *orchStore) workers() ([]workerRecord, error) {
 	var out []workerRecord
-	err := s.db.View(func(tx *bolt.Tx) error {
-		return tx.Bucket(bucketWorkers).ForEach(func(k, raw []byte) error {
-			var rec workerRecord
-			if err := s.openJSON(bucketWorkers, k, raw, &rec); err != nil {
-				return err
-			}
-			out = append(out, rec)
-			return nil
-		})
-	})
+	err := listSealed(s, bucketWorkers, func(_ string, rec workerRecord) { out = append(out, rec) })
 	return out, err
-}
-
-func (s *orchStore) updateAck(id string, applied int64, observed string, self map[string]any) error {
-	return s.updateAckWithProbe(id, applied, observed, self, nil)
 }
 
 // updateAckWithProbe records an ack and, when probe is non-nil, the egress
@@ -2061,13 +1841,6 @@ func (s *orchStore) recordAck(id string, applied int64, observed string, self ma
 		s.touchDiscoveryWorkerRevision()
 	}
 	return desired, blocked, nil
-}
-
-func (s *orchStore) updateAckWithProbe(id string, applied int64, observed string, self map[string]any, probe *string) error {
-	return s.updateWorker(id, func(rec *workerRecord) error {
-		applyAck(rec, applied, observed, self, probe)
-		return nil
-	})
 }
 
 func applyAck(rec *workerRecord, applied int64, observed string, self map[string]any, probe *string) {
@@ -2144,16 +1917,6 @@ func (s *orchStore) markStaleWorkersInactive(cutoff time.Time) (int, error) {
 	return updated, err
 }
 
-func (s *orchStore) updateWorkerSelfDescribe(id string, self map[string]any) error {
-	if len(self) == 0 {
-		return nil
-	}
-	return s.updateWorker(id, func(rec *workerRecord) error {
-		rec.SelfDescribe = self
-		return nil
-	})
-}
-
 // heartbeatWriteInterval lets a nudge skip rewriting the worker record when
 // only LastAckAt would move; it is well inside workerFreshTTL.
 const heartbeatWriteInterval = 45 * time.Second
@@ -2165,7 +1928,7 @@ func (s *orchStore) updateWorkerHeartbeat(id string, haveSeq int64, self map[str
 	if err := s.db.View(func(tx *bolt.Tx) error {
 		raw := tx.Bucket(bucketWorkers).Get([]byte(id))
 		if raw == nil {
-			return errors.New("worker not found")
+			return errWorkerNotFound
 		}
 		var rec workerRecord
 		if err := s.openJSON(bucketWorkers, []byte(id), raw, &rec); err != nil {
@@ -2276,7 +2039,7 @@ func (s *orchStore) mutateWorkerTx(tx *bolt.Tx, id string, fn func(*workerRecord
 	b := tx.Bucket(bucketWorkers)
 	raw := b.Get([]byte(id))
 	if raw == nil {
-		return workerRecord{}, false, errors.New("worker not found")
+		return workerRecord{}, false, errWorkerNotFound
 	}
 	var rec workerRecord
 	if err := s.openJSON(bucketWorkers, []byte(id), raw, &rec); err != nil {
@@ -2400,10 +2163,6 @@ func (s *orchStore) bumpWorkerSeqsTx(tx *bolt.Tx) error {
 	})
 }
 
-func (s *orchStore) allocateDeviceIP(tx *bolt.Tx, cidr string) (string, error) {
-	return s.newDeviceIPIndex(tx).allocate("awg", cidr)
-}
-
 // deviceIPPoolReserved is the number of low host addresses kept for the
 // worker gateway and infrastructure.
 const deviceIPPoolReserved = 10
@@ -2500,10 +2259,6 @@ func (x *deviceIPIndex) allocate(profileName, cidr string) (string, error) {
 		return next.String() + "/32", nil
 	}
 	return "", errors.New("device IP pool exhausted")
-}
-
-func (s *orchStore) allocateDeviceIPForProfile(tx *bolt.Tx, profileName, cidr string) (string, error) {
-	return s.newDeviceIPIndex(tx).allocate(profileName, cidr)
 }
 
 func randomBase64Key() (string, error) {

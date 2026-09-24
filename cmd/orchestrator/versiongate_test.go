@@ -28,20 +28,6 @@ func TestClientVersionCode(t *testing.T) {
 	}
 }
 
-func TestMinVersionFor(t *testing.T) {
-	t.Setenv("FEATURE_MIN_VERSION_REALITY_FP_MODERN", "116")
-	if got := minVersionFor("reality-fp-modern"); got != 116 {
-		t.Fatalf("minVersionFor=%d want 116", got)
-	}
-	if got := minVersionFor("missing"); got != 0 {
-		t.Fatalf("missing minVersionFor=%d want 0", got)
-	}
-	t.Setenv("FEATURE_MIN_VERSION_BAD", "not-int")
-	if got := minVersionFor("bad"); got != 0 {
-		t.Fatalf("bad minVersionFor=%d want 0", got)
-	}
-}
-
 func TestRealityFingerprintForClientVersion(t *testing.T) {
 	t.Setenv("REALITY_FP_DEFAULT", "chrome")
 	t.Setenv("REALITY_FP_MODERN", "firefox")

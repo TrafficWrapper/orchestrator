@@ -89,6 +89,16 @@
   <script>
     let csrfToken = document.querySelector('meta[name="csrf-token"]')?.content || '';
     let apkServerSigningAvailable = false;
+    // Admin API errors are JSON {"ok":false,"error":"..."}; fall back to the
+    // raw body for anything else.
+    async function errorText(response) {
+      const body = await response.text();
+      try {
+        const parsed = JSON.parse(body);
+        if (parsed && typeof parsed.error === 'string') return parsed.error;
+      } catch (_) {}
+      return body;
+    }
     async function postJSON(path, payload, confirmText) {
       if (confirmText && !window.confirm(confirmText)) return;
       const response = await fetch(path, {
@@ -98,7 +108,7 @@
         body: JSON.stringify(payload)
       });
       if (!response.ok) {
-        alert(await response.text());
+        alert(await errorText(response));
         return;
       }
       window.location.reload();
@@ -118,7 +128,7 @@
       });
       if (!response.ok) {
         notice.className = 'notice error';
-        notice.textContent = await response.text();
+        notice.textContent = await errorText(response);
         return;
       }
       const result = await response.json();
@@ -150,7 +160,7 @@
       });
       if (!response.ok) {
         notice.className = 'notice error';
-        notice.textContent = await response.text();
+        notice.textContent = await errorText(response);
         return;
       }
       window.location.href = '/';
@@ -177,7 +187,7 @@
       });
       if (!response.ok) {
         notice.className = 'notice error';
-        notice.textContent = await response.text();
+        notice.textContent = await errorText(response);
         return;
       }
       const result = await response.json();
@@ -264,7 +274,7 @@
       });
       if (!response.ok) {
         notice.className = 'notice error';
-        notice.textContent = await response.text();
+        notice.textContent = await errorText(response);
         return;
       }
       const payload = await response.json();
@@ -285,7 +295,7 @@
         document.getElementById('bootstrap-qr').src = qr.image;
       } else {
         document.getElementById('bootstrap-qr').removeAttribute('src');
-        alert(await qrResponse.text());
+        alert(await errorText(qrResponse));
       }
       resultBox.style.display = 'block';
       notice.textContent = 'Bootstrap создан. Token показывается один раз: скопируйте Base64 или скачайте JSON.';
@@ -372,7 +382,7 @@
       });
       if (!response.ok) {
         note.className = 'bad';
-        note.textContent = await response.text();
+        note.textContent = await errorText(response);
         return;
       }
       const result = await response.json();
@@ -405,7 +415,7 @@
         headers: {'Content-Type': 'application/json', 'X-CSRF-Token': csrfToken},
         body: JSON.stringify(payload)
       });
-      if (!response.ok) { alert(await response.text()); return; }
+      if (!response.ok) { alert(await errorText(response)); return; }
       const result = await response.json();
       document.getElementById('apk-manifest-json').value = result.manifest_json;
       document.getElementById('apk-publish-note').textContent = 'Manifest seq ' + result.seq + ' сформирован. Подпишите эту строку offline и вставьте minisig.';
@@ -438,7 +448,7 @@
         headers: {'X-CSRF-Token': csrfToken},
         body: form
       });
-      if (!response.ok) { alert(await response.text()); return; }
+      if (!response.ok) { alert(await errorText(response)); return; }
       window.location.reload();
     }
     async function loadApkStatus() {
@@ -448,7 +458,7 @@
       if (!response.ok) {
         box.className = 'notice error';
         box.style.display = 'block';
-        box.textContent = await response.text();
+        box.textContent = await errorText(response);
         return;
       }
       const status = await response.json();

@@ -246,12 +246,6 @@ func (s *server) currentAuthApprover() authApprover {
 	return s.authApprover
 }
 
-func (s *server) setAuthApproverForTest(approver authApprover) {
-	s.botMu.Lock()
-	s.authApprover = approver
-	s.botMu.Unlock()
-}
-
 func (s *server) hasBotFactory() bool {
 	s.botMu.Lock()
 	defer s.botMu.Unlock()
@@ -537,7 +531,7 @@ func (b *telegramBot) statusText() string {
 	devices, _ := b.server.store.devices()
 	activeWorkers := 0
 	for _, worker := range workers {
-		if !worker.Disabled && (worker.Status == "active" || worker.Status == "approved") {
+		if workerCountsAsActive(worker) {
 			activeWorkers++
 		}
 	}
@@ -553,7 +547,7 @@ func (b *telegramBot) statusText() string {
 		len(workers),
 		approvedDevices,
 		len(devices),
-		maxWorkerDesiredSeq(workers),
+		platformConfigSeq(workers),
 	)
 }
 
@@ -811,16 +805,6 @@ func botHelpText() string {
 		"/approve — pending approvals",
 		"/limit <device_id> <quota> <rate> <expiry> — задать лимиты",
 	}, "\n")
-}
-
-func maxWorkerDesiredSeq(workers []workerRecord) int64 {
-	var out int64
-	for _, worker := range workers {
-		if worker.DesiredSeq > out {
-			out = worker.DesiredSeq
-		}
-	}
-	return out
 }
 
 func onOffText(on bool) string {
@@ -1238,12 +1222,4 @@ func (c *telegramHTTPClient) call(ctx context.Context, method string, payload an
 		return nil
 	}
 	return json.Unmarshal(body, out)
-}
-
-func parseTelegramOwnerID(value string) (int64, error) {
-	id, err := strconv.ParseInt(strings.TrimSpace(value), 10, 64)
-	if err != nil || id <= 0 {
-		return 0, errors.New("owner telegram id must be positive integer")
-	}
-	return id, nil
 }

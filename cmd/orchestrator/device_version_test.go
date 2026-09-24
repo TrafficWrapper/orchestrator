@@ -3,8 +3,6 @@ package main
 import (
 	"testing"
 	"time"
-
-	bolt "go.etcd.io/bbolt"
 )
 
 func TestResolveInstalledVersion(t *testing.T) {
@@ -95,7 +93,7 @@ func TestComputeUpdateAvailable(t *testing.T) {
 
 func TestUpdateDeviceClientVersionFromTelemetry(t *testing.T) {
 	s := newTestServer(t)
-	insertDeviceRecord(t, s.store, deviceRecord{
+	putQuotaDevice(t, s, deviceRecord{
 		ID:            "device-a",
 		Status:        "approved",
 		ClientVersion: "0.1.11",
@@ -168,22 +166,5 @@ func TestUpdateDeviceClientVersionFromTelemetry(t *testing.T) {
 	}
 	if changed {
 		t.Fatal("unparseable telemetry version should not replace known version")
-	}
-}
-
-func insertDeviceRecord(t *testing.T, st *orchStore, rec deviceRecord) {
-	t.Helper()
-	raw, err := st.sealJSON(bucketDevices, []byte(rec.ID), rec)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := st.db.Update(func(tx *bolt.Tx) error {
-		if err := tx.Bucket(bucketDevices).Put([]byte(rec.ID), raw); err != nil {
-			return err
-		}
-		_, err := tx.Bucket(bucketDevices).NextSequence()
-		return err
-	}); err != nil {
-		t.Fatal(err)
 	}
 }

@@ -18,6 +18,12 @@ bootstrap payloads, worker state или device credentials в public issues.
 - `ORCH_SIGNER_SOCKET` указывает на один и тот же path для `signer` и
   `orchestrator`
 - `ORCH_LISTEN` не занят другим process
+- лог не начинается с `invalid configuration:` (неверные boolean, числа или
+  URL в окружении останавливают старт, все ошибки перечислены там)
+
+Когда процесс запущен, `GET /healthz` показывает только, что он жив;
+`GET /readyz` возвращает 503 с `{"checks":{...}}`, если signer или база
+недоступны, — именно это ломает pull воркеров и enroll.
 
 Для local development ожидается дефолтный self-signed TLS listener:
 
