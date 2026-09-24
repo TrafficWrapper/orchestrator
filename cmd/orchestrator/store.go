@@ -987,7 +987,7 @@ func (s *orchStore) setDeviceLimits(id string, limits deviceLimits) error {
 		if err := s.openJSON(raw, &rec); err != nil {
 			return err
 		}
-		rec.Limits = limits
+		applyDeviceLimitsChange(&rec, limits, time.Now().UTC())
 		if rec.ConfigSeq < 1 {
 			rec.ConfigSeq = 1
 		}
@@ -1073,6 +1073,39 @@ func clientVersionWouldRollback(current, next string) bool {
 		return false
 	}
 	return nextCode == 0 || nextCode < currentCode
+}
+
+// applyDeviceLimitsChange sets new limits. A cleared limit set or a changed
+// traffic quota restarts usage accounting, so the quota counts from the moment
+// it is set instead of blocking immediately on lifetime usage. A device that
+// was blocked automatically (quota or expiry) is restored when the new limits
+// no longer trip; a manual revoke is never undone here.
+func applyDeviceLimitsChange(rec *deviceRecord, limits deviceLimits, now time.Time) {
+	if limits == (deviceLimits{}) || limits.TrafficQuotaBytes != rec.Limits.TrafficQuotaBytes {
+		rec.UsageRxBytes = 0
+		rec.UsageTxBytes = 0
+	}
+	rec.Limits = limits
+	if rec.Status != "revoked" || !deviceAutoBlockReason(rec.BlockedReason) {
+		return
+	}
+	if deviceLimitsExpired(rec.Limits, now) {
+		return
+	}
+	if rec.Limits.TrafficQuotaBytes > 0 && saturatingAddUint64(rec.UsageRxBytes, rec.UsageTxBytes) >= rec.Limits.TrafficQuotaBytes {
+		return
+	}
+	rec.Status = "approved"
+	rec.BlockedReason = ""
+	rec.BlockedAt = nil
+}
+
+func deviceAutoBlockReason(reason string) bool {
+	switch strings.TrimSpace(reason) {
+	case "traffic_quota_bytes", "expires_at":
+		return true
+	}
+	return false
 }
 
 func (s *orchStore) applyDeviceUsageAndBlocks(workerID string, reports []deviceUsage, now time.Time) (int, error) {
@@ -1303,6 +1336,11 @@ func (s *orchStore) revokeDevice(id string) error {
 			return err
 		}
 		rec.Status = "revoked"
+		// A manual revoke overrides any automatic block so that later limit
+		// changes cannot silently restore the device.
+		rec.BlockedReason = "manual"
+		now := time.Now().UTC()
+		rec.BlockedAt = &now
 		sealed, err := s.sealJSON(rec)
 		if err != nil {
 			return err
