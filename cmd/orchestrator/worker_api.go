@@ -144,16 +144,24 @@ func (s *server) handlePull(peer []byte, raw []byte) (any, error) {
 	return pullResponse{OK: true, Status: rec.Status, WorkerID: rec.ID, DesiredSeq: rec.DesiredSeq, WorkerBundle: wb, ClientBundle: cb, Update: update}, nil
 }
 
+const (
+	nudgeLongPollTimeout = 25 * time.Second
+	nudgeFallbackPoll    = 5 * time.Second
+)
+
 func (s *server) handleNudge(ctx context.Context, peer []byte, raw []byte) (any, error) {
 	var req nudgeRequest
 	if err := json.Unmarshal(raw, &req); err != nil {
 		return nil, err
 	}
-	deadline := time.Now().Add(25 * time.Second)
+	deadline := time.NewTimer(nudgeLongPollTimeout)
+	defer deadline.Stop()
+	expired := false
 	updatedHeartbeat := false
-	ticker := time.NewTicker(time.Second)
-	defer ticker.Stop()
 	for {
+		// Grab the change signal before reading, so a bump committed between
+		// the read and the wait still wakes us.
+		changed := s.store.workerSeqChanged()
 		rec, err := s.store.worker(req.WorkerID)
 		if err != nil {
 			return nudgeResponse{OK: false, Error: err.Error()}, nil
@@ -165,13 +173,17 @@ func (s *server) handleNudge(ctx context.Context, peer []byte, raw []byte) (any,
 			_ = s.store.updateWorkerHeartbeat(rec.ID, req.HaveSeq, req.SelfDescribe)
 			updatedHeartbeat = true
 		}
-		if rec.DesiredSeq > req.HaveSeq || time.Now().After(deadline) {
+		if rec.DesiredSeq > req.HaveSeq || expired {
 			return nudgeResponse{OK: true, DesiredSeq: rec.DesiredSeq, Heartbeat: rec.DesiredSeq <= req.HaveSeq}, nil
 		}
 		select {
 		case <-ctx.Done():
 			return nudgeResponse{OK: false, Error: ctx.Err().Error()}, nil
-		case <-ticker.C:
+		case <-deadline.C:
+			expired = true
+		case <-changed:
+		case <-time.After(nudgeFallbackPoll):
+			// Safety net for a seq change that bypassed the signal.
 		}
 	}
 }

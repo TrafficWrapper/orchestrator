@@ -1,9 +1,12 @@
 package main
 
 import (
+	"context"
+	"encoding/json"
 	"testing"
 	"time"
 
+	"github.com/TrafficWrapper/orchestrator/internal/protocol"
 	bolt "go.etcd.io/bbolt"
 )
 
@@ -79,5 +82,38 @@ func TestIdleJanitorDoesNotWrite(t *testing.T) {
 	}
 	if after := lastTxID(t, s); after != before {
 		t.Fatalf("idle janitor wrote to the DB (tx %d -> %d)", before, after)
+	}
+}
+
+func TestNudgeWakesOnSeqBump(t *testing.T) {
+	s := newTestServer(t)
+	kp, err := protocol.GenerateKeypair()
+	if err != nil {
+		t.Fatal(err)
+	}
+	peer := kp.Public
+	w := addApprovedWorkerWithStatic(t, s, protocol.KeyToBase64(peer))
+	rec, _ := s.store.worker(w.ID)
+	raw, _ := json.Marshal(nudgeRequest{WorkerID: w.ID, HaveSeq: rec.DesiredSeq})
+	done := make(chan nudgeResponse, 1)
+	go func() {
+		resp, _ := s.handleNudge(context.Background(), peer, raw)
+		done <- resp.(nudgeResponse)
+	}()
+	time.Sleep(100 * time.Millisecond)
+	start := time.Now()
+	if err := s.store.db.Update(s.store.bumpWorkerSeqsTx); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case resp := <-done:
+		if !resp.OK || resp.DesiredSeq <= rec.DesiredSeq {
+			t.Fatalf("resp=%+v", resp)
+		}
+		if waited := time.Since(start); waited > 500*time.Millisecond {
+			t.Fatalf("nudge woke after %s", waited)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("nudge did not wake on seq bump")
 	}
 }

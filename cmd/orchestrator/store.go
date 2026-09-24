@@ -55,6 +55,11 @@ type orchStore struct {
 
 	// approvedCache holds decrypted approved devices for the committed DB
 	// state identified by approvedCacheTx (see approvedDevices).
+	// seqSignal is closed (and replaced) after every commit that changes a
+	// worker's DesiredSeq, waking nudge long-polls without DB polling.
+	seqSignalMu sync.Mutex
+	seqSignal   chan struct{}
+
 	approvedCacheMu sync.Mutex
 	approvedCacheTx int
 	approvedCache   []deviceRecord
@@ -2229,9 +2234,13 @@ func (s *orchStore) mutateWorkerTx(tx *bolt.Tx, id string, fn func(*workerRecord
 	}
 	now := time.Now().UTC()
 	before := workerDiscoveryFingerprint(rec, now)
+	beforeSeq := rec.DesiredSeq
 	write, err := fn(&rec)
 	if err != nil || !write {
 		return rec, false, err
+	}
+	if rec.DesiredSeq != beforeSeq {
+		tx.OnCommit(s.signalWorkerSeqChange)
 	}
 	sealed, err := s.sealJSON(bucketWorkers, []byte(id), rec)
 	if err != nil {
@@ -2296,7 +2305,28 @@ func rewriteBucket(b *bolt.Bucket, fn func(k, v []byte) ([]byte, error)) error {
 	return nil
 }
 
+// workerSeqChanged returns a channel closed by the next commit that changes
+// any worker's DesiredSeq. Take it before reading the record you wait on.
+func (s *orchStore) workerSeqChanged() <-chan struct{} {
+	s.seqSignalMu.Lock()
+	defer s.seqSignalMu.Unlock()
+	if s.seqSignal == nil {
+		s.seqSignal = make(chan struct{})
+	}
+	return s.seqSignal
+}
+
+func (s *orchStore) signalWorkerSeqChange() {
+	s.seqSignalMu.Lock()
+	defer s.seqSignalMu.Unlock()
+	if s.seqSignal != nil {
+		close(s.seqSignal)
+	}
+	s.seqSignal = make(chan struct{})
+}
+
 func (s *orchStore) bumpWorkerSeqsTx(tx *bolt.Tx) error {
+	tx.OnCommit(s.signalWorkerSeqChange)
 	return rewriteBucket(tx.Bucket(bucketWorkers), func(k, raw []byte) ([]byte, error) {
 		var rec workerRecord
 		if err := s.openJSON(bucketWorkers, k, raw, &rec); err != nil {
