@@ -116,9 +116,11 @@ AWG остаётся fallback path, когда REALITY unhealthy.
   `short_id`. `POST /admin/v1/workers/short-id {id, short_id, revoked}`
   заполняет `desired_state.revoked_short_ids`. В списке устройств админки виден
   слот `reality_cohort`.
-- **Fallback-профили.** При `ORCH_REALITY_FALLBACK_PROFILES=1` XHTTP-профили из
-  `reality_profiles` добавляются доп. REALITY маршрутами сразу после основного
-  маршрута воркера (без flow). По умолчанию выключено: приложение заполняет
+- **Fallback-профили.** При `ORCH_REALITY_FALLBACK_PROFILES=1` остальные
+  `reality_profiles` (XHTTP или TCP на другом порту) добавляются доп. REALITY
+  маршрутами сразу после основного маршрута воркера. Flow не передаётся; у
+  каждого REALITY маршрута есть `vision` (true, если в `flows` профиля есть
+  `xtls-rprx-vision`), и приложение ставит свой `reality_flow` только туда. По умолчанию выключено: приложение заполняет
   только два REALITY слота, и fallback вытесняет REALITY второго воркера.
 - **Ротация диалекта AWG.** `POST /admin/v1/workers/awg-drain {id, profile,
   draining}` перестаёт отдавать клиентам AWG-профиль (учётные данные для всех

@@ -190,6 +190,7 @@ func (s *server) clientWorkerPayloadForClient(rec workerRecord, clientVersion st
 				}
 				route["cohort_short_ids"] = cohorts
 			}
+			route["vision"] = realityProfileSupportsVision(rec.SelfDescribe["reality"])
 			routes = append(routes, route)
 			if s.cfg.RealityFallbackProfiles {
 				routes = append(routes, realityFallbackRoutes(rec, route, expected, configURL, clientVersion)...)

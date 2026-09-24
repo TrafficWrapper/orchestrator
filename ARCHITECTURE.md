@@ -115,9 +115,11 @@ policy; AWG remains a fallback path when REALITY is unhealthy.
   when the slot is blank. `POST /admin/v1/workers/short-id
   {id, short_id, revoked}` fills `desired_state.revoked_short_ids`. The admin
   device list shows each device's `reality_cohort` slot.
-- **Fallback profiles.** With `ORCH_REALITY_FALLBACK_PROFILES=1`, XHTTP
-  entries of `reality_profiles` are added as extra REALITY routes right after a
-  worker's primary route (flow-less). Off by default: the app fills only two
+- **Fallback profiles.** With `ORCH_REALITY_FALLBACK_PROFILES=1`, the
+  other `reality_profiles` (XHTTP, or TCP on another port) are added as extra
+  REALITY routes right after a worker's primary route. No flow is sent; each
+  REALITY route carries `vision` (true when the profile's `flows` include
+  `xtls-rprx-vision`), and the app applies its `reality_flow` only there. Off by default: the app fills only two
   REALITY slots, so fallbacks displace a second worker's REALITY route.
 - **AWG dialect rotation.** `POST /admin/v1/workers/awg-drain {id, profile,
   draining}` stops offering an AWG profile to clients (devices keep
