@@ -264,6 +264,12 @@ func (s *server) handleAdminAPKPublish(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	log.Printf("published APK update seq=%d version=%s(%d) sha256=%s server_signed=%t", release.Seq, release.VersionName, release.VersionCode, release.APKSHA256, serverSigned)
+	s.auditEvent(auditEntry{Event: "apk_publish", IP: clientIP(r), Result: "ok", Fields: map[string]string{
+		"seq":           strconv.FormatInt(release.Seq, 10),
+		"version_code":  strconv.FormatInt(release.VersionCode, 10),
+		"apk_sha256":    release.APKSHA256,
+		"server_signed": strconv.FormatBool(serverSigned),
+	}})
 	writeJSON(w, map[string]any{"ok": true, "release": release})
 }
 

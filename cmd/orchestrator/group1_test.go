@@ -6,6 +6,9 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -78,5 +81,23 @@ func TestConcurrentBotRestartsLeaveOnePoller(t *testing.T) {
 	}
 	if got := active.Load(); got != 1 {
 		t.Fatalf("pollers=%d after concurrent restarts, want 1", got)
+	}
+}
+
+func TestBotActionsAreAudited(t *testing.T) {
+	s := newTestServer(t)
+	logPath := filepath.Join(t.TempDir(), "audit.log")
+	audit, err := openAuditLog(logPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.audit = audit
+	defer audit.Close()
+	worker := addApprovedWorkerWithStatic(t, s, "bot-audit-worker")
+	bot := newTelegramBot(s, botSettingsRecord{Token: "t", OwnerID: 77}, &mockTelegramAPI{})
+	bot.handleWorkerCallback(context.Background(), telegramCallbackQuery{ID: "cb", Data: "worker:disable:" + worker.ID})
+	raw, _ := os.ReadFile(logPath)
+	if !strings.Contains(string(raw), `"event":"worker_set_enabled"`) || !strings.Contains(string(raw), `"actor":"bot:77"`) {
+		t.Fatalf("bot action not audited: %s", raw)
 	}
 }

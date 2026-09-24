@@ -318,6 +318,7 @@ func (s *server) handleAdminDeviceAlias(w http.ResponseWriter, r *http.Request) 
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
+	s.auditEvent(auditEntry{Event: "device_alias", IP: clientIP(r), Result: "ok", Fields: map[string]string{"device_id": rec.ID}})
 	writeJSON(w, map[string]any{"ok": true, "device_id": rec.ID, "alias": rec.Alias})
 }
 
@@ -365,6 +366,7 @@ func (s *server) handleAdminWorkerSetEnabled(w http.ResponseWriter, r *http.Requ
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
+	s.auditEvent(auditEntry{Event: "worker_set_enabled", IP: clientIP(r), Result: "ok", Fields: map[string]string{"worker_id": req.ID, "enabled": strconv.FormatBool(*req.Enabled)}})
 	writeJSON(w, map[string]any{"ok": true})
 }
 
@@ -398,6 +400,7 @@ func (s *server) handleAdminWorkerProtocol(w http.ResponseWriter, r *http.Reques
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
+	s.auditEvent(auditEntry{Event: "worker_protocol", IP: clientIP(r), Result: "ok", Fields: map[string]string{"worker_id": req.ID, "protocol": protocol, "enabled": strconv.FormatBool(*req.Enabled)}})
 	writeJSON(w, map[string]any{"ok": true})
 }
 
@@ -510,6 +513,7 @@ func (s *server) handleAdminConfigEdit(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
+		s.auditEvent(auditEntry{Event: "worker_config_edit", IP: clientIP(r), Result: "ok", Fields: map[string]string{"worker_id": id}})
 	}
 	bundle, err := s.buildClientBundle(0)
 	if err != nil {

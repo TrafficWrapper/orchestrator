@@ -346,6 +346,7 @@ func (b *telegramBot) handleMessage(ctx context.Context, msg telegramMessage) {
 				_ = b.sendOwnerMessage(ctx, "Лимиты не применены: "+err.Error(), nil)
 				return
 			}
+			b.audit("device_limits", "ok", map[string]string{"device_id": state.DeviceID, "limits": telegramLimitsSummary(limits)})
 			_ = b.sendOwnerMessage(ctx, "Лимиты заданы: "+telegramLimitsSummary(limits), nil)
 			return
 		}
@@ -401,6 +402,7 @@ func (b *telegramBot) handleCallback(ctx context.Context, cb telegramCallbackQue
 	case strings.HasPrefix(data, botCallbackApprovePrefix):
 		nonce := strings.TrimPrefix(data, botCallbackApprovePrefix)
 		if b.approver.resolve(nonce, true) {
+			b.audit("admin_login_approval", "approved", nil)
 			_ = b.client.answerCallback(ctx, cb.ID, "Вход подтверждён")
 			return
 		}
@@ -408,6 +410,7 @@ func (b *telegramBot) handleCallback(ctx context.Context, cb telegramCallbackQue
 	case strings.HasPrefix(data, botCallbackDenyPrefix):
 		nonce := strings.TrimPrefix(data, botCallbackDenyPrefix)
 		if b.approver.resolve(nonce, false) {
+			b.audit("admin_login_approval", "denied", nil)
 			_ = b.client.answerCallback(ctx, cb.ID, "Вход отклонён")
 			return
 		}
@@ -423,6 +426,7 @@ func (b *telegramBot) handleCallback(ctx context.Context, cb telegramCallbackQue
 			_ = b.client.answerCallback(ctx, cb.ID, err.Error())
 			return
 		}
+		b.audit("worker_protocol", "ok", map[string]string{"worker_id": parts[2], "protocol": parts[3], "enabled": strconv.FormatBool(enabled)})
 		_ = b.client.answerCallback(ctx, cb.ID, "Протокол обновлён")
 	case strings.HasPrefix(data, botCallbackWorkerPrefix):
 		b.handleWorkerCallback(ctx, cb)
@@ -436,10 +440,17 @@ func (b *telegramBot) handleCallback(ctx context.Context, cb telegramCallbackQue
 			_ = b.client.answerCallback(ctx, cb.ID, err.Error())
 			return
 		}
+		b.audit("device_revoke", "ok", map[string]string{"device_id": parts[2]})
 		_ = b.client.answerCallback(ctx, cb.ID, "Устройство отозвано")
 	default:
 		_ = b.client.answerCallback(ctx, cb.ID, "Неизвестная команда")
 	}
+}
+
+// audit records an owner action taken through the bot, like the admin API
+// does for the same actions.
+func (b *telegramBot) audit(event, result string, fields map[string]string) {
+	b.server.auditEvent(auditEntry{Event: event, Actor: "bot:" + strconv.FormatInt(b.ownerID, 10), Result: result, Fields: fields})
 }
 
 func (b *telegramBot) handleWorkerCallback(ctx context.Context, cb telegramCallbackQuery) {
@@ -456,12 +467,14 @@ func (b *telegramBot) handleWorkerCallback(ctx context.Context, cb telegramCallb
 			_ = b.client.answerCallback(ctx, cb.ID, err.Error())
 			return
 		}
+		b.audit("worker_set_enabled", "ok", map[string]string{"worker_id": id, "enabled": strconv.FormatBool(enabled)})
 		_ = b.client.answerCallback(ctx, cb.ID, "Worker обновлён")
 	case "approve":
 		if err := b.server.store.approveWorker(id); err != nil {
 			_ = b.client.answerCallback(ctx, cb.ID, err.Error())
 			return
 		}
+		b.audit("worker_approve", "ok", map[string]string{"worker_id": id})
 		_ = b.client.answerCallback(ctx, cb.ID, "Worker одобрен")
 	default:
 		_ = b.client.answerCallback(ctx, cb.ID, "Неверная команда")
@@ -636,6 +649,7 @@ func (b *telegramBot) handleLimitCommand(ctx context.Context, command []string) 
 	if err := b.server.store.setDeviceLimits(deviceID, limits); err != nil {
 		return b.sendOwnerMessage(ctx, "Лимиты не применены: "+err.Error(), nil)
 	}
+	b.audit("device_limits", "ok", map[string]string{"device_id": deviceID, "limits": telegramLimitsSummary(limits)})
 	return b.sendOwnerMessage(ctx, "Лимиты заданы: "+telegramLimitsSummary(limits), nil)
 }
 
