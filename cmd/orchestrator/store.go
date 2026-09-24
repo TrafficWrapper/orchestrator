@@ -702,6 +702,12 @@ func (s *orchStore) consumeBootstrapToken(secret string, device deviceRecord, pr
 	err = s.db.Update(func(tx *bolt.Tx) error {
 		tb := tx.Bucket(bucketTokens)
 		db := tx.Bucket(bucketDevices)
+		// Re-check inside the write tx: a concurrent enroll of the same
+		// identity would otherwise overwrite the first device record (new
+		// PSK/IP) and burn both tokens. Aborting here keeps this token.
+		if db.Get([]byte(device.ID)) != nil {
+			return errors.New("device already enrolled; retry enrollment")
+		}
 		raw := tb.Get([]byte(matchedID))
 		if raw == nil {
 			return errors.New("invalid, expired, or exhausted bootstrap token")
@@ -844,6 +850,39 @@ func (s *orchStore) tokenLookup(secret string) string {
 	mac := hmac.New(sha256.New, s.tokenLookupKey)
 	mac.Write([]byte(secret))
 	return hex.EncodeToString(mac.Sum(nil))
+}
+
+// tokenRetentionAfterUse keeps spent or expired tokens briefly for audit and
+// troubleshooting before pruneDeadTokens drops them; every live token is
+// scanned on each enroll attempt, so dead ones must not pile up forever.
+const tokenRetentionAfterUse = 7 * 24 * time.Hour
+
+func (s *orchStore) pruneDeadTokens(now time.Time) (int, error) {
+	var dead [][]byte
+	err := s.db.Update(func(tx *bolt.Tx) error {
+		b := tx.Bucket(bucketTokens)
+		if err := b.ForEach(func(k, v []byte) error {
+			var rec tokenRecord
+			if err := json.Unmarshal(v, &rec); err != nil {
+				return nil
+			}
+			expiredLongAgo := now.Sub(rec.ExpiresAt) > tokenRetentionAfterUse
+			exhaustedLongAgo := rec.MaxUses > 0 && rec.Uses >= rec.MaxUses && now.Sub(rec.CreatedAt) > tokenRetentionAfterUse
+			if expiredLongAgo || exhaustedLongAgo {
+				dead = append(dead, append([]byte(nil), k...))
+			}
+			return nil
+		}); err != nil {
+			return err
+		}
+		for _, k := range dead {
+			if err := b.Delete(k); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	return len(dead), err
 }
 
 func tokenRecordConsumable(rec tokenRecord, now time.Time, workerStaticPub string) bool {
@@ -1568,6 +1607,9 @@ func (s *orchStore) deleteDevice(id string) error {
 		}
 		needsRevoke := rec.Status != "revoked"
 		if err := db.Delete([]byte(rec.ID)); err != nil {
+			return err
+		}
+		if err := tx.Bucket(bucketTelemetry).Delete([]byte(rec.ID)); err != nil {
 			return err
 		}
 		if needsRevoke {

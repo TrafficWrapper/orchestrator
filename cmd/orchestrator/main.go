@@ -2518,6 +2518,9 @@ func (s *server) runWorkerJanitor(ctx context.Context) {
 			}
 			// Expiry-based blocks need no usage report, so they are swept here
 			// instead of scanning every device on every worker ack.
+			if _, err := s.store.pruneDeadTokens(time.Now().UTC()); err != nil {
+				log.Printf("token prune failed: %v", err)
+			}
 			if blocked, err := s.store.applyDeviceUsageAndBlocks("", nil, time.Now().UTC()); err != nil {
 				log.Printf("device expiry janitor failed: %v", err)
 			} else if blocked > 0 {
