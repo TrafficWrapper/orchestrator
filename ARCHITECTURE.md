@@ -22,8 +22,12 @@ flowchart LR
   Android --> Dist
 ```
 
-- `orchestrator/cmd/orchestrator/main.go` owns the HTTP API, admin UI, worker
-  approval, device enrollment, bundle generation, and APK publication metadata.
+- `orchestrator/cmd/orchestrator/` holds the control plane, split by concern:
+  `main.go` (config, commands), `serve.go` (HTTP server and routes),
+  `noise_transport.go` (Noise handshakes and envelopes), `worker_api.go` and
+  `device_api.go` (enroll/pull/ack), `bundles.go` (signed worker/client
+  config), `telemetry.go`, `admin_auth.go` and `admin_api.go` (admin UI/API),
+  `apk_release.go` (APK publication), `store.go` (bbolt state), `cli.go`.
 - `orchestrator/cmd/orchestrator/signer.go` isolates the config-signing minisign
   key behind `ORCH_SIGNER_SOCKET`.
 - `orchestrator/internal/protocol/protocol.go` defines the Noise envelope:

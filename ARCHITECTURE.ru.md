@@ -22,9 +22,12 @@ flowchart LR
   Android --> Dist
 ```
 
-- `orchestrator/cmd/orchestrator/main.go` владеет HTTP API, admin UI,
-  approve workers, device enrollment, генерацией bundles и APK publication
-  metadata.
+- `orchestrator/cmd/orchestrator/` содержит control plane, разбитый по темам:
+  `main.go` (конфиг, команды), `serve.go` (HTTP-сервер и маршруты),
+  `noise_transport.go` (Noise handshake и envelope), `worker_api.go` и
+  `device_api.go` (enroll/pull/ack), `bundles.go` (подписанные worker/client
+  config), `telemetry.go`, `admin_auth.go` и `admin_api.go` (admin UI/API),
+  `apk_release.go` (публикация APK), `store.go` (состояние bbolt), `cli.go`.
 - `orchestrator/cmd/orchestrator/signer.go` изолирует minisign-ключ подписи
   config за `ORCH_SIGNER_SOCKET`.
 - `orchestrator/internal/protocol/protocol.go` определяет Noise envelope:
