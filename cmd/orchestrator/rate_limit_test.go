@@ -188,3 +188,40 @@ func fullLoginLimiterForTest(now time.Time) *loginLimiter {
 	limiter.lastPrune = now
 	return limiter
 }
+
+func TestPendingHandshakesCappedPerNetwork(t *testing.T) {
+	s := newTestServer(t)
+	reserve := func(ip string) bool {
+		req := httptest.NewRequest(http.MethodPost, "/w/v1/handshake/start", nil)
+		req.RemoteAddr = ip + ":40000"
+		ok, _ := s.reserveHandshakeStart(req)
+		return ok
+	}
+	for i := 0; i < maxPendingHandshakesPerKey; i++ {
+		if !reserve("198.51.100.7") {
+			t.Fatalf("pending handshake %d rejected below per-key cap", i)
+		}
+	}
+	if reserve("198.51.100.7") {
+		t.Fatal("per-key pending cap not enforced")
+	}
+	admitted := maxPendingHandshakesPerKey
+	for host := 8; admitted < maxPendingHandshakesPerPrefix; host++ {
+		for i := 0; i < maxPendingHandshakesPerKey && admitted < maxPendingHandshakesPerPrefix; i++ {
+			if !reserve(fmt.Sprintf("198.51.100.%d", host)) {
+				t.Fatalf("rejected below prefix cap at %d", admitted)
+			}
+			admitted++
+		}
+	}
+	if reserve("198.51.100.250") {
+		t.Fatal("per-/24 pending cap not enforced")
+	}
+	if !reserve("203.0.113.9") {
+		t.Fatal("a different network must still be admitted")
+	}
+	s.releasePendingHandshake("198.51.100.7")
+	if !reserve("198.51.100.7") {
+		t.Fatal("released slot must be reusable")
+	}
+}

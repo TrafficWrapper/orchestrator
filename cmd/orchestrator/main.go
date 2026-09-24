@@ -24,6 +24,7 @@ import (
 	"mime/multipart"
 	"net"
 	"net/http"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -69,6 +70,7 @@ type server struct {
 	sessionCount     atomic.Int64
 	handshakeMu      sync.Mutex
 	handshakeRates   map[string]handshakeRate
+	handshakePending map[string]int
 	handshakePrune   time.Time
 	telemetryNonceMu sync.Mutex
 	telemetryNonces  map[string]map[string]time.Time
@@ -103,6 +105,9 @@ type server struct {
 type noiseSession struct {
 	hs        *noise.HandshakeState
 	createdAt time.Time
+	// pendingKey identifies the source bucket charged for this pending
+	// handshake (see reserveHandshakeStart).
+	pendingKey string
 }
 
 type handshakeRate struct {
@@ -265,13 +270,18 @@ const (
 	telemetryNonceDeviceMax  = 16 * 1024
 	noiseSessionTTL          = 30 * time.Second
 	noiseSessionJanitorEvery = 5 * time.Second
-	maxNoiseSessions         = 1024
-	handshakeRateWindow      = 10 * time.Second
-	handshakeRateLimit       = 30
-	handshakeRatePruneEvery  = time.Second
-	maxHandshakeRateKeys     = 64 * 1024
-	workerFreshTTL           = 2 * time.Minute
-	workerJanitorEvery       = 30 * time.Second
+	maxNoiseSessions         = 16 * 1024
+	// Pending (unfinished) handshakes allowed per rate-limit key (IPv4 or
+	// IPv6 /64) and per wider prefix (IPv4 /24, IPv6 /48), so a few sources
+	// cannot occupy the global pool and lock real workers/devices out.
+	maxPendingHandshakesPerKey    = 16
+	maxPendingHandshakesPerPrefix = 128
+	handshakeRateWindow           = 10 * time.Second
+	handshakeRateLimit            = 30
+	handshakeRatePruneEvery       = time.Second
+	maxHandshakeRateKeys          = 64 * 1024
+	workerFreshTTL                = 2 * time.Minute
+	workerJanitorEvery            = 30 * time.Second
 )
 
 type nudgeResponse struct {
@@ -494,9 +504,10 @@ func (s *server) handleHandshakeStart(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	stored := false
+	ip := clientIP(r)
 	defer func() {
 		if !stored {
-			s.sessionCount.Add(-1)
+			s.releasePendingHandshake(ip)
 		}
 	}()
 	var req startRequest
@@ -530,7 +541,7 @@ func (s *server) handleHandshakeStart(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	sid := randID()
-	s.sessions.Store(sid, noiseSession{hs: hs, createdAt: time.Now()})
+	s.sessions.Store(sid, noiseSession{hs: hs, createdAt: time.Now(), pendingKey: ip})
 	stored = true
 	writeJSON(w, startResponse{OK: true, SID: sid, Message: base64.StdEncoding.EncodeToString(msg2)})
 }
@@ -556,12 +567,58 @@ func (s *server) reserveHandshakeStart(r *http.Request) (bool, string) {
 	}
 	rate.Count++
 	s.handshakeRates[key] = rate
+	if s.handshakePending == nil {
+		s.handshakePending = map[string]int{}
+	}
+	prefix := pendingPrefixKey(clientIP(r))
+	if s.handshakePending[key] >= maxPendingHandshakesPerKey || s.handshakePending[prefix] >= maxPendingHandshakesPerPrefix {
+		s.handshakeMu.Unlock()
+		return false, "too many pending handshakes from this network"
+	}
+	s.handshakePending[key]++
+	s.handshakePending[prefix]++
 	s.handshakeMu.Unlock()
 	if s.sessionCount.Add(1) > maxNoiseSessions {
-		s.sessionCount.Add(-1)
+		s.releasePendingHandshake(clientIP(r))
 		return false, "too many pending handshakes"
 	}
 	return true, ""
+}
+
+// releasePendingHandshake returns the global and per-source slots taken by
+// reserveHandshakeStart for a handshake from ip.
+func (s *server) releasePendingHandshake(ip string) {
+	s.sessionCount.Add(-1)
+	key := rateLimitKey(ip)
+	prefix := pendingPrefixKey(ip)
+	s.handshakeMu.Lock()
+	defer s.handshakeMu.Unlock()
+	for _, k := range []string{key, prefix} {
+		if s.handshakePending[k] <= 1 {
+			delete(s.handshakePending, k)
+		} else {
+			s.handshakePending[k]--
+		}
+	}
+}
+
+// pendingPrefixKey aggregates addresses one level wider than rateLimitKey:
+// IPv4 /24 and IPv6 /48.
+func pendingPrefixKey(ip string) string {
+	addr, err := netip.ParseAddr(strings.TrimSpace(ip))
+	if err != nil {
+		return "prefix:" + strings.TrimSpace(ip)
+	}
+	addr = addr.Unmap()
+	bits := 48
+	if addr.Is4() {
+		bits = 24
+	}
+	prefix, err := addr.Prefix(bits)
+	if err != nil {
+		return "prefix:" + addr.String()
+	}
+	return "prefix:" + prefix.String()
 }
 
 func (s *server) pruneHandshakeRatesLocked(now time.Time) {
@@ -607,7 +664,7 @@ func (s *server) runNoiseSessionJanitor(ctx context.Context) {
 				sess, ok := value.(noiseSession)
 				if !ok || sess.createdAt.Before(cutoff) {
 					if _, loaded := s.sessions.LoadAndDelete(key); loaded {
-						s.sessionCount.Add(-1)
+						s.releasePendingHandshake(sess.pendingKey)
 					}
 				}
 				return true
@@ -636,8 +693,8 @@ func (s *server) handleNoiseContext(fn func(context.Context, []byte, []byte) (an
 			writeJSON(w, noiseEnvelopeResponse{OK: false, Error: "noise session expired"})
 			return
 		}
-		s.sessionCount.Add(-1)
 		sess := v.(noiseSession)
+		s.releasePendingHandshake(sess.pendingKey)
 		if time.Since(sess.createdAt) > noiseSessionTTL {
 			writeJSON(w, noiseEnvelopeResponse{OK: false, Error: "noise session expired"})
 			return
