@@ -35,13 +35,13 @@ func TestPullShipsAPKOnlyUntilWorkerAcksRelease(t *testing.T) {
 	}
 
 	rec := reload()
-	update, err := s.updateArtifactForPull(rec, rec.DesiredSeq-1)
+	update, err := pullArtifactForTest(s, rec, rec.DesiredSeq-1)
 	if err != nil || update == nil || update.APKBase64 == "" {
 		t.Fatalf("first pull must ship APK: update=%v err=%v", update != nil, err)
 	}
 	// Before the ack the APK keeps shipping.
 	rec = reload()
-	if update, _ := s.updateArtifactForPull(rec, rec.DesiredSeq-1); update == nil {
+	if update, _ := pullArtifactForTest(s, rec, rec.DesiredSeq-1); update == nil {
 		t.Fatal("APK must be re-sent until the worker acks it")
 	}
 	if err := s.store.updateAck(rec.ID, rec.DesiredSeq, "", nil); err != nil {
@@ -51,12 +51,12 @@ func TestPullShipsAPKOnlyUntilWorkerAcksRelease(t *testing.T) {
 		t.Fatal(err)
 	}
 	rec = reload()
-	update, err = s.updateArtifactForPull(rec, rec.AppliedSeq)
+	update, err = pullArtifactForTest(s, rec, rec.AppliedSeq)
 	if err != nil || update != nil {
 		t.Fatalf("config-only bump must not re-ship APK: update=%v err=%v", update != nil, err)
 	}
 	// A worker reporting no applied state gets the APK again.
-	if update, _ := s.updateArtifactForPull(rec, 0); update == nil {
+	if update, _ := pullArtifactForTest(s, rec, 0); update == nil {
 		t.Fatal("fresh worker state must receive APK")
 	}
 
@@ -73,7 +73,40 @@ func TestPullShipsAPKOnlyUntilWorkerAcksRelease(t *testing.T) {
 		t.Fatal(err)
 	}
 	rec = reload()
-	if update, _ := s.updateArtifactForPull(rec, rec.AppliedSeq); update == nil {
+	if update, _ := pullArtifactForTest(s, rec, rec.AppliedSeq); update == nil {
 		t.Fatal("new APK release must ship")
 	}
+}
+
+// pullArtifactForTest mirrors a pull: take the artifact, then release the
+// shipment slot as handleNoiseContext does after writing the response.
+func pullArtifactForTest(s *server, rec workerRecord, haveSeq int64) (*updateArtifact, error) {
+	update, release, err := s.updateArtifactForPull(rec, haveSeq)
+	if release != nil {
+		release()
+	}
+	return update, err
+}
+
+func TestAPKShipmentsAreBoundedAndSkippedWhenBusy(t *testing.T) {
+	s := newTestServer(t)
+	var releases []func()
+	for i := 0; i < maxConcurrentAPKShipments; i++ {
+		release, ok := s.acquireAPKShipment(time.Second)
+		if !ok {
+			t.Fatalf("slot %d not granted", i)
+		}
+		releases = append(releases, release)
+	}
+	if _, ok := s.acquireAPKShipment(50 * time.Millisecond); ok {
+		t.Fatal("shipments beyond the bound must wait")
+	}
+	releases[0]()
+	releases[0]() // idempotent
+	if release, ok := s.acquireAPKShipment(time.Second); !ok {
+		t.Fatal("released slot must be reusable")
+	} else {
+		release()
+	}
+	releases[1]()
 }

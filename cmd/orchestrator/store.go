@@ -15,6 +15,7 @@ import (
 	"net/netip"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -52,11 +53,18 @@ type orchStore struct {
 	// another key.
 	rejectLegacySealed atomic.Bool
 
-	// approvedCache holds decrypted approved devices for the committed DB
-	// state identified by approvedCacheTx (see approvedDevices).
-	approvedCacheMu sync.Mutex
-	approvedCacheTx int
-	approvedCache   []deviceRecord
+	// seqSignal is closed (and replaced) after every commit that changes a
+	// worker's DesiredSeq, waking nudge long-polls without DB polling.
+	seqSignalMu sync.Mutex
+	seqSignal   chan struct{}
+
+	// approvedCache holds decrypted approved devices for the device-config
+	// revision approvedCacheRev (the devices bucket sequence, see
+	// approvedDevices).
+	approvedCacheMu  sync.Mutex
+	approvedCacheRev uint64
+	approvedCacheSet bool
+	approvedCache    []deviceRecord
 }
 
 type tokenRecord struct {
@@ -728,6 +736,7 @@ func (s *orchStore) consumeBootstrapToken(secret string, device deviceRecord, pr
 	err = s.db.Update(func(tx *bolt.Tx) error {
 		tb := tx.Bucket(bucketTokens)
 		db := tx.Bucket(bucketDevices)
+		ipIndex := s.newDeviceIPIndex(tx)
 		// Re-check inside the write tx: a concurrent enroll of the same
 		// identity would otherwise overwrite the first device record (new
 		// PSK/IP) and burn both tokens. Aborting here keeps this token.
@@ -762,7 +771,7 @@ func (s *orchStore) consumeBootstrapToken(secret string, device deviceRecord, pr
 			device.RealityUUID = uuidV4()
 		}
 		if device.InternalIP == "" {
-			ip, err := s.allocateDeviceIP(tx, baseAWGSubnet(profiles))
+			ip, err := ipIndex.allocate("awg", baseAWGSubnet(profiles))
 			if err != nil {
 				return err
 			}
@@ -778,7 +787,7 @@ func (s *orchStore) consumeBootstrapToken(secret string, device deviceRecord, pr
 		if device.ConfigSeq < 1 {
 			device.ConfigSeq = 1
 		}
-		if err := s.ensureDeviceAWGProfilesTx(tx, &device, profiles, device.AWGPublicKey); err != nil {
+		if err := s.ensureDeviceAWGProfilesTx(tx, ipIndex, &device, profiles, device.AWGPublicKey); err != nil {
 			return err
 		}
 		sealed, err := s.sealJSON(bucketDevices, []byte(device.ID), device)
@@ -883,32 +892,48 @@ func (s *orchStore) tokenLookup(secret string) string {
 // scanned on each enroll attempt, so dead ones must not pile up forever.
 const tokenRetentionAfterUse = 7 * 24 * time.Hour
 
+func tokenDead(rec tokenRecord, now time.Time) bool {
+	expiredLongAgo := now.Sub(rec.ExpiresAt) > tokenRetentionAfterUse
+	exhaustedLongAgo := rec.MaxUses > 0 && rec.Uses >= rec.MaxUses && now.Sub(rec.CreatedAt) > tokenRetentionAfterUse
+	return expiredLongAgo || exhaustedLongAgo
+}
+
 func (s *orchStore) pruneDeadTokens(now time.Time) (int, error) {
 	var dead [][]byte
-	err := s.db.Update(func(tx *bolt.Tx) error {
-		b := tx.Bucket(bucketTokens)
-		if err := b.ForEach(func(k, v []byte) error {
+	// Scan read-only: the janitor runs every 30s and an empty write
+	// transaction still costs an fsync.
+	if err := s.db.View(func(tx *bolt.Tx) error {
+		return tx.Bucket(bucketTokens).ForEach(func(k, v []byte) error {
 			var rec tokenRecord
 			if err := json.Unmarshal(v, &rec); err != nil {
 				return nil
 			}
-			expiredLongAgo := now.Sub(rec.ExpiresAt) > tokenRetentionAfterUse
-			exhaustedLongAgo := rec.MaxUses > 0 && rec.Uses >= rec.MaxUses && now.Sub(rec.CreatedAt) > tokenRetentionAfterUse
-			if expiredLongAgo || exhaustedLongAgo {
+			if tokenDead(rec, now) {
 				dead = append(dead, append([]byte(nil), k...))
 			}
 			return nil
-		}); err != nil {
-			return err
-		}
+		})
+	}); err != nil || len(dead) == 0 {
+		return 0, err
+	}
+	removed := 0
+	err := s.db.Update(func(tx *bolt.Tx) error {
+		b := tx.Bucket(bucketTokens)
+		removed = 0
 		for _, k := range dead {
+			// Re-check: the id may have been re-created since the scan.
+			var rec tokenRecord
+			if raw := b.Get(k); raw == nil || json.Unmarshal(raw, &rec) != nil || !tokenDead(rec, now) {
+				continue
+			}
+			removed++
 			if err := b.Delete(k); err != nil {
 				return err
 			}
 		}
 		return nil
 	})
-	return len(dead), err
+	return removed, err
 }
 
 func tokenRecordConsumable(rec tokenRecord, now time.Time, workerStaticPub string) bool {
@@ -921,6 +946,39 @@ func tokenRecordConsumable(rec tokenRecord, now time.Time, workerStaticPub strin
 
 func (s *orchStore) ensureDeviceAWGProfiles(id string, profiles []awgProfile, awgPublic string) (deviceRecord, error) {
 	var out deviceRecord
+	// Re-enrollments usually find every profile provisioned already; check
+	// read-only first so they do not cost a write transaction (fsync).
+	unchanged := false
+	if err := s.db.View(func(tx *bolt.Tx) error {
+		raw := tx.Bucket(bucketDevices).Get([]byte(id))
+		if raw == nil {
+			return errors.New("device not found")
+		}
+		var rec deviceRecord
+		if err := s.openJSON(bucketDevices, []byte(id), raw, &rec); err != nil {
+			return err
+		}
+		before, _ := json.Marshal(rec)
+		probe := rec
+		probe.AWGProfiles = make(map[string]deviceAWGProfile, len(rec.AWGProfiles))
+		for k, v := range rec.AWGProfiles {
+			probe.AWGProfiles[k] = v
+		}
+		if err := s.ensureDeviceAWGProfilesTx(tx, s.newDeviceIPIndex(tx), &probe, profiles, awgPublic); err != nil {
+			return err
+		}
+		after, _ := json.Marshal(probe)
+		if string(before) == string(after) {
+			unchanged = true
+			out = rec
+		}
+		return nil
+	}); err != nil {
+		return deviceRecord{}, err
+	}
+	if unchanged {
+		return out, nil
+	}
 	err := s.db.Update(func(tx *bolt.Tx) error {
 		b := tx.Bucket(bucketDevices)
 		raw := b.Get([]byte(id))
@@ -932,7 +990,7 @@ func (s *orchStore) ensureDeviceAWGProfiles(id string, profiles []awgProfile, aw
 			return err
 		}
 		before, _ := json.Marshal(rec.AWGProfiles)
-		if err := s.ensureDeviceAWGProfilesTx(tx, &rec, profiles, awgPublic); err != nil {
+		if err := s.ensureDeviceAWGProfilesTx(tx, s.newDeviceIPIndex(tx), &rec, profiles, awgPublic); err != nil {
 			return err
 		}
 		after, _ := json.Marshal(rec.AWGProfiles)
@@ -956,7 +1014,7 @@ func (s *orchStore) ensureDeviceAWGProfiles(id string, profiles []awgProfile, aw
 	return out, err
 }
 
-func (s *orchStore) ensureDeviceAWGProfilesTx(tx *bolt.Tx, device *deviceRecord, profiles []awgProfile, awgPublic string) error {
+func (s *orchStore) ensureDeviceAWGProfilesTx(tx *bolt.Tx, ipIndex *deviceIPIndex, device *deviceRecord, profiles []awgProfile, awgPublic string) error {
 	awgPublic = strings.TrimSpace(awgPublic)
 	if awgPublic == "" {
 		awgPublic = strings.TrimSpace(device.AWGPublicKey)
@@ -997,7 +1055,7 @@ func (s *orchStore) ensureDeviceAWGProfilesTx(tx *bolt.Tx, device *deviceRecord,
 			return fmt.Errorf("device awg public key mismatch for profile %s", name)
 		}
 		if strings.TrimSpace(creds.InternalIP) == "" {
-			ip, err := s.allocateDeviceIPForProfile(tx, name, profile.Subnet)
+			ip, err := ipIndex.allocate(name, profile.Subnet)
 			if err != nil {
 				return err
 			}
@@ -1101,6 +1159,48 @@ func (s *orchStore) setTelemetrySnapshot(rec telemetrySnapshotRecord) error {
 	}
 	return s.db.Update(func(tx *bolt.Tx) error {
 		return tx.Bucket(bucketTelemetry).Put([]byte(rec.DeviceID), sealed)
+	})
+}
+
+// recordTelemetry stores a device's telemetry snapshot and, when it reports a
+// newer client version, the device's version, in one batched transaction.
+func (s *orchStore) recordTelemetry(rec telemetrySnapshotRecord) error {
+	if strings.TrimSpace(rec.DeviceID) == "" {
+		return errors.New("telemetry device_id is required")
+	}
+	if rec.ReceivedAt.IsZero() {
+		rec.ReceivedAt = time.Now().UTC()
+	}
+	sealed, err := s.sealJSON(bucketTelemetry, []byte(rec.DeviceID), rec)
+	if err != nil {
+		return err
+	}
+	version := strings.TrimSpace(rec.ClientVersion)
+	return s.db.Batch(func(tx *bolt.Tx) error {
+		if err := tx.Bucket(bucketTelemetry).Put([]byte(rec.DeviceID), sealed); err != nil {
+			return err
+		}
+		if version == "" {
+			return nil
+		}
+		b := tx.Bucket(bucketDevices)
+		raw := b.Get([]byte(rec.DeviceID))
+		if raw == nil {
+			return errors.New("device not found")
+		}
+		var device deviceRecord
+		if err := s.openJSON(bucketDevices, []byte(rec.DeviceID), raw, &device); err != nil {
+			return err
+		}
+		if strings.TrimSpace(device.ClientVersion) == version || clientVersionWouldRollback(device.ClientVersion, version) {
+			return nil
+		}
+		device.ClientVersion = version
+		out, err := s.sealJSON(bucketDevices, []byte(rec.DeviceID), device)
+		if err != nil {
+			return err
+		}
+		return b.Put([]byte(rec.DeviceID), out)
 	})
 }
 
@@ -1238,6 +1338,20 @@ func deviceAWGKeys(rec deviceRecord) []string {
 	return keys
 }
 
+// deviceBlockReason names why an approved device must be blocked now, or "".
+func deviceBlockReason(rec deviceRecord, now time.Time) string {
+	if rec.Status != "approved" {
+		return ""
+	}
+	if deviceLimitsExpired(rec.Limits, now) {
+		return "expires_at"
+	}
+	if rec.Limits.TrafficQuotaBytes > 0 && saturatingAddUint64(rec.UsageRxBytes, rec.UsageTxBytes) >= rec.Limits.TrafficQuotaBytes {
+		return "traffic_quota_bytes"
+	}
+	return ""
+}
+
 // applyUsageToDevice folds the reports that belong to rec into its counters
 // and applies quota/expiry blocking. It reports whether rec changed and
 // whether it was newly blocked.
@@ -1256,13 +1370,8 @@ func applyUsageToDevice(rec *deviceRecord, workerID string, grouped deviceUsageR
 			}
 		}
 	}
-	reason := ""
-	if deviceLimitsExpired(rec.Limits, now) {
-		reason = "expires_at"
-	} else if rec.Limits.TrafficQuotaBytes > 0 && saturatingAddUint64(rec.UsageRxBytes, rec.UsageTxBytes) >= rec.Limits.TrafficQuotaBytes {
-		reason = "traffic_quota_bytes"
-	}
-	if reason != "" && rec.Status == "approved" {
+	reason := deviceBlockReason(*rec, now)
+	if reason != "" {
 		rec.Status = "revoked"
 		rec.BlockedReason = reason
 		blockedAt := now.UTC()
@@ -1281,6 +1390,26 @@ func applyUsageToDevice(rec *deviceRecord, workerID string, grouped deviceUsageR
 // acks use applyReportedDeviceUsage, which touches only reported devices.
 func (s *orchStore) applyDeviceUsageAndBlocks(workerID string, reports []deviceUsage, now time.Time) (int, error) {
 	grouped := groupDeviceUsageReports(reports)
+	if len(grouped.byID) == 0 && len(grouped.byAWG) == 0 {
+		// Periodic sweep: find devices to block read-only first so the
+		// writer lock is not held across a full decrypt when there are none.
+		pending := false
+		if err := s.db.View(func(tx *bolt.Tx) error {
+			return tx.Bucket(bucketDevices).ForEach(func(k, raw []byte) error {
+				if pending {
+					return nil
+				}
+				var rec deviceRecord
+				if err := s.openJSON(bucketDevices, k, raw, &rec); err != nil {
+					return err
+				}
+				pending = deviceBlockReason(rec, now) != ""
+				return nil
+			})
+		}); err != nil || !pending {
+			return 0, err
+		}
+	}
 	blocked := 0
 	err := s.db.Update(func(tx *bolt.Tx) error {
 		n, err := s.sweepDeviceUsageTx(tx, workerID, grouped, now, nil)
@@ -1345,12 +1474,25 @@ func (s *orchStore) sweepDeviceUsageTx(tx *bolt.Tx, workerID string, grouped dev
 // the full scan only runs when a report cannot be attributed that way (legacy
 // reports keyed solely by AWG public key).
 func (s *orchStore) applyReportedDeviceUsage(workerID string, reports []deviceUsage, now time.Time) (int, error) {
+	blocked := 0
+	err := s.db.Update(func(tx *bolt.Tx) error {
+		var err error
+		blocked, err = s.applyReportedDeviceUsageTx(tx, workerID, reports, now)
+		return err
+	})
+	if err != nil {
+		return 0, err
+	}
+	return blocked, nil
+}
+
+func (s *orchStore) applyReportedDeviceUsageTx(tx *bolt.Tx, workerID string, reports []deviceUsage, now time.Time) (int, error) {
 	grouped := groupDeviceUsageReports(reports)
 	if len(grouped.byID) == 0 && len(grouped.byAWG) == 0 {
 		return 0, nil
 	}
 	blocked := 0
-	err := s.db.Update(func(tx *bolt.Tx) error {
+	err := func() error {
 		b := tx.Bucket(bucketDevices)
 		resolved := map[string]bool{}
 		coveredAWG := map[string]bool{}
@@ -1404,7 +1546,7 @@ func (s *orchStore) applyReportedDeviceUsage(workerID string, reports []deviceUs
 			return s.bumpWorkerSeqsTx(tx)
 		}
 		return nil
-	})
+	}()
 	if err != nil {
 		return 0, err
 	}
@@ -1517,18 +1659,19 @@ func (s *orchStore) telemetrySnapshots() (map[string]telemetrySnapshotRecord, er
 	return out, err
 }
 
-// approvedDevices returns approved, fully provisioned devices. Every worker
-// pull needs this list, and after a seq bump all workers pull at once, so the
-// decrypted result is cached per committed DB state: a read transaction's ID
-// is the ID of the last committed write, and the list is built inside that
-// same transaction, so a cache hit can never return data older than the DB.
-// Callers must treat the returned records as read-only.
+// approvedDevices returns approved, fully provisioned devices for worker
+// config. Every pull needs it and a seq bump sends all workers to pull at
+// once, so the decrypted list is cached per device-config revision: the
+// devices bucket sequence, advanced by bumpWorkerSeqsTx in the same
+// transaction as any config change and read here in the same snapshot as the
+// data. Usage counters and client versions (not part of worker config) do not
+// advance it and may be stale in the result. Treat records as read-only.
 func (s *orchStore) approvedDevices() ([]deviceRecord, error) {
 	var out []deviceRecord
 	err := s.db.View(func(tx *bolt.Tx) error {
-		rev := tx.ID()
+		rev := tx.Bucket(bucketDevices).Sequence()
 		s.approvedCacheMu.Lock()
-		if s.approvedCache != nil && s.approvedCacheTx == rev {
+		if s.approvedCacheSet && s.approvedCacheRev == rev {
 			out = append([]deviceRecord(nil), s.approvedCache...)
 			s.approvedCacheMu.Unlock()
 			return nil
@@ -1551,9 +1694,10 @@ func (s *orchStore) approvedDevices() ([]deviceRecord, error) {
 			return err
 		}
 		s.approvedCacheMu.Lock()
-		if rev >= s.approvedCacheTx {
-			s.approvedCacheTx = rev
+		if !s.approvedCacheSet || rev >= s.approvedCacheRev {
+			s.approvedCacheRev = rev
 			s.approvedCache = fresh
+			s.approvedCacheSet = true
 		}
 		s.approvedCacheMu.Unlock()
 		out = append([]deviceRecord(nil), fresh...)
@@ -1877,8 +2021,57 @@ func (s *orchStore) updateAck(id string, applied int64, observed string, self ma
 
 // updateAckWithProbe records an ack and, when probe is non-nil, the egress
 // probe result (possibly empty) in one write transaction.
+// recordAck stores a worker ack (and egress probe) together with the usage it
+// reports in one batched write transaction, returning the worker's desired
+// seq and the number of devices newly blocked by quota.
+func (s *orchStore) recordAck(id string, applied int64, observed string, self map[string]any, probe *string, usage []deviceUsage, now time.Time) (int64, int, error) {
+	var desired int64
+	var blocked int
+	var discoveryChanged bool
+	err := s.db.Batch(func(tx *bolt.Tx) error {
+		rec, changed, err := s.mutateWorkerTx(tx, id, func(rec *workerRecord) (bool, error) {
+			applyAck(rec, applied, observed, self, probe)
+			return true, nil
+		})
+		if err != nil {
+			return err
+		}
+		n, err := s.applyReportedDeviceUsageTx(tx, id, usage, now)
+		if err != nil {
+			return err
+		}
+		// Usage may bump every worker's seq; report the post-bump value.
+		if n > 0 {
+			var bumped workerRecord
+			if raw := tx.Bucket(bucketWorkers).Get([]byte(id)); raw != nil {
+				if err := s.openJSON(bucketWorkers, []byte(id), raw, &bumped); err != nil {
+					return err
+				}
+				rec = bumped
+			}
+		}
+		// Batch may re-run this function: assign, never accumulate.
+		desired, blocked, discoveryChanged = rec.DesiredSeq, n, changed
+		return nil
+	})
+	if err != nil {
+		return 0, 0, err
+	}
+	if discoveryChanged {
+		s.touchDiscoveryWorkerRevision()
+	}
+	return desired, blocked, nil
+}
+
 func (s *orchStore) updateAckWithProbe(id string, applied int64, observed string, self map[string]any, probe *string) error {
 	return s.updateWorker(id, func(rec *workerRecord) error {
+		applyAck(rec, applied, observed, self, probe)
+		return nil
+	})
+}
+
+func applyAck(rec *workerRecord, applied int64, observed string, self map[string]any, probe *string) {
+	{
 		if probe != nil {
 			rec.EgressIPProbe = *probe
 		}
@@ -1899,11 +2092,37 @@ func (s *orchStore) updateAckWithProbe(id string, applied int64, observed string
 				forceWorkerResync(rec, applied)
 			}
 		}
-		return nil
-	})
+	}
+}
+
+func workerStale(rec workerRecord, cutoff time.Time) bool {
+	if rec.Status != "approved" && rec.Status != "active" {
+		return false
+	}
+	lastSeen := rec.CreatedAt
+	if rec.ApprovedAt != nil {
+		lastSeen = *rec.ApprovedAt
+	}
+	if rec.LastAckAt != nil {
+		lastSeen = *rec.LastAckAt
+	}
+	return !lastSeen.After(cutoff)
 }
 
 func (s *orchStore) markStaleWorkersInactive(cutoff time.Time) (int, error) {
+	any := false
+	if err := s.db.View(func(tx *bolt.Tx) error {
+		return tx.Bucket(bucketWorkers).ForEach(func(k, raw []byte) error {
+			var rec workerRecord
+			if err := s.openJSON(bucketWorkers, k, raw, &rec); err != nil {
+				return err
+			}
+			any = any || workerStale(rec, cutoff)
+			return nil
+		})
+	}); err != nil || !any {
+		return 0, err
+	}
 	updated := 0
 	err := s.db.Update(func(tx *bolt.Tx) error {
 		return rewriteBucket(tx.Bucket(bucketWorkers), func(k, raw []byte) ([]byte, error) {
@@ -1911,17 +2130,7 @@ func (s *orchStore) markStaleWorkersInactive(cutoff time.Time) (int, error) {
 			if err := s.openJSON(bucketWorkers, k, raw, &rec); err != nil {
 				return nil, err
 			}
-			if rec.Status != "approved" && rec.Status != "active" {
-				return nil, nil
-			}
-			lastSeen := rec.CreatedAt
-			if rec.ApprovedAt != nil {
-				lastSeen = *rec.ApprovedAt
-			}
-			if rec.LastAckAt != nil {
-				lastSeen = *rec.LastAckAt
-			}
-			if lastSeen.After(cutoff) {
+			if !workerStale(rec, cutoff) {
 				return nil, nil
 			}
 			rec.Status = "inactive"
@@ -1945,22 +2154,67 @@ func (s *orchStore) updateWorkerSelfDescribe(id string, self map[string]any) err
 	})
 }
 
+// heartbeatWriteInterval lets a nudge skip rewriting the worker record when
+// only LastAckAt would move; it is well inside workerFreshTTL.
+const heartbeatWriteInterval = 45 * time.Second
+
 func (s *orchStore) updateWorkerHeartbeat(id string, haveSeq int64, self map[string]any) error {
-	return s.updateWorker(id, func(rec *workerRecord) error {
-		now := time.Now().UTC()
-		rec.LastAckAt = &now
-		if len(self) > 0 {
-			rec.SelfDescribe = self
+	// Decide in a read transaction first: bbolt commits (and fsyncs) every
+	// write transaction even when nothing was Put.
+	needed := true
+	if err := s.db.View(func(tx *bolt.Tx) error {
+		raw := tx.Bucket(bucketWorkers).Get([]byte(id))
+		if raw == nil {
+			return errors.New("worker not found")
 		}
-		wasInactive := rec.Status == "inactive"
-		if (rec.Status == "approved" || rec.Status == "inactive") && rec.DesiredSeq <= haveSeq {
-			rec.Status = "active"
-			if wasInactive {
-				forceWorkerResync(rec, haveSeq)
-			}
+		var rec workerRecord
+		if err := s.openJSON(bucketWorkers, []byte(id), raw, &rec); err != nil {
+			return err
 		}
+		needed = applyHeartbeat(&rec, haveSeq, self, time.Now().UTC())
 		return nil
+	}); err != nil {
+		return err
+	}
+	if !needed {
+		return nil
+	}
+	changed := false
+	err := s.db.Batch(func(tx *bolt.Tx) error {
+		var err error
+		_, changed, err = s.mutateWorkerTx(tx, id, func(rec *workerRecord) (bool, error) {
+			return applyHeartbeat(rec, haveSeq, self, time.Now().UTC()), nil
+		})
+		return err
 	})
+	if err == nil && changed {
+		s.touchDiscoveryWorkerRevision()
+	}
+	return err
+}
+
+// applyHeartbeat updates rec for a nudge and reports whether it must be
+// stored: a status or self-description change, or LastAckAt older than
+// heartbeatWriteInterval.
+func applyHeartbeat(rec *workerRecord, haveSeq int64, self map[string]any, now time.Time) bool {
+	beforeStatus := rec.Status
+	selfChanged := len(self) > 0 && !reflect.DeepEqual(rec.SelfDescribe, self)
+	if len(self) > 0 {
+		rec.SelfDescribe = self
+	}
+	wasInactive := rec.Status == "inactive"
+	if (rec.Status == "approved" || rec.Status == "inactive") && rec.DesiredSeq <= haveSeq {
+		rec.Status = "active"
+		if wasInactive {
+			forceWorkerResync(rec, haveSeq)
+		}
+	}
+	recent := rec.LastAckAt != nil && now.Sub(*rec.LastAckAt) < heartbeatWriteInterval
+	if recent && !selfChanged && rec.Status == beforeStatus {
+		return false
+	}
+	rec.LastAckAt = &now
+	return true
 }
 
 func forceWorkerResync(rec *workerRecord, haveSeq int64) {
@@ -2003,30 +2257,49 @@ func (s *orchStore) markWorkerAPKSent(id string, apkSeq, atSeq int64) error {
 func (s *orchStore) updateWorker(id string, fn func(*workerRecord) error) error {
 	changed := false
 	err := s.db.Update(func(tx *bolt.Tx) error {
-		b := tx.Bucket(bucketWorkers)
-		raw := b.Get([]byte(id))
-		if raw == nil {
-			return errors.New("worker not found")
-		}
-		var rec workerRecord
-		if err := s.openJSON(bucketWorkers, []byte(id), raw, &rec); err != nil {
-			return err
-		}
-		before := workerDiscoveryFingerprint(rec, time.Now().UTC())
-		if err := fn(&rec); err != nil {
-			return err
-		}
-		sealed, err := s.sealJSON(bucketWorkers, []byte(id), rec)
-		if err != nil {
-			return err
-		}
-		changed = before != workerDiscoveryFingerprint(rec, time.Now().UTC())
-		return b.Put([]byte(id), sealed)
+		var err error
+		_, changed, err = s.mutateWorkerTx(tx, id, func(rec *workerRecord) (bool, error) {
+			return true, fn(rec)
+		})
+		return err
 	})
 	if err == nil && changed {
 		s.touchDiscoveryWorkerRevision()
 	}
 	return err
+}
+
+// mutateWorkerTx loads worker id, applies fn and stores the record when fn
+// asks for a write. It returns the resulting record and whether fields that
+// feed the discovery bundle changed.
+func (s *orchStore) mutateWorkerTx(tx *bolt.Tx, id string, fn func(*workerRecord) (bool, error)) (workerRecord, bool, error) {
+	b := tx.Bucket(bucketWorkers)
+	raw := b.Get([]byte(id))
+	if raw == nil {
+		return workerRecord{}, false, errors.New("worker not found")
+	}
+	var rec workerRecord
+	if err := s.openJSON(bucketWorkers, []byte(id), raw, &rec); err != nil {
+		return workerRecord{}, false, err
+	}
+	now := time.Now().UTC()
+	before := workerDiscoveryFingerprint(rec, now)
+	beforeSeq := rec.DesiredSeq
+	write, err := fn(&rec)
+	if err != nil || !write {
+		return rec, false, err
+	}
+	if rec.DesiredSeq != beforeSeq {
+		tx.OnCommit(s.signalWorkerSeqChange)
+	}
+	sealed, err := s.sealJSON(bucketWorkers, []byte(id), rec)
+	if err != nil {
+		return workerRecord{}, false, err
+	}
+	if err := b.Put([]byte(id), sealed); err != nil {
+		return workerRecord{}, false, err
+	}
+	return rec, before != workerDiscoveryFingerprint(rec, now), nil
 }
 
 func (s *orchStore) discoveryRevision() uint64 {
@@ -2082,7 +2355,34 @@ func rewriteBucket(b *bolt.Bucket, fn func(k, v []byte) ([]byte, error)) error {
 	return nil
 }
 
+// workerSeqChanged returns a channel closed by the next commit that changes
+// any worker's DesiredSeq. Take it before reading the record you wait on.
+func (s *orchStore) workerSeqChanged() <-chan struct{} {
+	s.seqSignalMu.Lock()
+	defer s.seqSignalMu.Unlock()
+	if s.seqSignal == nil {
+		s.seqSignal = make(chan struct{})
+	}
+	return s.seqSignal
+}
+
+func (s *orchStore) signalWorkerSeqChange() {
+	s.seqSignalMu.Lock()
+	defer s.seqSignalMu.Unlock()
+	if s.seqSignal != nil {
+		close(s.seqSignal)
+	}
+	s.seqSignal = make(chan struct{})
+}
+
 func (s *orchStore) bumpWorkerSeqsTx(tx *bolt.Tx) error {
+	tx.OnCommit(s.signalWorkerSeqChange)
+	// Every change to device config that workers must see goes through a
+	// seq bump; advancing the devices bucket sequence here versions the
+	// approvedDevices cache without counting usage/heartbeat writes.
+	if _, err := tx.Bucket(bucketDevices).NextSequence(); err != nil {
+		return err
+	}
 	return rewriteBucket(tx.Bucket(bucketWorkers), func(k, raw []byte) ([]byte, error) {
 		var rec workerRecord
 		if err := s.openJSON(bucketWorkers, k, raw, &rec); err != nil {
@@ -2101,41 +2401,84 @@ func (s *orchStore) bumpWorkerSeqsTx(tx *bolt.Tx) error {
 }
 
 func (s *orchStore) allocateDeviceIP(tx *bolt.Tx, cidr string) (string, error) {
-	return s.allocateDeviceIPFrom(tx, cidr, func(rec deviceRecord) string { return rec.InternalIP })
+	return s.newDeviceIPIndex(tx).allocate("awg", cidr)
 }
 
 // deviceIPPoolReserved is the number of low host addresses kept for the
 // worker gateway and infrastructure.
 const deviceIPPoolReserved = 10
 
-// allocateDeviceIPFrom returns the first free /32 in cidr (IPv4), skipping the
-// reserved low addresses and the broadcast address. usedIP extracts the
-// address a device already holds in this pool.
-func (s *orchStore) allocateDeviceIPFrom(tx *bolt.Tx, cidr string, usedIP func(deviceRecord) string) (string, error) {
+// deviceIPIndex holds the addresses devices already use per AWG profile pool
+// ("awg" is the base pool), built with one pass over the devices bucket on
+// first use and updated by each allocation, so an enrollment that fills
+// several profile pools decrypts every device once instead of once per pool.
+type deviceIPIndex struct {
+	store *orchStore
+	tx    *bolt.Tx
+	used  map[string]map[netip.Addr]struct{}
+}
+
+func (s *orchStore) newDeviceIPIndex(tx *bolt.Tx) *deviceIPIndex {
+	return &deviceIPIndex{store: s, tx: tx}
+}
+
+func (x *deviceIPIndex) load() error {
+	if x.used != nil {
+		return nil
+	}
+	used := map[string]map[netip.Addr]struct{}{}
+	add := func(pool, value string) {
+		addr, err := netip.ParseAddr(strings.TrimSuffix(strings.TrimSpace(value), "/32"))
+		if err != nil {
+			return
+		}
+		if used[pool] == nil {
+			used[pool] = map[netip.Addr]struct{}{}
+		}
+		used[pool][addr] = struct{}{}
+	}
+	if err := x.tx.Bucket(bucketDevices).ForEach(func(k, raw []byte) error {
+		var rec deviceRecord
+		if err := x.store.openJSON(bucketDevices, k, raw, &rec); err != nil {
+			return err
+		}
+		add("awg", rec.InternalIP)
+		for name, creds := range rec.AWGProfiles {
+			if pool := normalizeAWGProfileName(name); pool != "" && pool != "awg" {
+				add(pool, creds.InternalIP)
+			}
+		}
+		return nil
+	}); err != nil {
+		return err
+	}
+	x.used = used
+	return nil
+}
+
+// allocate returns the first free /32 in cidr (IPv4) for the profile pool,
+// skipping the reserved low addresses, the broadcast address and the
+// worker's gateway/smoke addresses, and records it as used.
+func (x *deviceIPIndex) allocate(profileName, cidr string) (string, error) {
+	pool := normalizeAWGProfileName(profileName)
+	if pool == "" {
+		pool = "awg"
+	}
+	if err := x.load(); err != nil {
+		return "", err
+	}
 	prefix, err := netip.ParsePrefix(strings.TrimSpace(cidr))
 	if err != nil || !prefix.Addr().Is4() {
 		prefix = netip.MustParsePrefix("10.13.13.0/24")
 	}
-	used := map[netip.Addr]struct{}{}
 	// Workers derive the gateway and smoke-test peer as the configured
 	// (unmasked) address +1 and +2; never hand those out to devices.
+	reserved := map[netip.Addr]struct{}{}
 	for a, i := prefix.Addr(), 0; i < 3 && a.IsValid(); a, i = a.Next(), i+1 {
-		used[a] = struct{}{}
+		reserved[a] = struct{}{}
 	}
 	prefix = prefix.Masked()
-	if err := tx.Bucket(bucketDevices).ForEach(func(k, raw []byte) error {
-		var rec deviceRecord
-		if err := s.openJSON(bucketDevices, k, raw, &rec); err != nil {
-			return err
-		}
-		addrText := strings.TrimSuffix(strings.TrimSpace(usedIP(rec)), "/32")
-		if addr, err := netip.ParseAddr(addrText); err == nil {
-			used[addr] = struct{}{}
-		}
-		return nil
-	}); err != nil {
-		return "", err
-	}
+	used := x.used[pool]
 	next := prefix.Addr()
 	for i := 0; i < deviceIPPoolReserved; i++ {
 		next = next.Next()
@@ -2144,22 +2487,23 @@ func (s *orchStore) allocateDeviceIPFrom(tx *bolt.Tx, cidr string, usedIP func(d
 		if after := next.Next(); !after.IsValid() || !prefix.Contains(after) {
 			break // broadcast address
 		}
+		if _, ok := reserved[next]; ok {
+			continue
+		}
 		if _, ok := used[next]; ok {
 			continue
 		}
+		if x.used[pool] == nil {
+			x.used[pool] = map[netip.Addr]struct{}{}
+		}
+		x.used[pool][next] = struct{}{}
 		return next.String() + "/32", nil
 	}
 	return "", errors.New("device IP pool exhausted")
 }
 
 func (s *orchStore) allocateDeviceIPForProfile(tx *bolt.Tx, profileName, cidr string) (string, error) {
-	profileName = normalizeAWGProfileName(profileName)
-	if profileName == "" || profileName == "awg" {
-		return s.allocateDeviceIP(tx, cidr)
-	}
-	return s.allocateDeviceIPFrom(tx, cidr, func(rec deviceRecord) string {
-		return rec.AWGProfiles[profileName].InternalIP
-	})
+	return s.newDeviceIPIndex(tx).allocate(profileName, cidr)
 }
 
 func randomBase64Key() (string, error) {

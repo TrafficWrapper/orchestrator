@@ -178,7 +178,11 @@ func insertDeviceRecord(t *testing.T, st *orchStore, rec deviceRecord) {
 		t.Fatal(err)
 	}
 	if err := st.db.Update(func(tx *bolt.Tx) error {
-		return tx.Bucket(bucketDevices).Put([]byte(rec.ID), raw)
+		if err := tx.Bucket(bucketDevices).Put([]byte(rec.ID), raw); err != nil {
+			return err
+		}
+		_, err := tx.Bucket(bucketDevices).NextSequence()
+		return err
 	}); err != nil {
 		t.Fatal(err)
 	}

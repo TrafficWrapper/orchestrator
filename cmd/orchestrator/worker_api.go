@@ -42,6 +42,8 @@ type pullResponse struct {
 	WorkerBundle signedConfig    `json:"worker_bundle,omitempty"`
 	ClientBundle signedConfig    `json:"client_bundle,omitempty"`
 	Update       *updateArtifact `json:"update,omitempty"`
+	// release frees the APK shipment slot once the response is written.
+	release func()
 }
 
 type updateArtifact struct {
@@ -108,7 +110,7 @@ func (s *server) handleEnroll(peer []byte, raw []byte) (any, error) {
 	if err != nil {
 		return nil, err
 	}
-	pub, err := s.signer.publicKey()
+	pub, err := s.signerPublicKey()
 	if err != nil {
 		return nil, err
 	}
@@ -137,23 +139,31 @@ func (s *server) handlePull(peer []byte, raw []byte) (any, error) {
 	if err != nil {
 		return nil, err
 	}
-	update, err := s.updateArtifactForPull(rec, req.HaveSeq)
+	update, release, err := s.updateArtifactForPull(rec, req.HaveSeq)
 	if err != nil {
 		return nil, err
 	}
-	return pullResponse{OK: true, Status: rec.Status, WorkerID: rec.ID, DesiredSeq: rec.DesiredSeq, WorkerBundle: wb, ClientBundle: cb, Update: update}, nil
+	return pullResponse{OK: true, Status: rec.Status, WorkerID: rec.ID, DesiredSeq: rec.DesiredSeq, WorkerBundle: wb, ClientBundle: cb, Update: update, release: release}, nil
 }
+
+const (
+	nudgeLongPollTimeout = 25 * time.Second
+	nudgeFallbackPoll    = 5 * time.Second
+)
 
 func (s *server) handleNudge(ctx context.Context, peer []byte, raw []byte) (any, error) {
 	var req nudgeRequest
 	if err := json.Unmarshal(raw, &req); err != nil {
 		return nil, err
 	}
-	deadline := time.Now().Add(25 * time.Second)
+	deadline := time.NewTimer(nudgeLongPollTimeout)
+	defer deadline.Stop()
+	expired := false
 	updatedHeartbeat := false
-	ticker := time.NewTicker(time.Second)
-	defer ticker.Stop()
 	for {
+		// Grab the change signal before reading, so a bump committed between
+		// the read and the wait still wakes us.
+		changed := s.store.workerSeqChanged()
 		rec, err := s.store.worker(req.WorkerID)
 		if err != nil {
 			return nudgeResponse{OK: false, Error: err.Error()}, nil
@@ -165,13 +175,17 @@ func (s *server) handleNudge(ctx context.Context, peer []byte, raw []byte) (any,
 			_ = s.store.updateWorkerHeartbeat(rec.ID, req.HaveSeq, req.SelfDescribe)
 			updatedHeartbeat = true
 		}
-		if rec.DesiredSeq > req.HaveSeq || time.Now().After(deadline) {
+		if rec.DesiredSeq > req.HaveSeq || expired {
 			return nudgeResponse{OK: true, DesiredSeq: rec.DesiredSeq, Heartbeat: rec.DesiredSeq <= req.HaveSeq}, nil
 		}
 		select {
 		case <-ctx.Done():
 			return nudgeResponse{OK: false, Error: ctx.Err().Error()}, nil
-		case <-ticker.C:
+		case <-deadline.C:
+			expired = true
+		case <-changed:
+		case <-time.After(nudgeFallbackPoll):
+			// Safety net for a seq change that bypassed the signal.
 		}
 	}
 }
@@ -193,21 +207,14 @@ func (s *server) handleAck(peer []byte, raw []byte) (any, error) {
 	if probe == "" {
 		log.Printf("worker %s egress probe unavailable; observed=%q", rec.ID, req.EgressIPObserved)
 	}
-	if err := s.store.updateAckWithProbe(rec.ID, req.AppliedVersion, req.EgressIPObserved, req.SelfDescribe, &probe); err != nil {
-		return nil, err
-	}
-	quotaBlocks, err := s.store.applyReportedDeviceUsage(rec.ID, req.Usage, time.Now().UTC())
+	desiredSeq, quotaBlocks, err := s.store.recordAck(rec.ID, req.AppliedVersion, req.EgressIPObserved, req.SelfDescribe, &probe, req.Usage, time.Now().UTC())
 	if err != nil {
 		return nil, err
 	}
 	if quotaBlocks > 0 {
 		log.Printf("quota enforcement blocked devices count=%d worker=%s", quotaBlocks, rec.ID)
 	}
-	updated, err := s.store.worker(rec.ID)
-	if err != nil {
-		return nil, err
-	}
-	return ackResponse{OK: true, DesiredSeq: updated.DesiredSeq, AppliedSeq: req.AppliedVersion, EgressIPProbe: probe, EgressMatch: egressMatch, QuotaBlocks: quotaBlocks}, nil
+	return ackResponse{OK: true, DesiredSeq: desiredSeq, AppliedSeq: req.AppliedVersion, EgressIPProbe: probe, EgressMatch: egressMatch, QuotaBlocks: quotaBlocks}, nil
 }
 
 const egressProbeCacheTTL = time.Minute
@@ -219,14 +226,24 @@ func (s *server) probeEgressIP(rec workerRecord) string {
 	// ORCH_EGRESS_PROBE_URL is one URL for the whole orchestrator (meant for a
 	// co-located worker), so the answer is the same for every ack: cache it
 	// instead of blocking each ack on a synchronous HTTP call.
+	// One refresh at a time and never under the lock: concurrent acks get the
+	// previous value instead of queueing behind a slow HTTP call.
 	s.egressProbeMu.Lock()
-	defer s.egressProbeMu.Unlock()
-	if !s.egressProbeAt.IsZero() && time.Since(s.egressProbeAt) < egressProbeCacheTTL {
-		return s.egressProbeValue
+	value := s.egressProbeValue
+	fresh := !s.egressProbeAt.IsZero() && time.Since(s.egressProbeAt) < egressProbeCacheTTL
+	if fresh || s.egressProbeFetching {
+		s.egressProbeMu.Unlock()
+		return value
 	}
-	s.egressProbeValue = s.fetchEgressProbe()
+	s.egressProbeFetching = true
+	s.egressProbeMu.Unlock()
+	value = s.fetchEgressProbe()
+	s.egressProbeMu.Lock()
+	s.egressProbeValue = value
 	s.egressProbeAt = time.Now()
-	return s.egressProbeValue
+	s.egressProbeFetching = false
+	s.egressProbeMu.Unlock()
+	return value
 }
 
 func (s *server) fetchEgressProbe() string {
@@ -242,4 +259,10 @@ func (s *server) fetchEgressProbe() string {
 		return stringFromMap(body, "egress_ip")
 	}
 	return strings.TrimSpace(string(raw))
+}
+
+func (p pullResponse) releaseAfterWrite() {
+	if p.release != nil {
+		p.release()
+	}
 }

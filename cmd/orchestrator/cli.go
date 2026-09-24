@@ -3,15 +3,19 @@ package main
 import (
 	"bytes"
 	"crypto/tls"
+	"crypto/x509"
 	"encoding/base64"
 	"encoding/json"
+	"encoding/pem"
 	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -36,8 +40,9 @@ func tokenCommand(cfg orchConfig, args []string) error {
 	if err != nil {
 		return err
 	}
-	if err := adminPost(cfg, "/admin/v1/token/create", map[string]string{"id": *id, "value": *value, "ttl": ttl.String(), "worker_static_pub": *workerStaticPub}, os.Stdout); err == nil {
-		return nil
+	if err := adminPost(cfg, "/admin/v1/token/create", map[string]string{"id": *id, "value": *value, "ttl": ttl.String(), "worker_static_pub": *workerStaticPub}, os.Stdout); !errors.Is(err, errAdminServerUnreachable) {
+		// Reached the server: report its answer instead of bypassing it.
+		return err
 	}
 	st, err := openOrchStore(cfg)
 	if err != nil {
@@ -76,8 +81,9 @@ func bootstrapTokenCommand(cfg orchConfig, args []string) error {
 		"expires":      expiresAt.Format(time.RFC3339),
 		"seed_workers": seedWorkers,
 	}
-	if err := adminPost(cfg, "/admin/v1/bootstrap-token/create", req, os.Stdout); err == nil {
-		return nil
+	if err := adminPost(cfg, "/admin/v1/bootstrap-token/create", req, os.Stdout); !errors.Is(err, errAdminServerUnreachable) {
+		// Reached the server: report its answer instead of bypassing it.
+		return err
 	}
 	st, err := openOrchStore(cfg)
 	if err != nil {
@@ -111,8 +117,9 @@ func bootstrapTokenCommand(cfg orchConfig, args []string) error {
 }
 
 func statusCommand(cfg orchConfig) error {
-	if err := adminGet(cfg, "/admin/v1/status", os.Stdout); err == nil {
-		return nil
+	if err := adminGet(cfg, "/admin/v1/status", os.Stdout); !errors.Is(err, errAdminServerUnreachable) {
+		// Reached the server: report its answer instead of bypassing it.
+		return err
 	}
 	st, err := openOrchStore(cfg)
 	if err != nil {
@@ -210,8 +217,9 @@ func adminCommand(cfg orchConfig, args []string) error {
 	}
 	st, err := openOrchStore(cfg)
 	if err != nil {
-		if err := adminPost(cfg, "/admin/v1/password/force-set", map[string]string{"new_secret": secret}, os.Stdout); err == nil {
-			return nil
+		if err := adminPost(cfg, "/admin/v1/password/force-set", map[string]string{"new_secret": secret}, os.Stdout); !errors.Is(err, errAdminServerUnreachable) {
+			// Reached the server: report its answer instead of bypassing it.
+			return err
 		}
 		return err
 	}
@@ -371,14 +379,60 @@ func (d responseDecoder) Write(raw []byte) (int, error) {
 	return len(raw), nil
 }
 
+// errAdminServerUnreachable marks a CLI admin request that never reached the
+// server; only then may commands fall back to opening the database directly.
+var errAdminServerUnreachable = errors.New("orchestrator admin API unreachable")
+
+// adminTLSConfig trusts the orchestrator's own self-signed certificate
+// (state/tls.crt, pinned by exact bytes) and otherwise performs normal
+// verification, instead of skipping verification while sending a bearer
+// token to whatever ORCH_ADMIN_URL points at.
+// adminTLSRoots overrides the system roots for admin API verification
+// (tests only; nil means the system pool).
+var adminTLSRoots *x509.CertPool
+
+func adminTLSConfig(cfg orchConfig, host string) *tls.Config {
+	pinned, _ := os.ReadFile(filepath.Join(cfg.StateDir, "tls.crt"))
+	var pinnedDER []byte
+	if block, _ := pem.Decode(pinned); block != nil {
+		pinnedDER = block.Bytes
+	}
+	return &tls.Config{
+		MinVersion: tls.VersionTLS12,
+		// Verification happens in VerifyConnection so the pinned certificate
+		// can be accepted without a matching hostname.
+		InsecureSkipVerify: true,
+		VerifyConnection: func(cs tls.ConnectionState) error {
+			if len(cs.PeerCertificates) == 0 {
+				return errors.New("no server certificate")
+			}
+			leaf := cs.PeerCertificates[0]
+			if pinnedDER != nil && bytes.Equal(leaf.Raw, pinnedDER) {
+				return nil
+			}
+			intermediates := x509.NewCertPool()
+			for _, c := range cs.PeerCertificates[1:] {
+				intermediates.AddCert(c)
+			}
+			// Verify against the host we dialed: for an IP host no SNI is sent,
+			// so cs.ServerName is empty and would skip the name check.
+			if strings.TrimSpace(host) == "" {
+				return errors.New("admin URL has no host to verify")
+			}
+			_, err := leaf.Verify(x509.VerifyOptions{DNSName: host, Intermediates: intermediates, Roots: adminTLSRoots})
+			return err
+		},
+	}
+}
+
 func adminRequest(cfg orchConfig, method, path string, body io.Reader, out io.Writer) error {
 	tr := http.DefaultTransport.(*http.Transport).Clone()
-	tr.TLSClientConfig = &tls.Config{InsecureSkipVerify: true}
-	client := http.Client{Transport: tr, Timeout: 15 * time.Second}
 	req, err := http.NewRequest(method, adminBaseURL(cfg)+path, body)
 	if err != nil {
 		return err
 	}
+	tr.TLSClientConfig = adminTLSConfig(cfg, req.URL.Hostname())
+	client := http.Client{Transport: tr, Timeout: 15 * time.Second}
 	if body != nil {
 		req.Header.Set("content-type", "application/json")
 	}
@@ -387,6 +441,10 @@ func adminRequest(cfg orchConfig, method, path string, body io.Reader, out io.Wr
 	}
 	resp, err := client.Do(req)
 	if err != nil {
+		var opErr *net.OpError
+		if errors.As(err, &opErr) && opErr.Op == "dial" {
+			return fmt.Errorf("%w: %v", errAdminServerUnreachable, err)
+		}
 		return err
 	}
 	defer resp.Body.Close()

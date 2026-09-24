@@ -374,7 +374,13 @@ func putQuotaDevice(t *testing.T, s *server, rec deviceRecord) {
 		if err != nil {
 			return err
 		}
-		return tx.Bucket(bucketDevices).Put([]byte(rec.ID), sealed)
+		if err := tx.Bucket(bucketDevices).Put([]byte(rec.ID), sealed); err != nil {
+			return err
+		}
+		// Mirror production writes: device config changes advance the
+		// devices bucket sequence that versions the approvedDevices cache.
+		_, err = tx.Bucket(bucketDevices).NextSequence()
+		return err
 	})
 	if err != nil {
 		t.Fatal(err)

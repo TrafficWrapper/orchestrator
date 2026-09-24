@@ -16,6 +16,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"aead.dev/minisign"
@@ -264,6 +265,12 @@ func (s *server) handleAdminAPKPublish(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	log.Printf("published APK update seq=%d version=%s(%d) sha256=%s server_signed=%t", release.Seq, release.VersionName, release.VersionCode, release.APKSHA256, serverSigned)
+	s.auditEvent(auditEntry{Event: "apk_publish", IP: clientIP(r), Result: "ok", Fields: map[string]string{
+		"seq":           strconv.FormatInt(release.Seq, 10),
+		"version_code":  strconv.FormatInt(release.VersionCode, 10),
+		"apk_sha256":    release.APKSHA256,
+		"server_signed": strconv.FormatBool(serverSigned),
+	}})
 	writeJSON(w, map[string]any{"ok": true, "release": release})
 }
 
@@ -368,8 +375,38 @@ func (s *server) serverUpdateSigningAvailable() bool {
 	return err == nil
 }
 
+// loadServerUpdateSigningKey returns the server-held update key. It is used
+// for every discovery build and client bundle, so the parsed key is cached and
+// only reloaded when update.key's size or mtime changes.
 func (s *server) loadServerUpdateSigningKey() (minisign.PrivateKey, string, error) {
-	raw, err := os.ReadFile(filepath.Join(s.cfg.StateDir, "update.key"))
+	path := filepath.Join(s.cfg.StateDir, "update.key")
+	info, statErr := os.Stat(path)
+	if statErr == nil {
+		s.updateKeyMu.Lock()
+		c := s.updateKeyCache
+		s.updateKeyMu.Unlock()
+		if c != nil && c.size == info.Size() && c.modTime.Equal(info.ModTime()) {
+			return c.priv, c.pub, nil
+		}
+	}
+	priv, pub, err := s.readServerUpdateSigningKey(path)
+	if err == nil && statErr == nil {
+		s.updateKeyMu.Lock()
+		s.updateKeyCache = &updateKeyCacheEntry{priv: priv, pub: pub, size: info.Size(), modTime: info.ModTime()}
+		s.updateKeyMu.Unlock()
+	}
+	return priv, pub, err
+}
+
+type updateKeyCacheEntry struct {
+	priv    minisign.PrivateKey
+	pub     string
+	size    int64
+	modTime time.Time
+}
+
+func (s *server) readServerUpdateSigningKey(path string) (minisign.PrivateKey, string, error) {
+	raw, err := os.ReadFile(path)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			return minisign.PrivateKey{}, "", errors.New("update.key is not present")
@@ -483,24 +520,84 @@ func (s *server) storeAPKRelease(manifest apkReleaseRecord, manifestJSON, minisi
 	return manifest, nil
 }
 
+const (
+	// maxConcurrentAPKShipments bounds pulls that carry the APK at once: each
+	// one is JSON-encoded, encrypted and base64-encoded again (several times
+	// the APK size in memory), and a release sends every worker to pull.
+	maxConcurrentAPKShipments = 2
+)
+
+// apkShipmentWait is how long a pull waits for a free APK shipment slot (a
+// var so tests can shorten it).
+var apkShipmentWait = 30 * time.Second
+
 // updateArtifactForPull returns the APK update only when the worker has not
 // yet acknowledged the current release (or reports no applied state), so
-// config-only bumps do not re-ship the whole APK to every worker.
-func (s *server) updateArtifactForPull(worker workerRecord, haveSeq int64) (*updateArtifact, error) {
+// config-only bumps do not re-ship the whole APK. The returned release func
+// must run after the response is written. When all shipment slots stay busy
+// the pull goes out without the APK; since it is not marked sent, the next
+// pull ships it.
+func (s *server) updateArtifactForPull(worker workerRecord, haveSeq int64) (*updateArtifact, func(), error) {
 	rel, ok, err := s.store.currentAPKRelease()
 	if err != nil || !ok {
-		return nil, err
+		return nil, nil, err
 	}
 	if haveSeq > 0 && worker.APKAppliedSeq == rel.Seq {
-		return nil, nil
+		return nil, nil, nil
+	}
+	release, acquired := s.acquireAPKShipment(apkShipmentWait)
+	if !acquired {
+		// The worker would otherwise stay on the old APK until an unrelated
+		// seq bump: bump its own seq so its next nudge pulls again.
+		log.Printf("apk shipment slots busy; worker %s will retry the update", worker.ID)
+		if err := s.store.updateWorker(worker.ID, func(rec *workerRecord) error {
+			if rec.DesiredSeq <= worker.DesiredSeq {
+				rec.DesiredSeq = worker.DesiredSeq + 1
+			}
+			return nil
+		}); err != nil {
+			return nil, nil, err
+		}
+		return nil, nil, nil
+	}
+	update, err := s.cachedUpdateArtifact(rel)
+	if err != nil {
+		release()
+		return nil, nil, err
+	}
+	if err := s.store.markWorkerAPKSent(worker.ID, rel.Seq, worker.DesiredSeq); err != nil {
+		release()
+		return nil, nil, err
+	}
+	return update, release, nil
+}
+
+func (s *server) acquireAPKShipment(wait time.Duration) (func(), bool) {
+	s.apkShipOnce.Do(func() { s.apkShipSem = make(chan struct{}, maxConcurrentAPKShipments) })
+	timer := time.NewTimer(wait)
+	defer timer.Stop()
+	select {
+	case s.apkShipSem <- struct{}{}:
+		var once sync.Once
+		return func() { once.Do(func() { <-s.apkShipSem }) }, true
+	case <-timer.C:
+		return nil, false
+	}
+}
+
+// cachedUpdateArtifact reads and base64-encodes a release once; the artifact
+// is shared read-only by all pulls of that release.
+func (s *server) cachedUpdateArtifact(rel apkReleaseRecord) (*updateArtifact, error) {
+	s.apkArtifactMu.Lock()
+	defer s.apkArtifactMu.Unlock()
+	if s.apkArtifact != nil && s.apkArtifactSeq == rel.Seq {
+		return s.apkArtifact, nil
 	}
 	update, err := readUpdateArtifact(rel)
 	if err != nil {
 		return nil, err
 	}
-	if err := s.store.markWorkerAPKSent(worker.ID, rel.Seq, worker.DesiredSeq); err != nil {
-		return nil, err
-	}
+	s.apkArtifact, s.apkArtifactSeq = update, rel.Seq
 	return update, nil
 }
 

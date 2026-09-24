@@ -1,7 +1,9 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"log"
 	"sort"
@@ -70,6 +72,10 @@ func (b *telegramBot) notifyProblemTransitions(ctx context.Context) {
 		markBotProblemNoticesSent(&current, notices)
 	}
 	cleanupRecoveredBotProblems(&current)
+	// Runs every 30s; only persist real changes (each write is an fsync).
+	if found && botProblemStatesEqual(prev, current) {
+		return
+	}
 	if err := b.server.store.putBotProblemState(current); err != nil {
 		log.Printf("telegram problem notify state save failed: %v", err)
 	}
@@ -445,4 +451,13 @@ func truncateRunes(text string, maxRunes int) string {
 		return text
 	}
 	return string(runes[:maxRunes-1]) + "…"
+}
+
+// botProblemStatesEqual compares two states ignoring their UpdatedAt stamp.
+func botProblemStatesEqual(a, b botProblemState) bool {
+	a.UpdatedAt, b.UpdatedAt = time.Time{}, time.Time{}
+	a.Version, b.Version = 0, 0
+	ra, errA := json.Marshal(a)
+	rb, errB := json.Marshal(b)
+	return errA == nil && errB == nil && bytes.Equal(ra, rb)
 }

@@ -281,6 +281,11 @@ func (s *server) handleNoiseContext(fn func(context.Context, []byte, []byte) (an
 		if err != nil {
 			resp = map[string]any{"ok": false, "error": err.Error()}
 		}
+		// Responses holding a scarce resource (an APK shipment slot) release
+		// it only after the encrypted response has been written.
+		if rel, ok := resp.(interface{ releaseAfterWrite() }); ok {
+			defer rel.releaseAfterWrite()
+		}
 		encrypted, err := protocol.EncryptJSON(sendCipher, resp)
 		if err != nil {
 			writeJSON(w, noiseEnvelopeResponse{OK: false, Error: err.Error()})

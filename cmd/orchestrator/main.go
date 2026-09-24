@@ -68,13 +68,30 @@ type server struct {
 	adminSessions       sync.Map
 	botMu               sync.Mutex
 	apkPublishMu        sync.Mutex
+	apkShipOnce         sync.Once
+	apkShipSem          chan struct{}
+	apkArtifactMu       sync.Mutex
+	apkArtifact         *updateArtifact
+	apkArtifactSeq      int64
+	clientBundleMu      sync.Mutex
+	clientBundleCache   map[string]clientBundleCacheEntry
+	updateKeyMu         sync.Mutex
+	updateKeyCache      *updateKeyCacheEntry
+	signerPubMu         sync.Mutex
+	signerPub           string
 	egressProbeMu       sync.Mutex
 	egressProbeValue    string
 	egressProbeAt       time.Time
+	egressProbeFetching bool
 	authApprover        authApprover
 	bot                 *telegramBot
 	botCancel           context.CancelFunc
 	botFactory          telegramClientFactory
+	// botRestartMu serializes whole bot restarts so two concurrent restarts
+	// cannot both start a poller (Telegram answers the second with 409).
+	botRestartMu sync.Mutex
+	// rootCtx is cancelled on shutdown; long-lived goroutines derive from it.
+	rootCtx context.Context
 }
 
 const (
@@ -138,8 +155,9 @@ func runMain() error {
 		if len(os.Args) < 3 {
 			return errors.New("revoke-device requires device id")
 		}
-		if err := adminPost(cfg, "/admin/v1/revoke-device", map[string]string{"id": os.Args[2]}, os.Stdout); err == nil {
-			return nil
+		if err := adminPost(cfg, "/admin/v1/revoke-device", map[string]string{"id": os.Args[2]}, os.Stdout); !errors.Is(err, errAdminServerUnreachable) {
+			// Reached the server: report its answer instead of bypassing it.
+			return err
 		}
 		st, err := openOrchStore(cfg)
 		if err != nil {
@@ -151,8 +169,9 @@ func runMain() error {
 		if len(os.Args) < 3 {
 			return errors.New("approve-worker requires worker id")
 		}
-		if err := adminPost(cfg, "/admin/v1/approve-worker", map[string]string{"id": os.Args[2]}, os.Stdout); err == nil {
-			return nil
+		if err := adminPost(cfg, "/admin/v1/approve-worker", map[string]string{"id": os.Args[2]}, os.Stdout); !errors.Is(err, errAdminServerUnreachable) {
+			// Reached the server: report its answer instead of bypassing it.
+			return err
 		}
 		st, err := openOrchStore(cfg)
 		if err != nil {
