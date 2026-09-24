@@ -3,6 +3,7 @@ package main
 import (
 	"crypto/sha256"
 	"encoding/binary"
+	"math"
 	"net/http"
 	"slices"
 	"strconv"
@@ -95,8 +96,18 @@ func rateMbpsFromLimit(rate string) (float64, bool) {
 	return 0, false
 }
 
-// deviceLimitsPayload is the limits object sent to workers: the stored
-// limits plus rate_mbps derived from the rate text for per-device shaping.
+// maxWorkerRateMbps is the largest per-device shaping rate a worker accepts.
+const maxWorkerRateMbps = 100000
+
+// workerRateMbps rounds a rate up to whole Mbit/s for the worker, which treats
+// 0 as unlimited, so sub-megabit limits become 1 rather than disappearing.
+func workerRateMbps(mbps float64) int {
+	return int(min(max(math.Ceil(mbps), 1), maxWorkerRateMbps))
+}
+
+// deviceLimitsPayload is the limits object sent to workers: the stored limits
+// plus download_mbps/upload_mbps (whole Mbit/s) derived from the rate text for
+// per-device AWG shaping.
 func deviceLimitsPayload(limits deviceLimits) map[string]any {
 	out := map[string]any{}
 	if limits.TrafficQuotaBytes > 0 {
@@ -105,7 +116,8 @@ func deviceLimitsPayload(limits deviceLimits) map[string]any {
 	if limits.RateLimit != "" {
 		out["rate_limit"] = limits.RateLimit
 		if mbps, ok := rateMbpsFromLimit(limits.RateLimit); ok {
-			out["rate_mbps"] = map[string]float64{"upload": mbps, "download": mbps}
+			out["download_mbps"] = workerRateMbps(mbps)
+			out["upload_mbps"] = workerRateMbps(mbps)
 		}
 	}
 	if limits.ExpiresAt != nil {
@@ -230,4 +242,28 @@ func realityFallbackRoutes(rec workerRecord, primary map[string]any, expected, c
 		out = append(out, route)
 	}
 	return out
+}
+
+// inheritAWGWorkerFields copies worker-wide AWG fields (IPv6 endpoint, tunnel
+// DNS) that dialect profiles do not repeat into a profile-based route.
+func inheritAWGWorkerFields(route map[string]any, raw any) {
+	awg, ok := raw.(map[string]any)
+	if !ok {
+		return
+	}
+	params, _ := route["params"].(map[string]any)
+	for _, key := range []string{"endpoint_v6", "dns"} {
+		value, ok := awg[key]
+		if !ok {
+			continue
+		}
+		if _, exists := route[key]; !exists {
+			route[key] = value
+		}
+		if params != nil {
+			if _, exists := params[key]; !exists {
+				params[key] = value
+			}
+		}
+	}
 }

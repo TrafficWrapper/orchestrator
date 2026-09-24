@@ -115,9 +115,27 @@ func TestRateMbpsDerivedFromRateLimit(t *testing.T) {
 		t.Fatal("unparseable rate must be skipped")
 	}
 	payload := deviceLimitsPayload(deviceLimits{RateLimit: "20mbit", TrafficQuotaBytes: 5})
-	rate, ok := payload["rate_mbps"].(map[string]float64)
-	if !ok || rate["upload"] != 20 || rate["download"] != 20 || payload["traffic_quota_bytes"] != uint64(5) {
+	if payload["download_mbps"] != 20 || payload["upload_mbps"] != 20 || payload["traffic_quota_bytes"] != uint64(5) {
 		t.Fatalf("limits payload=%v", payload)
+	}
+	// Sub-megabit limits must not round to 0, which the worker treats as unlimited.
+	if got := deviceLimitsPayload(deviceLimits{RateLimit: "512kbit"})["download_mbps"]; got != 1 {
+		t.Fatalf("512kbit -> %v, want 1", got)
+	}
+	if got := workerRateMbps(1e9); got != maxWorkerRateMbps {
+		t.Fatalf("clamp -> %d", got)
+	}
+}
+
+func TestAWGProfileRouteInheritsWorkerIPv6AndDNS(t *testing.T) {
+	route := map[string]any{"params": map[string]any{}}
+	inheritAWGWorkerFields(route, map[string]any{"endpoint_v6": "[2001:db8::1]:51888", "dns": []any{"10.13.13.1"}})
+	params := route["params"].(map[string]any)
+	if route["endpoint_v6"] != "[2001:db8::1]:51888" || params["endpoint_v6"] != "[2001:db8::1]:51888" {
+		t.Fatalf("endpoint_v6 not inherited: %v", route)
+	}
+	if dns, _ := params["dns"].([]any); len(dns) != 1 {
+		t.Fatalf("dns not inherited: %v", route)
 	}
 }
 

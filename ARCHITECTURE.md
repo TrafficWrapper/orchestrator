@@ -125,8 +125,10 @@ policy; AWG remains a fallback path when REALITY is unhealthy.
   before the old one is removed.
 - **Health and limits.** Ack `self_check` (`ok` / `degraded: ...`) and
   self-describe `health` are shown in the admin UI/API; the Telegram bot alerts
-  on degraded workers. Device limits sent to workers include `rate_mbps
-  {upload, download}` derived from the rate limit text (`20mbit`, `1gbit`).
+  on degraded workers. Device limits sent to workers include
+  `download_mbps`/`upload_mbps` (whole Mbit/s, rounded up, max 100000; the
+  worker shapes AWG only) derived from the rate limit text (`20mbit`, `1gbit`).
+  AWG profile routes inherit the worker's `endpoint_v6` and tunnel `dns`.
 
 ## Distributor and Updates
 
