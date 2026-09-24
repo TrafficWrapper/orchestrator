@@ -3,6 +3,7 @@ package main
 import (
 	"crypto/aes"
 	"crypto/cipher"
+	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
@@ -40,6 +41,7 @@ var (
 type orchStore struct {
 	db                      *bolt.DB
 	aead                    cipher.AEAD
+	tokenLookupKey          []byte
 	discoveryWorkerRevision atomic.Uint64
 }
 
@@ -54,6 +56,9 @@ type tokenRecord struct {
 	Limits          json.RawMessage `json:"limits,omitempty"`
 	SeedWorkers     []string        `json:"seed_workers,omitempty"`
 	WorkerStaticPub string          `json:"worker_static_pub,omitempty"`
+	// Lookup is a keyed HMAC of the secret used to find the record without
+	// running PBKDF2 against every stored token. Legacy records lack it.
+	Lookup string `json:"lookup,omitempty"`
 }
 
 type workerRecord struct {
@@ -198,7 +203,7 @@ func openOrchStore(cfg orchConfig) (*orchStore, error) {
 	if err != nil {
 		return nil, err
 	}
-	s := &orchStore{db: db, aead: aead}
+	s := &orchStore{db: db, aead: aead, tokenLookupKey: deriveTokenLookupKey(key)}
 	err = db.Update(func(tx *bolt.Tx) error {
 		for _, b := range [][]byte{bucketWorkers, bucketTokens, bucketDevices, bucketTelemetry, bucketMeta} {
 			if _, err := tx.CreateBucketIfNotExists(b); err != nil {
@@ -581,6 +586,7 @@ func (s *orchStore) createToken(id, secret string, ttl time.Duration, maxUses in
 	rec := tokenRecord{
 		ID:              strings.TrimSpace(id),
 		Hash:            hash,
+		Lookup:          s.tokenLookup(secret),
 		ExpiresAt:       time.Now().UTC().Add(ttl),
 		MaxUses:         maxUses,
 		CreatedAt:       time.Now().UTC(),
@@ -603,6 +609,7 @@ func (s *orchStore) createBootstrapToken(secret string, expiresAt time.Time, lim
 	rec := tokenRecord{
 		ID:          randID(),
 		Hash:        hash,
+		Lookup:      s.tokenLookup(secret),
 		Kind:        "bootstrap",
 		ExpiresAt:   expiresAt.UTC(),
 		MaxUses:     1,
@@ -738,49 +745,78 @@ func (s *orchStore) consumeBootstrapToken(secret string, device deviceRecord, pr
 }
 
 func (s *orchStore) findTokenID(secret, workerStaticPub string, now time.Time) (string, error) {
-	var matched string
-	err := s.db.View(func(tx *bolt.Tx) error {
-		return tx.Bucket(bucketTokens).ForEach(func(k, v []byte) error {
-			if matched != "" {
-				return nil
-			}
-			var rec tokenRecord
-			if err := json.Unmarshal(v, &rec); err != nil {
-				return err
-			}
-			if !tokenRecordConsumable(rec, now, workerStaticPub) {
-				return nil
-			}
-			if protocol.VerifySecret(rec.Hash, secret) {
-				matched = string(k)
-			}
-			return nil
-		})
+	return s.findTokenIDMatching(secret, func(rec tokenRecord) bool {
+		return tokenRecordConsumable(rec, now, workerStaticPub)
 	})
-	return matched, err
 }
 
 func (s *orchStore) findBootstrapTokenID(secret string, now time.Time) (string, error) {
-	var matched string
+	return s.findTokenIDMatching(secret, func(rec tokenRecord) bool {
+		return rec.Kind == "bootstrap" && now.Before(rec.ExpiresAt) && rec.Uses < rec.MaxUses
+	})
+}
+
+// findTokenIDMatching locates a usable token by its keyed lookup HMAC inside a
+// short read transaction and runs the expensive PBKDF2 verification outside
+// it, so unauthenticated guesses cost one hash instead of one per token and
+// never hold a bbolt read transaction open.
+func (s *orchStore) findTokenIDMatching(secret string, usable func(tokenRecord) bool) (string, error) {
+	if secret == "" {
+		return "", nil
+	}
+	lookup := s.tokenLookup(secret)
+	var exact *tokenRecord
+	var legacy []tokenRecord
 	err := s.db.View(func(tx *bolt.Tx) error {
 		return tx.Bucket(bucketTokens).ForEach(func(k, v []byte) error {
-			if matched != "" {
+			if exact != nil {
 				return nil
 			}
 			var rec tokenRecord
 			if err := json.Unmarshal(v, &rec); err != nil {
 				return err
 			}
-			if rec.Kind != "bootstrap" || !now.Before(rec.ExpiresAt) || rec.Uses >= rec.MaxUses {
+			if !usable(rec) {
 				return nil
 			}
-			if protocol.VerifySecret(rec.Hash, secret) {
-				matched = string(k)
+			rec.ID = string(k)
+			if rec.Lookup == "" {
+				legacy = append(legacy, rec)
+				return nil
+			}
+			if hmac.Equal([]byte(rec.Lookup), []byte(lookup)) {
+				exact = &rec
 			}
 			return nil
 		})
 	})
-	return matched, err
+	if err != nil {
+		return "", err
+	}
+	if exact != nil {
+		if protocol.VerifySecret(exact.Hash, secret) {
+			return exact.ID, nil
+		}
+		return "", nil
+	}
+	for _, rec := range legacy {
+		if protocol.VerifySecret(rec.Hash, secret) {
+			return rec.ID, nil
+		}
+	}
+	return "", nil
+}
+
+func deriveTokenLookupKey(masterKey []byte) []byte {
+	mac := hmac.New(sha256.New, masterKey)
+	mac.Write([]byte("TrafficWrapper token lookup v1"))
+	return mac.Sum(nil)
+}
+
+func (s *orchStore) tokenLookup(secret string) string {
+	mac := hmac.New(sha256.New, s.tokenLookupKey)
+	mac.Write([]byte(secret))
+	return hex.EncodeToString(mac.Sum(nil))
 }
 
 func tokenRecordConsumable(rec tokenRecord, now time.Time, workerStaticPub string) bool {
