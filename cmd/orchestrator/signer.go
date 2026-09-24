@@ -10,9 +10,15 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"aead.dev/minisign"
 )
+
+const signerDialTimeout = 2 * time.Second
+
+// signerCallTimeout bounds one signer round trip (a var so tests can shorten it).
+var signerCallTimeout = 10 * time.Second
 
 type signerRequest struct {
 	Action  string `json:"action"`
@@ -152,6 +158,7 @@ func writeFileAtomic(path string, data []byte, perm os.FileMode) error {
 
 func handleSignerConn(c net.Conn, pub minisign.PublicKey, priv minisign.PrivateKey) {
 	defer c.Close()
+	_ = c.SetDeadline(time.Now().Add(signerCallTimeout))
 	var req signerRequest
 	resp := signerResponse{OK: true}
 	if err := json.NewDecoder(c).Decode(&req); err != nil {
@@ -233,11 +240,13 @@ func (c signerClient) sign(message string) (signedConfig, error) {
 }
 
 func (c signerClient) call(req signerRequest) (signerResponse, error) {
-	conn, err := net.Dial("unix", c.socket)
+	conn, err := net.DialTimeout("unix", c.socket, signerDialTimeout)
 	if err != nil {
 		return signerResponse{}, err
 	}
 	defer conn.Close()
+	// A hung signer must not wedge every pull, enroll and discovery request.
+	_ = conn.SetDeadline(time.Now().Add(signerCallTimeout))
 	if err := json.NewEncoder(conn).Encode(req); err != nil {
 		return signerResponse{}, err
 	}

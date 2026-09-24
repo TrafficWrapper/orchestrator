@@ -1,9 +1,11 @@
 package main
 
 import (
+	"net"
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 func TestMigrateLegacySignerKeyMovesKey(t *testing.T) {
@@ -46,5 +48,32 @@ func TestMigrateLegacySignerKeyRefusesConflict(t *testing.T) {
 	}
 	if _, err := os.Stat(legacy); err != nil {
 		t.Fatal("legacy key must be kept on conflict")
+	}
+}
+
+func TestSignerClientTimesOutOnHungSigner(t *testing.T) {
+	old := signerCallTimeout
+	signerCallTimeout = 300 * time.Millisecond
+	t.Cleanup(func() { signerCallTimeout = old })
+	sock := filepath.Join(t.TempDir(), "s.sock")
+	l, err := net.Listen("unix", sock)
+	if err != nil {
+		t.Skipf("unix sockets unavailable: %v", err)
+	}
+	defer l.Close()
+	go func() {
+		c, err := l.Accept()
+		if err == nil {
+			defer c.Close()
+			time.Sleep(3 * time.Second)
+		}
+	}()
+	start := time.Now()
+	_, err = signerClient{socket: sock}.publicKey()
+	if err == nil {
+		t.Fatal("expected timeout error")
+	}
+	if elapsed := time.Since(start); elapsed > 2*time.Second {
+		t.Fatalf("call hung for %s", elapsed)
 	}
 }
