@@ -16,6 +16,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -36,6 +37,9 @@ var (
 	metaBotSettings = []byte("bot_settings")
 	metaBotProblems = []byte("bot_problem_state")
 	metaAdminTOTP   = []byte("admin_totp")
+	// metaSealedFormat records that every sealed record uses the bound v2
+	// format; from then on legacy (unbound) ciphertexts are rejected.
+	metaSealedFormat = []byte("sealed_format")
 )
 
 type orchStore struct {
@@ -43,6 +47,16 @@ type orchStore struct {
 	aead                    cipher.AEAD
 	tokenLookupKey          []byte
 	discoveryWorkerRevision atomic.Uint64
+	// rejectLegacySealed is set once migration has bound every record, so an
+	// old unbound ciphertext (e.g. from a backup) cannot be planted under
+	// another key.
+	rejectLegacySealed atomic.Bool
+
+	// approvedCache holds decrypted approved devices for the committed DB
+	// state identified by approvedCacheTx (see approvedDevices).
+	approvedCacheMu sync.Mutex
+	approvedCacheTx int
+	approvedCache   []deviceRecord
 }
 
 type tokenRecord struct {
@@ -225,6 +239,14 @@ func openOrchStore(cfg orchConfig) (*orchStore, error) {
 		_ = db.Close()
 		return nil, err
 	}
+	migrated, err := s.migrateSealedRecords()
+	if err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("migrate sealed records: %w", err)
+	}
+	if migrated > 0 {
+		log.Printf("store: bound %d legacy sealed records to their keys", migrated)
+	}
 	return s, nil
 }
 
@@ -340,7 +362,7 @@ func (s *orchStore) setAdminPasswordWithMustChange(secret string, mustChange boo
 		return err
 	}
 	rec := adminSecretRecord{Hash: hash, UpdatedAt: time.Now().UTC(), MustChange: mustChange}
-	sealed, err := s.sealJSON(rec)
+	sealed, err := s.sealJSON(bucketMeta, metaAdminSecret, rec)
 	if err != nil {
 		return err
 	}
@@ -384,7 +406,7 @@ func (s *orchStore) verifyAdminPassword(secret string) (bool, bool, error) {
 		if raw == nil {
 			return errors.New("admin password is not configured")
 		}
-		return s.openJSON(raw, &rec)
+		return s.openJSON(bucketMeta, metaAdminSecret, raw, &rec)
 	})
 	if err != nil {
 		return false, false, err
@@ -400,7 +422,7 @@ func (s *orchStore) adminTOTP() (adminTOTPRecord, bool, error) {
 		if raw == nil {
 			return nil
 		}
-		return s.openJSON(raw, &rec)
+		return s.openJSON(bucketMeta, metaAdminTOTP, raw, &rec)
 	})
 	if err != nil {
 		return adminTOTPRecord{}, false, err
@@ -420,7 +442,7 @@ func (s *orchStore) startAdminTOTPEnrollment() (adminTOTPRecord, error) {
 	err = s.db.Update(func(tx *bolt.Tx) error {
 		var rec adminTOTPRecord
 		if raw := tx.Bucket(bucketMeta).Get(metaAdminTOTP); raw != nil {
-			if err := s.openJSON(raw, &rec); err != nil {
+			if err := s.openJSON(bucketMeta, metaAdminTOTP, raw, &rec); err != nil {
 				return err
 			}
 		}
@@ -433,7 +455,7 @@ func (s *orchStore) startAdminTOTPEnrollment() (adminTOTPRecord, error) {
 			rec = adminTOTPRecord{Secret: secret, Enabled: false, UpdatedAt: now}
 			out = rec
 		}
-		sealed, err := s.sealJSON(rec)
+		sealed, err := s.sealJSON(bucketMeta, metaAdminTOTP, rec)
 		if err != nil {
 			return err
 		}
@@ -449,7 +471,7 @@ func (s *orchStore) enableAdminTOTP(code string, now time.Time) error {
 		if raw == nil {
 			return errors.New("totp enrollment is not started")
 		}
-		if err := s.openJSON(raw, &rec); err != nil {
+		if err := s.openJSON(bucketMeta, metaAdminTOTP, raw, &rec); err != nil {
 			return err
 		}
 		secret := rec.Secret
@@ -469,7 +491,7 @@ func (s *orchStore) enableAdminTOTP(code string, now time.Time) error {
 		rec.Enabled = true
 		rec.LastCounter = counter
 		rec.UpdatedAt = now.UTC()
-		sealed, err := s.sealJSON(rec)
+		sealed, err := s.sealJSON(bucketMeta, metaAdminTOTP, rec)
 		if err != nil {
 			return err
 		}
@@ -492,7 +514,7 @@ func (s *orchStore) verifyAdminTOTP(code string, now time.Time) (bool, bool, err
 		if raw == nil {
 			return nil
 		}
-		if err := s.openJSON(raw, &rec); err != nil {
+		if err := s.openJSON(bucketMeta, metaAdminTOTP, raw, &rec); err != nil {
 			return err
 		}
 		if strings.TrimSpace(rec.Secret) == "" || !rec.Enabled {
@@ -505,7 +527,7 @@ func (s *orchStore) verifyAdminTOTP(code string, now time.Time) (bool, bool, err
 		}
 		rec.LastCounter = counter
 		rec.UpdatedAt = now.UTC()
-		sealed, err := s.sealJSON(rec)
+		sealed, err := s.sealJSON(bucketMeta, metaAdminTOTP, rec)
 		if err != nil {
 			return err
 		}
@@ -527,7 +549,7 @@ func (s *orchStore) setBotSettings(token string, ownerID int64) error {
 		return errors.New("owner telegram id is required")
 	}
 	rec := botSettingsRecord{Token: token, OwnerID: ownerID, UpdatedAt: time.Now().UTC()}
-	sealed, err := s.sealJSON(rec)
+	sealed, err := s.sealJSON(bucketMeta, metaBotSettings, rec)
 	if err != nil {
 		return err
 	}
@@ -543,7 +565,7 @@ func (s *orchStore) botSettings() (botSettingsRecord, bool, error) {
 		if raw == nil {
 			return nil
 		}
-		return s.openJSON(raw, &rec)
+		return s.openJSON(bucketMeta, metaBotSettings, raw, &rec)
 	})
 	if err != nil {
 		return botSettingsRecord{}, false, err
@@ -561,7 +583,7 @@ func (s *orchStore) getBotProblemState() (botProblemState, bool, error) {
 		if raw == nil {
 			return nil
 		}
-		return s.openJSON(raw, &rec)
+		return s.openJSON(bucketMeta, metaBotProblems, raw, &rec)
 	})
 	if err != nil {
 		return botProblemState{}, false, err
@@ -575,7 +597,7 @@ func (s *orchStore) getBotProblemState() (botProblemState, bool, error) {
 func (s *orchStore) putBotProblemState(rec botProblemState) error {
 	rec.Version = 1
 	rec.UpdatedAt = rec.UpdatedAt.UTC()
-	sealed, err := s.sealJSON(rec)
+	sealed, err := s.sealJSON(bucketMeta, metaBotProblems, rec)
 	if err != nil {
 		return err
 	}
@@ -759,7 +781,7 @@ func (s *orchStore) consumeBootstrapToken(secret string, device deviceRecord, pr
 		if err := s.ensureDeviceAWGProfilesTx(tx, &device, profiles, device.AWGPublicKey); err != nil {
 			return err
 		}
-		sealed, err := s.sealJSON(device)
+		sealed, err := s.sealJSON(bucketDevices, []byte(device.ID), device)
 		if err != nil {
 			return err
 		}
@@ -906,7 +928,7 @@ func (s *orchStore) ensureDeviceAWGProfiles(id string, profiles []awgProfile, aw
 			return errors.New("device not found")
 		}
 		var rec deviceRecord
-		if err := s.openJSON(raw, &rec); err != nil {
+		if err := s.openJSON(bucketDevices, []byte(id), raw, &rec); err != nil {
 			return err
 		}
 		before, _ := json.Marshal(rec.AWGProfiles)
@@ -918,7 +940,7 @@ func (s *orchStore) ensureDeviceAWGProfiles(id string, profiles []awgProfile, aw
 			out = rec
 			return nil
 		}
-		sealed, err := s.sealJSON(rec)
+		sealed, err := s.sealJSON(bucketDevices, []byte(rec.ID), rec)
 		if err != nil {
 			return err
 		}
@@ -1012,9 +1034,9 @@ func baseAWGSubnet(profiles []awgProfile) string {
 func (s *orchStore) devices() ([]deviceRecord, error) {
 	var out []deviceRecord
 	err := s.db.View(func(tx *bolt.Tx) error {
-		return tx.Bucket(bucketDevices).ForEach(func(_, raw []byte) error {
+		return tx.Bucket(bucketDevices).ForEach(func(k, raw []byte) error {
 			var rec deviceRecord
-			if err := s.openJSON(raw, &rec); err != nil {
+			if err := s.openJSON(bucketDevices, k, raw, &rec); err != nil {
 				return err
 			}
 			out = append(out, rec)
@@ -1031,7 +1053,7 @@ func (s *orchStore) device(id string) (deviceRecord, error) {
 		if raw == nil {
 			return errors.New("device not found")
 		}
-		return s.openJSON(raw, &rec)
+		return s.openJSON(bucketDevices, []byte(strings.TrimSpace(id)), raw, &rec)
 	})
 	return rec, err
 }
@@ -1048,14 +1070,14 @@ func (s *orchStore) setDeviceLimits(id string, limits deviceLimits) error {
 			return errors.New("device not found")
 		}
 		var rec deviceRecord
-		if err := s.openJSON(raw, &rec); err != nil {
+		if err := s.openJSON(bucketDevices, []byte(id), raw, &rec); err != nil {
 			return err
 		}
 		applyDeviceLimitsChange(&rec, limits, time.Now().UTC())
 		if rec.ConfigSeq < 1 {
 			rec.ConfigSeq = 1
 		}
-		sealed, err := s.sealJSON(rec)
+		sealed, err := s.sealJSON(bucketDevices, []byte(rec.ID), rec)
 		if err != nil {
 			return err
 		}
@@ -1073,7 +1095,7 @@ func (s *orchStore) setTelemetrySnapshot(rec telemetrySnapshotRecord) error {
 	if rec.ReceivedAt.IsZero() {
 		rec.ReceivedAt = time.Now().UTC()
 	}
-	sealed, err := s.sealJSON(rec)
+	sealed, err := s.sealJSON(bucketTelemetry, []byte(rec.DeviceID), rec)
 	if err != nil {
 		return err
 	}
@@ -1099,7 +1121,7 @@ func (s *orchStore) updateDeviceClientVersionFromTelemetry(id, version string) (
 			return errors.New("device not found")
 		}
 		var rec deviceRecord
-		if err := s.openJSON(raw, &rec); err != nil {
+		if err := s.openJSON(bucketDevices, []byte(id), raw, &rec); err != nil {
 			return err
 		}
 		if strings.TrimSpace(rec.ClientVersion) == version {
@@ -1109,7 +1131,7 @@ func (s *orchStore) updateDeviceClientVersionFromTelemetry(id, version string) (
 			return nil
 		}
 		rec.ClientVersion = version
-		sealed, err := s.sealJSON(rec)
+		sealed, err := s.sealJSON(bucketDevices, []byte(rec.ID), rec)
 		if err != nil {
 			return err
 		}
@@ -1287,7 +1309,7 @@ func (s *orchStore) sweepDeviceUsageTx(tx *bolt.Tx, workerID string, grouped dev
 			return nil
 		}
 		var rec deviceRecord
-		if err := s.openJSON(raw, &rec); err != nil {
+		if err := s.openJSON(bucketDevices, k, raw, &rec); err != nil {
 			return err
 		}
 		changed, newlyBlocked := applyUsageToDevice(&rec, workerID, grouped, now)
@@ -1303,7 +1325,7 @@ func (s *orchStore) sweepDeviceUsageTx(tx *bolt.Tx, workerID string, grouped dev
 		return 0, err
 	}
 	for _, p := range puts {
-		sealed, err := s.sealJSON(p.rec)
+		sealed, err := s.sealJSON(bucketDevices, p.key, p.rec)
 		if err != nil {
 			return 0, err
 		}
@@ -1340,7 +1362,7 @@ func (s *orchStore) applyReportedDeviceUsage(workerID string, reports []deviceUs
 				continue
 			}
 			var rec deviceRecord
-			if err := s.openJSON(raw, &rec); err != nil {
+			if err := s.openJSON(bucketDevices, []byte(id), raw, &rec); err != nil {
 				return err
 			}
 			resolved[id] = true
@@ -1352,7 +1374,7 @@ func (s *orchStore) applyReportedDeviceUsage(workerID string, reports []deviceUs
 				blocked++
 			}
 			if changed {
-				sealed, err := s.sealJSON(rec)
+				sealed, err := s.sealJSON(bucketDevices, []byte(id), rec)
 				if err != nil {
 					return err
 				}
@@ -1485,7 +1507,7 @@ func (s *orchStore) telemetrySnapshots() (map[string]telemetrySnapshotRecord, er
 	err := s.db.View(func(tx *bolt.Tx) error {
 		return tx.Bucket(bucketTelemetry).ForEach(func(k, raw []byte) error {
 			var rec telemetrySnapshotRecord
-			if err := s.openJSON(raw, &rec); err != nil {
+			if err := s.openJSON(bucketTelemetry, k, raw, &rec); err != nil {
 				return err
 			}
 			out[string(k)] = rec
@@ -1495,21 +1517,49 @@ func (s *orchStore) telemetrySnapshots() (map[string]telemetrySnapshotRecord, er
 	return out, err
 }
 
+// approvedDevices returns approved, fully provisioned devices. Every worker
+// pull needs this list, and after a seq bump all workers pull at once, so the
+// decrypted result is cached per committed DB state: a read transaction's ID
+// is the ID of the last committed write, and the list is built inside that
+// same transaction, so a cache hit can never return data older than the DB.
+// Callers must treat the returned records as read-only.
 func (s *orchStore) approvedDevices() ([]deviceRecord, error) {
-	devices, err := s.devices()
-	if err != nil {
-		return nil, err
-	}
-	out := make([]deviceRecord, 0, len(devices))
-	for _, device := range devices {
-		if device.Status == "approved" &&
-			strings.TrimSpace(device.RealityUUID) != "" &&
-			strings.TrimSpace(device.AWGPublicKey) != "" &&
-			strings.TrimSpace(device.InternalIP) != "" {
-			out = append(out, device)
+	var out []deviceRecord
+	err := s.db.View(func(tx *bolt.Tx) error {
+		rev := tx.ID()
+		s.approvedCacheMu.Lock()
+		if s.approvedCache != nil && s.approvedCacheTx == rev {
+			out = append([]deviceRecord(nil), s.approvedCache...)
+			s.approvedCacheMu.Unlock()
+			return nil
 		}
-	}
-	return out, nil
+		s.approvedCacheMu.Unlock()
+		fresh := []deviceRecord{}
+		if err := tx.Bucket(bucketDevices).ForEach(func(k, raw []byte) error {
+			var device deviceRecord
+			if err := s.openJSON(bucketDevices, k, raw, &device); err != nil {
+				return err
+			}
+			if device.Status == "approved" &&
+				strings.TrimSpace(device.RealityUUID) != "" &&
+				strings.TrimSpace(device.AWGPublicKey) != "" &&
+				strings.TrimSpace(device.InternalIP) != "" {
+				fresh = append(fresh, device)
+			}
+			return nil
+		}); err != nil {
+			return err
+		}
+		s.approvedCacheMu.Lock()
+		if rev >= s.approvedCacheTx {
+			s.approvedCacheTx = rev
+			s.approvedCache = fresh
+		}
+		s.approvedCacheMu.Unlock()
+		out = append([]deviceRecord(nil), fresh...)
+		return nil
+	})
+	return out, err
 }
 
 func (s *orchStore) revokeDevice(id string) error {
@@ -1520,7 +1570,7 @@ func (s *orchStore) revokeDevice(id string) error {
 			return errors.New("device not found")
 		}
 		var rec deviceRecord
-		if err := s.openJSON(raw, &rec); err != nil {
+		if err := s.openJSON(bucketDevices, []byte(strings.TrimSpace(id)), raw, &rec); err != nil {
 			return err
 		}
 		rec.Status = "revoked"
@@ -1529,7 +1579,7 @@ func (s *orchStore) revokeDevice(id string) error {
 		rec.BlockedReason = "manual"
 		now := time.Now().UTC()
 		rec.BlockedAt = &now
-		sealed, err := s.sealJSON(rec)
+		sealed, err := s.sealJSON(bucketDevices, []byte(rec.ID), rec)
 		if err != nil {
 			return err
 		}
@@ -1557,11 +1607,11 @@ func (s *orchStore) setDeviceAlias(id, alias string) (deviceRecord, error) {
 			return errors.New("device not found")
 		}
 		var rec deviceRecord
-		if err := s.openJSON(raw, &rec); err != nil {
+		if err := s.openJSON(bucketDevices, []byte(id), raw, &rec); err != nil {
 			return err
 		}
 		rec.Alias = alias
-		sealed, err := s.sealJSON(rec)
+		sealed, err := s.sealJSON(bucketDevices, []byte(rec.ID), rec)
 		if err != nil {
 			return err
 		}
@@ -1606,7 +1656,7 @@ func (s *orchStore) deleteDevice(id string) error {
 			return errors.New("device not found")
 		}
 		var rec deviceRecord
-		if err := s.openJSON(raw, &rec); err != nil {
+		if err := s.openJSON(bucketDevices, []byte(id), raw, &rec); err != nil {
 			return err
 		}
 		needsRevoke := rec.Status != "revoked"
@@ -1631,7 +1681,7 @@ func (s *orchStore) upsertPendingWorker(staticPub string, self map[string]any) (
 		b := tx.Bucket(bucketWorkers)
 		var before [sha256.Size]byte
 		if raw := b.Get([]byte(id)); raw != nil {
-			if err := s.openJSON(raw, &rec); err != nil {
+			if err := s.openJSON(bucketWorkers, []byte(id), raw, &rec); err != nil {
 				return err
 			}
 			before = workerDiscoveryFingerprint(rec, time.Now().UTC())
@@ -1645,7 +1695,7 @@ func (s *orchStore) upsertPendingWorker(staticPub string, self map[string]any) (
 				CreatedAt:       time.Now().UTC(),
 			}
 		}
-		sealed, err := s.sealJSON(rec)
+		sealed, err := s.sealJSON(bucketWorkers, []byte(id), rec)
 		if err != nil {
 			return err
 		}
@@ -1689,7 +1739,7 @@ func (s *orchStore) updateWorkerPolicy(id string, patch workerPolicyPatch) error
 			return errors.New("worker not found")
 		}
 		var rec workerRecord
-		if err := s.openJSON(raw, &rec); err != nil {
+		if err := s.openJSON(bucketWorkers, []byte(strings.TrimSpace(id)), raw, &rec); err != nil {
 			return err
 		}
 		before := workerDiscoveryFingerprint(rec, time.Now().UTC())
@@ -1726,7 +1776,7 @@ func (s *orchStore) updateWorkerPolicy(id string, patch workerPolicyPatch) error
 				}
 			}
 		}
-		sealed, err := s.sealJSON(rec)
+		sealed, err := s.sealJSON(bucketWorkers, []byte(rec.ID), rec)
 		if err != nil {
 			return err
 		}
@@ -1801,7 +1851,7 @@ func (s *orchStore) worker(id string) (workerRecord, error) {
 		if raw == nil {
 			return errors.New("worker not found")
 		}
-		return s.openJSON(raw, &rec)
+		return s.openJSON(bucketWorkers, []byte(id), raw, &rec)
 	})
 	return rec, err
 }
@@ -1809,9 +1859,9 @@ func (s *orchStore) worker(id string) (workerRecord, error) {
 func (s *orchStore) workers() ([]workerRecord, error) {
 	var out []workerRecord
 	err := s.db.View(func(tx *bolt.Tx) error {
-		return tx.Bucket(bucketWorkers).ForEach(func(_, raw []byte) error {
+		return tx.Bucket(bucketWorkers).ForEach(func(k, raw []byte) error {
 			var rec workerRecord
-			if err := s.openJSON(raw, &rec); err != nil {
+			if err := s.openJSON(bucketWorkers, k, raw, &rec); err != nil {
 				return err
 			}
 			out = append(out, rec)
@@ -1856,9 +1906,9 @@ func (s *orchStore) updateAckWithProbe(id string, applied int64, observed string
 func (s *orchStore) markStaleWorkersInactive(cutoff time.Time) (int, error) {
 	updated := 0
 	err := s.db.Update(func(tx *bolt.Tx) error {
-		return rewriteBucket(tx.Bucket(bucketWorkers), func(_, raw []byte) ([]byte, error) {
+		return rewriteBucket(tx.Bucket(bucketWorkers), func(k, raw []byte) ([]byte, error) {
 			var rec workerRecord
-			if err := s.openJSON(raw, &rec); err != nil {
+			if err := s.openJSON(bucketWorkers, k, raw, &rec); err != nil {
 				return nil, err
 			}
 			if rec.Status != "approved" && rec.Status != "active" {
@@ -1876,7 +1926,7 @@ func (s *orchStore) markStaleWorkersInactive(cutoff time.Time) (int, error) {
 			}
 			rec.Status = "inactive"
 			updated++
-			return s.sealJSON(rec)
+			return s.sealJSON(bucketWorkers, k, rec)
 		})
 	})
 	if err == nil && updated > 0 {
@@ -1959,14 +2009,14 @@ func (s *orchStore) updateWorker(id string, fn func(*workerRecord) error) error 
 			return errors.New("worker not found")
 		}
 		var rec workerRecord
-		if err := s.openJSON(raw, &rec); err != nil {
+		if err := s.openJSON(bucketWorkers, []byte(id), raw, &rec); err != nil {
 			return err
 		}
 		before := workerDiscoveryFingerprint(rec, time.Now().UTC())
 		if err := fn(&rec); err != nil {
 			return err
 		}
-		sealed, err := s.sealJSON(rec)
+		sealed, err := s.sealJSON(bucketWorkers, []byte(id), rec)
 		if err != nil {
 			return err
 		}
@@ -2033,9 +2083,9 @@ func rewriteBucket(b *bolt.Bucket, fn func(k, v []byte) ([]byte, error)) error {
 }
 
 func (s *orchStore) bumpWorkerSeqsTx(tx *bolt.Tx) error {
-	return rewriteBucket(tx.Bucket(bucketWorkers), func(_, raw []byte) ([]byte, error) {
+	return rewriteBucket(tx.Bucket(bucketWorkers), func(k, raw []byte) ([]byte, error) {
 		var rec workerRecord
-		if err := s.openJSON(raw, &rec); err != nil {
+		if err := s.openJSON(bucketWorkers, k, raw, &rec); err != nil {
 			return nil, err
 		}
 		if rec.Status != "approved" && rec.Status != "active" {
@@ -2046,7 +2096,7 @@ func (s *orchStore) bumpWorkerSeqsTx(tx *bolt.Tx) error {
 		} else {
 			rec.DesiredSeq++
 		}
-		return s.sealJSON(rec)
+		return s.sealJSON(bucketWorkers, k, rec)
 	})
 }
 
@@ -2073,9 +2123,9 @@ func (s *orchStore) allocateDeviceIPFrom(tx *bolt.Tx, cidr string, usedIP func(d
 		used[a] = struct{}{}
 	}
 	prefix = prefix.Masked()
-	if err := tx.Bucket(bucketDevices).ForEach(func(_, raw []byte) error {
+	if err := tx.Bucket(bucketDevices).ForEach(func(k, raw []byte) error {
 		var rec deviceRecord
-		if err := s.openJSON(raw, &rec); err != nil {
+		if err := s.openJSON(bucketDevices, k, raw, &rec); err != nil {
 			return err
 		}
 		addrText := strings.TrimSuffix(strings.TrimSpace(usedIP(rec)), "/32")
@@ -2141,35 +2191,106 @@ func normalizeProtocolName(value string) string {
 	}
 }
 
-func (s *orchStore) sealJSON(v any) ([]byte, error) {
+// Sealed record format. v2 binds each ciphertext to its location by passing
+// "bucket\x00key" as AEAD associated data, so a record copied or swapped to
+// another key or bucket fails to decrypt. Legacy records (no prefix, no AD)
+// remain readable and are rewritten by migrateSealedRecords.
+const sealedRecordV2Prefix = "v2."
+
+func sealedRecordAD(bucket, key []byte) []byte {
+	ad := make([]byte, 0, len(bucket)+1+len(key))
+	ad = append(ad, bucket...)
+	ad = append(ad, 0)
+	return append(ad, key...)
+}
+
+func (s *orchStore) sealJSON(bucket, key []byte, v any) ([]byte, error) {
 	plain, err := json.Marshal(v)
 	if err != nil {
 		return nil, err
 	}
+	return s.sealBytes(bucket, key, plain)
+}
+
+func (s *orchStore) sealBytes(bucket, key, plain []byte) ([]byte, error) {
 	nonce := make([]byte, s.aead.NonceSize())
 	if _, err := rand.Read(nonce); err != nil {
 		return nil, err
 	}
-	ciphertext := s.aead.Seal(nil, nonce, plain, nil)
-	return []byte(base64.RawStdEncoding.EncodeToString(nonce) + "." + base64.RawStdEncoding.EncodeToString(ciphertext)), nil
+	ciphertext := s.aead.Seal(nil, nonce, plain, sealedRecordAD(bucket, key))
+	return []byte(sealedRecordV2Prefix + base64.RawStdEncoding.EncodeToString(nonce) + "." + base64.RawStdEncoding.EncodeToString(ciphertext)), nil
 }
 
-func (s *orchStore) openJSON(raw []byte, v any) error {
-	nonceText, ciphertextText, ok := strings.Cut(string(raw), ".")
-	if !ok {
-		return errors.New("bad sealed record")
-	}
-	nonce, err := base64.RawStdEncoding.DecodeString(nonceText)
-	if err != nil {
-		return err
-	}
-	ciphertext, err := base64.RawStdEncoding.DecodeString(ciphertextText)
-	if err != nil {
-		return err
-	}
-	plain, err := s.aead.Open(nil, nonce, ciphertext, nil)
+func (s *orchStore) openJSON(bucket, key, raw []byte, v any) error {
+	plain, err := s.openSealed(bucket, key, raw)
 	if err != nil {
 		return err
 	}
 	return json.Unmarshal(plain, v)
+}
+
+// migrateSealedRecords rewrites legacy sealed records (no associated data)
+// into the bound v2 format. Values that are not legacy ciphertexts (v2
+// records, plain JSON such as tokens or the APK release) are left untouched.
+func (s *orchStore) migrateSealedRecords() (int, error) {
+	migrated := 0
+	done := false
+	err := s.db.Update(func(tx *bolt.Tx) error {
+		// Once every record is bound, never accept (and rebind) legacy
+		// ciphertexts again: one planted from an old backup while the service
+		// was stopped would otherwise be re-sealed under the wrong key.
+		if tx.Bucket(bucketMeta).Get(metaSealedFormat) != nil {
+			done = true
+			return nil
+		}
+		for _, name := range [][]byte{bucketWorkers, bucketDevices, bucketTelemetry, bucketMeta} {
+			err := rewriteBucket(tx.Bucket(name), func(k, v []byte) ([]byte, error) {
+				if strings.HasPrefix(string(v), sealedRecordV2Prefix) {
+					return nil, nil
+				}
+				plain, err := s.openSealed(name, k, v)
+				if err != nil {
+					return nil, nil
+				}
+				migrated++
+				return s.sealBytes(name, k, plain)
+			})
+			if err != nil {
+				return err
+			}
+		}
+		return tx.Bucket(bucketMeta).Put(metaSealedFormat, []byte("2"))
+	})
+	if err == nil || done {
+		s.rejectLegacySealed.Store(true)
+	}
+	return migrated, err
+}
+
+// openSealed decrypts a v2 record bound to bucket/key, or a legacy record.
+func (s *orchStore) openSealed(bucket, key, raw []byte) ([]byte, error) {
+	text := string(raw)
+	var ad []byte
+	if rest, ok := strings.CutPrefix(text, sealedRecordV2Prefix); ok {
+		text = rest
+		ad = sealedRecordAD(bucket, key)
+	} else if s.rejectLegacySealed.Load() {
+		return nil, errors.New("unbound legacy sealed record rejected")
+	}
+	nonceText, ciphertextText, ok := strings.Cut(text, ".")
+	if !ok {
+		return nil, errors.New("bad sealed record")
+	}
+	nonce, err := base64.RawStdEncoding.DecodeString(nonceText)
+	if err != nil {
+		return nil, err
+	}
+	ciphertext, err := base64.RawStdEncoding.DecodeString(ciphertextText)
+	if err != nil {
+		return nil, err
+	}
+	if len(nonce) != s.aead.NonceSize() {
+		return nil, errors.New("bad sealed record nonce")
+	}
+	return s.aead.Open(nil, nonce, ciphertext, ad)
 }

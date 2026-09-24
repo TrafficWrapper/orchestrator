@@ -370,7 +370,7 @@ func putQuotaDevice(t *testing.T, s *server, rec deviceRecord) {
 		rec.CreatedAt = time.Now().UTC()
 	}
 	err := s.store.db.Update(func(tx *bolt.Tx) error {
-		sealed, err := s.store.sealJSON(rec)
+		sealed, err := s.store.sealJSON(bucketDevices, []byte(rec.ID), rec)
 		if err != nil {
 			return err
 		}

@@ -1540,11 +1540,11 @@ func tamperDeviceIdentityForTest(s *server, id string, identityPub string) error
 			return os.ErrNotExist
 		}
 		var rec deviceRecord
-		if err := s.store.openJSON(raw, &rec); err != nil {
+		if err := s.store.openJSON(bucketDevices, []byte(id), raw, &rec); err != nil {
 			return err
 		}
 		rec.IdentityPubKey = identityPub
-		sealed, err := s.store.sealJSON(rec)
+		sealed, err := s.store.sealJSON(bucketDevices, []byte(id), rec)
 		if err != nil {
 			return err
 		}
