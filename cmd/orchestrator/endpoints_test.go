@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -713,5 +714,38 @@ func TestDiscoveryEndpointsSkipDisabledProtocols(t *testing.T) {
 	}
 	if _, ok := discoveryAWGEndpoint(rec); !ok {
 		t.Fatal("enabled awg must stay in discovery")
+	}
+}
+
+func TestDiscoveryBuildErrorIsCachedAndNotLeaked(t *testing.T) {
+	s := newTestServer(t)
+	// No update signing key exists, so building the bundle fails.
+	rec := httptest.NewRecorder()
+	s.handleDiscoveryEndpointsJSON(rec, httptest.NewRequest(http.MethodGet, "/discovery/endpoints.json", nil))
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status=%d", rec.Code)
+	}
+	if strings.Contains(rec.Body.String(), s.cfg.StateDir) || !strings.Contains(rec.Body.String(), "discovery temporarily unavailable") {
+		t.Fatalf("internal error leaked: %q", rec.Body.String())
+	}
+	s.discoveryBuildMu.Lock()
+	cachedAt := s.discoveryBuildErrAt
+	s.discoveryBuildMu.Unlock()
+	if _, err := s.signedDiscoverySnapshot(); err == nil {
+		t.Fatal("expected cached build error")
+	}
+	s.discoveryBuildMu.Lock()
+	sameAttempt := s.discoveryBuildErrAt.Equal(cachedAt)
+	s.discoveryBuildMu.Unlock()
+	if !sameAttempt {
+		t.Fatal("failed build was retried instead of served from the error cache")
+	}
+	s.invalidateDiscoveryCache()
+	_, _ = s.signedDiscoverySnapshot()
+	s.discoveryBuildMu.Lock()
+	retried := !s.discoveryBuildErrAt.Equal(cachedAt) || s.discoveryBuildErrGn != 0
+	s.discoveryBuildMu.Unlock()
+	if !retried {
+		t.Fatal("invalidation must force a rebuild attempt")
 	}
 }

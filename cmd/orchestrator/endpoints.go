@@ -3,6 +3,7 @@ package main
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"log"
 	"net/http"
 	"net/netip"
 	"os"
@@ -52,7 +53,7 @@ func (s *server) handleDiscoveryEndpointsJSON(w http.ResponseWriter, r *http.Req
 	}
 	bundle, err := s.signedDiscoverySnapshot()
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusServiceUnavailable)
+		writeDiscoveryUnavailable(w, err)
 		return
 	}
 	revision, retryAfter, ok := s.reserveDiscoveryJSONForKey(
@@ -103,7 +104,7 @@ func (s *server) handleDiscoveryEndpointsMinisig(w http.ResponseWriter, r *http.
 		var err error
 		bundle, err = s.signedDiscoverySnapshot()
 		if err != nil {
-			http.Error(w, err.Error(), http.StatusServiceUnavailable)
+			writeDiscoveryUnavailable(w, err)
 			return
 		}
 	}
@@ -128,21 +129,70 @@ func (s *server) handleAdminDiscoveryBump(w http.ResponseWriter, r *http.Request
 	writeJSON(w, map[string]any{"ok": true, "seq": seq})
 }
 
+func writeDiscoveryUnavailable(w http.ResponseWriter, err error) {
+	log.Printf("discovery bundle unavailable: %v", err)
+	http.Error(w, "discovery temporarily unavailable", http.StatusServiceUnavailable)
+}
+
+// discoveryBuildErrorTTL caches a failed build (e.g. a missing update key) so
+// every request does not re-read disk and rescan workers while it persists.
+const discoveryBuildErrorTTL = 5 * time.Second
+
+func (s *server) freshDiscoverySnapshotLocked(now time.Time, revision uint64) *discoveryBundleSnapshot {
+	current := s.discoveryCache.Current
+	if current == nil || s.discoveryCache.Invalidated || current.WorkerRevision != revision {
+		return nil
+	}
+	if age := now.Sub(current.GeneratedAt); age < 0 || age >= discoveryBundleCacheTTL {
+		return nil
+	}
+	return current
+}
+
+// signedDiscoverySnapshot returns the cached bundle or rebuilds it. Builds are
+// serialized by discoveryBuildMu and run without discoveryCacheMu, so lookups
+// of cached revisions (the .minisig path) never wait on disk I/O or signing.
 func (s *server) signedDiscoverySnapshot() (*discoveryBundleSnapshot, error) {
-	now := time.Now().UTC()
 	revision := s.store.discoveryRevision()
 	s.discoveryCacheMu.Lock()
-	defer s.discoveryCacheMu.Unlock()
-	current := s.discoveryCache.Current
-	age := time.Duration(-1)
-	if current != nil {
-		age = now.Sub(current.GeneratedAt)
+	fresh := s.freshDiscoverySnapshotLocked(time.Now().UTC(), revision)
+	s.discoveryCacheMu.Unlock()
+	if fresh != nil {
+		return fresh, nil
 	}
-	if current != nil && !s.discoveryCache.Invalidated &&
-		current.WorkerRevision == revision &&
-		age >= 0 && age < discoveryBundleCacheTTL {
-		return current, nil
+
+	s.discoveryBuildMu.Lock()
+	defer s.discoveryBuildMu.Unlock()
+	now := time.Now().UTC()
+	revision = s.store.discoveryRevision()
+	s.discoveryCacheMu.Lock()
+	fresh = s.freshDiscoverySnapshotLocked(now, revision)
+	s.discoveryCacheMu.Unlock()
+	if fresh != nil {
+		return fresh, nil
 	}
+	gen := s.discoveryInvalidGen.Load()
+	if s.discoveryBuildErr != nil && s.discoveryBuildErrGn == gen && now.Sub(s.discoveryBuildErrAt) < discoveryBuildErrorTTL {
+		return nil, s.discoveryBuildErr
+	}
+	next, err := s.buildDiscoverySnapshot(now, revision)
+	if err != nil {
+		s.discoveryBuildErr = err
+		s.discoveryBuildErrAt = now
+		s.discoveryBuildErrGn = gen
+		return nil, err
+	}
+	s.discoveryBuildErr = nil
+	s.discoveryCacheMu.Lock()
+	s.rememberDiscoverySnapshotLocked(s.discoveryCache.Current)
+	s.discoveryCache.Current = next
+	s.discoveryCache.Invalidated = false
+	s.discoveryCacheMu.Unlock()
+	s.discoveryBuilds.Add(1)
+	return next, nil
+}
+
+func (s *server) buildDiscoverySnapshot(now time.Time, revision uint64) (*discoveryBundleSnapshot, error) {
 	priv, pubText, err := s.loadServerUpdateSigningKey()
 	if err != nil {
 		return nil, err
@@ -151,19 +201,14 @@ func (s *server) signedDiscoverySnapshot() (*discoveryBundleSnapshot, error) {
 	if err != nil {
 		return nil, err
 	}
-	next := &discoveryBundleSnapshot{
+	return &discoveryBundleSnapshot{
 		JSON:           jsonText,
 		Minisig:        string(minisign.Sign(priv, []byte(jsonText))),
 		PublicKey:      pubText,
 		Revision:       discoveryHash(jsonText),
 		GeneratedAt:    now,
 		WorkerRevision: revision,
-	}
-	s.rememberDiscoverySnapshotLocked(current)
-	s.discoveryCache.Current = next
-	s.discoveryCache.Invalidated = false
-	s.discoveryBuilds.Add(1)
-	return next, nil
+	}, nil
 }
 
 func (s *server) signedDiscoveryBundle() (string, string, string, error) {
@@ -209,6 +254,7 @@ func (s *server) invalidateDiscoveryCache() {
 	s.discoveryCacheMu.Lock()
 	s.discoveryCache.Invalidated = true
 	s.discoveryCacheMu.Unlock()
+	s.discoveryInvalidGen.Add(1)
 }
 
 func (s *server) reserveDiscoveryJSONForKey(
@@ -563,11 +609,14 @@ func (s *server) writeDiscoverySeqStateLocked(seq int64, hash string) error {
 	if err := os.MkdirAll(s.cfg.StateDir, 0o700); err != nil {
 		return err
 	}
-	if err := os.WriteFile(s.discoverySeqPath(), []byte(strconv.FormatInt(seq, 10)+"\n"), 0o600); err != nil {
+	// Atomic replace: a crash or full disk must not leave a truncated seq file
+	// that fails every discovery request until fixed by hand. Seq goes first;
+	// a lost hash write only causes one extra (harmless) seq bump.
+	if err := writeFileAtomic(s.discoverySeqPath(), []byte(strconv.FormatInt(seq, 10)+"\n"), 0o600); err != nil {
 		return err
 	}
 	if hash != "" {
-		if err := os.WriteFile(s.discoveryHashPath(), []byte(hash+"\n"), 0o600); err != nil {
+		if err := writeFileAtomic(s.discoveryHashPath(), []byte(hash+"\n"), 0o600); err != nil {
 			return err
 		}
 	}

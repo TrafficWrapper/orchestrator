@@ -77,17 +77,24 @@ type server struct {
 	audit            *auditLog
 	discoverySeqMu   sync.Mutex
 	discoveryCacheMu sync.Mutex
-	discoveryCache   discoveryBundleCache
-	discoveryBuilds  atomic.Int64
-	discoveryRateMu  sync.Mutex
-	discoveryRates   map[string]discoveryRequestRate
-	adminSessions    sync.Map
-	botMu            sync.Mutex
-	apkPublishMu     sync.Mutex
-	authApprover     authApprover
-	bot              *telegramBot
-	botCancel        context.CancelFunc
-	botFactory       telegramClientFactory
+	// discoveryBuildMu serializes bundle rebuilds; the fields below it are
+	// guarded by it.
+	discoveryBuildMu    sync.Mutex
+	discoveryBuildErr   error
+	discoveryBuildErrAt time.Time
+	discoveryBuildErrGn uint64
+	discoveryInvalidGen atomic.Uint64
+	discoveryCache      discoveryBundleCache
+	discoveryBuilds     atomic.Int64
+	discoveryRateMu     sync.Mutex
+	discoveryRates      map[string]discoveryRequestRate
+	adminSessions       sync.Map
+	botMu               sync.Mutex
+	apkPublishMu        sync.Mutex
+	authApprover        authApprover
+	bot                 *telegramBot
+	botCancel           context.CancelFunc
+	botFactory          telegramClientFactory
 }
 
 type noiseSession struct {
