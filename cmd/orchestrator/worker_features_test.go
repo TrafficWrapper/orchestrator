@@ -194,7 +194,7 @@ func TestWorkerWithSlowAckStaysFreshViaHeartbeat(t *testing.T) {
 	}
 }
 
-func TestRealityFallbackRoutesAreOptInAndFlowless(t *testing.T) {
+func TestRealityFallbackRoutesAreOptInWithoutFlow(t *testing.T) {
 	s := newTestServer(t)
 	w := addApprovedWorkerWithStatic(t, s, "fallback-worker")
 	if _, err := s.store.upsertPendingWorker("fallback-worker", map[string]any{
@@ -203,6 +203,7 @@ func TestRealityFallbackRoutesAreOptInAndFlowless(t *testing.T) {
 		"reality_profiles": []any{
 			map[string]any{"name": "base", "address": "203.0.113.5", "port": 443, "network": "tcp", "public_key": "pub", "short_id": "sid", "flows": []any{"", realityFlowVision}},
 			map[string]any{"name": "xh", "address": "203.0.113.5", "port": 8443, "network": "xhttp", "public_key": "pub", "short_id": "sid", "flows": []any{""}, "xhttp": map[string]any{"path": "/x", "mode": "auto"}},
+			map[string]any{"name": "tcp2", "address": "203.0.113.5", "port": 2053, "network": "tcp", "public_key": "pub", "short_id": "sid", "flows": []any{"", realityFlowVision}},
 		},
 	}); err != nil {
 		t.Fatal(err)
@@ -215,12 +216,19 @@ func TestRealityFallbackRoutesAreOptInAndFlowless(t *testing.T) {
 	s.cfg.RealityFallbackProfiles = true
 	item, _ = s.clientWorkerPayloadForClient(rec, "")
 	routes := item["routes"].([]any)
-	if len(routes) != 2 {
-		t.Fatalf("want primary + xhttp fallback, got %d", len(routes))
+	if len(routes) != 3 {
+		t.Fatalf("want primary + xhttp + tcp fallback, got %d", len(routes))
+	}
+	if routes[0].(map[string]any)["vision"] != true {
+		t.Fatalf("primary tcp route must allow vision: %v", routes[0])
 	}
 	fb := routes[1].(map[string]any)
-	if intFromMap(fb, "port", 0) != 8443 || fb["network"] != "xhttp" || fb["flow"] != nil || fb["flows"] != nil {
-		t.Fatalf("bad fallback route: %v", fb)
+	if intFromMap(fb, "port", 0) != 8443 || fb["network"] != "xhttp" || fb["flow"] != nil || fb["flows"] != nil || fb["vision"] != false {
+		t.Fatalf("bad xhttp fallback route: %v", fb)
+	}
+	tcp := routes[2].(map[string]any)
+	if intFromMap(tcp, "port", 0) != 2053 || tcp["flow"] != nil || tcp["vision"] != true {
+		t.Fatalf("bad tcp fallback route: %v", tcp)
 	}
 }
 

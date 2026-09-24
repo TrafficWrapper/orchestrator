@@ -208,10 +208,12 @@ func (s *server) handleAdminWorkerAWGDrain(w http.ResponseWriter, r *http.Reques
 	writeJSON(w, map[string]any{"ok": true})
 }
 
-// realityFallbackRoutes turns the worker's XHTTP reality_profiles into extra
-// REALITY routes placed right after its primary route, so a client whose
-// TCP REALITY handshake is blocked can retry over XHTTP before AWG. XHTTP
-// never carries a flow, so these routes are safe for every device.
+// realityFallbackRoutes turns the worker's other reality_profiles (XHTTP, or
+// TCP on another port) into extra REALITY routes placed right after its
+// primary route, so a client whose primary handshake is blocked can retry
+// before AWG. The bundle is shared, so no flow is sent: "vision" tells the app
+// whether the profile accepts xtls-rprx-vision, and only then does it apply its
+// enroll-negotiated reality_flow.
 func realityFallbackRoutes(rec workerRecord, primary map[string]any, expected, configURL, clientVersion string) []any {
 	raw, ok := rec.SelfDescribe["reality_profiles"].([]any)
 	if !ok {
@@ -221,12 +223,10 @@ func realityFallbackRoutes(rec workerRecord, primary map[string]any, expected, c
 	var out []any
 	for _, item := range raw {
 		profile, ok := mapFromAny(item)
-		if !ok || !strings.EqualFold(stringFromMap(profile, "network"), "xhttp") {
+		if !ok || intFromMap(profile, "port", 0) == primaryPort {
 			continue
 		}
-		if intFromMap(profile, "port", 0) == primaryPort {
-			continue
-		}
+		vision := realityProfileSupportsVision(profile)
 		params := cloneMap(profile)
 		delete(params, "flows")
 		delete(params, "flow")
@@ -239,9 +239,28 @@ func realityFallbackRoutes(rec workerRecord, primary map[string]any, expected, c
 			continue
 		}
 		route["profile"] = stringFromMap(profile, "name")
+		route["vision"] = vision
 		out = append(out, route)
 	}
 	return out
+}
+
+// realityProfileSupportsVision reports whether a REALITY profile accepts the
+// Vision flow: from its advertised flows, else TCP (XHTTP never does).
+func realityProfileSupportsVision(raw any) bool {
+	profile, ok := mapFromAny(raw)
+	if !ok {
+		return false
+	}
+	if flows, ok := profile["flows"].([]any); ok {
+		return slices.Contains(flows, any(realityFlowVision))
+	}
+	switch strings.ToLower(firstStringFromMap(profile, "network")) {
+	case "", "tcp":
+		return true
+	default:
+		return false
+	}
 }
 
 // inheritAWGWorkerFields copies worker-wide AWG fields (IPv6 endpoint, tunnel
