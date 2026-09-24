@@ -419,6 +419,7 @@ func runServe(cfg orchConfig) error {
 	mux.HandleFunc("/d/v1/handshake/start", s.handleHandshakeStart)
 	mux.HandleFunc("/d/v1/enroll", s.handleNoise(s.handleDeviceEnroll))
 	mux.HandleFunc("/admin/v1/login", s.handleAdminLogin)
+	mux.HandleFunc("/admin/v1/logout", s.handleAdminLogout)
 	mux.HandleFunc("/admin/v1/password/change", s.handleAdminPasswordChange)
 	mux.HandleFunc("/admin/v1/password/force-set", s.handleAdminPasswordForceSet)
 	mux.HandleFunc("/admin/v1/totp/enroll", s.handleAdminTOTPEnroll)
@@ -462,7 +463,7 @@ func runServe(cfg orchConfig) error {
 func newOrchestratorHTTPServer(addr string, handler http.Handler) *http.Server {
 	return &http.Server{
 		Addr:              addr,
-		Handler:           withRequestBodyLimits(handler),
+		Handler:           withSecurityHeaders(withRequestBodyLimits(handler)),
 		TLSConfig:         &tls.Config{MinVersion: tls.VersionTLS12},
 		ReadHeaderTimeout: 15 * time.Second,
 		IdleTimeout:       120 * time.Second,
@@ -596,6 +597,7 @@ func (s *server) runNoiseSessionJanitor(ctx context.Context) {
 				}
 				return true
 			})
+			s.pruneExpiredAdminSessions(time.Now().UTC())
 		}
 	}
 }
@@ -1916,7 +1918,7 @@ func (s *server) handleAdminLogin(w http.ResponseWriter, r *http.Request) {
 	limiter.recordSuccess(ip)
 	s.auditEvent(auditEntry{Event: "admin_login", IP: ip, Result: "ok"})
 	if mustChange {
-		s.createAdminSession(w, true)
+		s.createAdminSession(w, r, true)
 		return
 	}
 	if approver := s.currentAuthApprover(); approver != nil && approver.enabled() {
@@ -1936,10 +1938,10 @@ func (s *server) handleAdminLogin(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	s.createAdminSession(w, false)
+	s.createAdminSession(w, r, false)
 }
 
-func (s *server) createAdminSession(w http.ResponseWriter, mustChange bool) {
+func (s *server) createAdminSession(w http.ResponseWriter, r *http.Request, mustChange bool) {
 	token := randID() + randID() + randID()
 	csrf := randID() + randID()
 	expires := time.Now().UTC().Add(12 * time.Hour)
@@ -1949,6 +1951,7 @@ func (s *server) createAdminSession(w http.ResponseWriter, mustChange bool) {
 		Value:    token,
 		Path:     "/",
 		HttpOnly: true,
+		Secure:   s.cfg.TLS || r.TLS != nil,
 		SameSite: http.SameSiteLaxMode,
 		Expires:  expires,
 	})
@@ -1959,6 +1962,52 @@ func (s *server) createAdminSession(w http.ResponseWriter, mustChange bool) {
 		"expires_at":    expires.Format(time.RFC3339),
 		"must_change":   mustChange,
 	})
+}
+
+// revokeAdminSessions ends every admin session, e.g. after a password change,
+// so a stolen session cannot outlive the credential it was issued for.
+func (s *server) revokeAdminSessions() {
+	s.adminSessions.Range(func(key, _ any) bool {
+		s.adminSessions.Delete(key)
+		return true
+	})
+}
+
+func (s *server) pruneExpiredAdminSessions(now time.Time) {
+	s.adminSessions.Range(func(key, value any) bool {
+		if session, ok := value.(adminSession); !ok || now.After(session.ExpiresAt) {
+			s.adminSessions.Delete(key)
+		}
+		return true
+	})
+}
+
+func (s *server) handleAdminLogout(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	token, source, session, ok := s.lookupAdminSession(r)
+	if ok && source == "cookie" && !csrfTokenMatches(session.CSRFToken, r.Header.Get("x-csrf-token")) {
+		http.Error(w, "csrf token required", http.StatusForbidden)
+		return
+	}
+	if token != "" {
+		s.adminSessions.Delete(token)
+	}
+	http.SetCookie(w, &http.Cookie{
+		Name:     "tw_admin_session",
+		Value:    "",
+		Path:     "/",
+		HttpOnly: true,
+		Secure:   s.cfg.TLS || r.TLS != nil,
+		SameSite: http.SameSiteLaxMode,
+		MaxAge:   -1,
+	})
+	if ok {
+		s.auditEvent(auditEntry{Event: "admin_logout", IP: clientIP(r), Result: "ok"})
+	}
+	writeJSON(w, map[string]any{"ok": true})
 }
 
 func (s *server) handleAdminTOTPEnroll(w http.ResponseWriter, r *http.Request) {
@@ -2014,10 +2063,28 @@ func (s *server) handleAdminTOTPDisable(w http.ResponseWriter, r *http.Request) 
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
+	var req struct {
+		Code string `json:"code"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil && !errors.Is(err, io.EOF) {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	// Turning 2FA off must prove possession of the second factor, otherwise a
+	// stolen session could strip it with a single request.
+	if enabled, ok, err := s.store.verifyAdminTOTP(req.Code, time.Now().UTC()); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	} else if enabled && !ok {
+		s.auditEvent(auditEntry{Event: "admin_totp_disable", IP: clientIP(r), Result: "failed", Fields: map[string]string{"reason": "bad_totp"}})
+		http.Error(w, "valid totp code required", http.StatusForbidden)
+		return
+	}
 	if err := s.store.disableAdminTOTP(); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
+	s.revokeAdminSessions()
 	s.auditEvent(auditEntry{Event: "admin_totp_disable", IP: clientIP(r), Result: "ok"})
 	writeJSON(w, map[string]any{"ok": true})
 }
@@ -2119,7 +2186,7 @@ func (s *server) handleAdminPasswordChange(w http.ResponseWriter, r *http.Reques
 	}
 	log.Printf("admin password changed at=%s remote=%s", time.Now().UTC().Format(time.RFC3339), r.RemoteAddr)
 	s.auditEvent(auditEntry{Event: "admin_password_change", IP: ip, Result: "ok"})
-	s.adminSessions.Delete(token)
+	s.revokeAdminSessions()
 	if approver := s.currentAuthApprover(); approver != nil && approver.enabled() {
 		approved, err := approver.requestLoginApproval(r.Context(), loginApprovalRequest{
 			RemoteAddr: ip,
@@ -2135,7 +2202,7 @@ func (s *server) handleAdminPasswordChange(w http.ResponseWriter, r *http.Reques
 			return
 		}
 	}
-	s.createAdminSession(w, false)
+	s.createAdminSession(w, r, false)
 }
 
 func csrfTokenMatches(expected, provided string) bool {
@@ -2163,6 +2230,8 @@ func (s *server) handleAdminPasswordForceSet(w http.ResponseWriter, r *http.Requ
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
+	s.revokeAdminSessions()
+	s.auditEvent(auditEntry{Event: "admin_password_force_set", IP: clientIP(r), Result: "ok"})
 	writeJSON(w, map[string]any{"ok": true, "status": "admin_password_set"})
 }
 

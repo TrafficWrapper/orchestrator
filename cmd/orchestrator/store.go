@@ -87,10 +87,13 @@ type workerRecord struct {
 }
 
 type adminTOTPRecord struct {
-	Secret      string    `json:"secret"`
-	Enabled     bool      `json:"enabled"`
-	LastCounter int64     `json:"last_counter"`
-	UpdatedAt   time.Time `json:"updated_at"`
+	Secret string `json:"secret"`
+	// PendingSecret holds a re-enrollment secret while the current one stays
+	// active, so an unfinished re-enrollment never switches 2FA off.
+	PendingSecret string    `json:"pending_secret,omitempty"`
+	Enabled       bool      `json:"enabled"`
+	LastCounter   int64     `json:"last_counter"`
+	UpdatedAt     time.Time `json:"updated_at"`
 }
 
 type deviceRecord struct {
@@ -413,8 +416,30 @@ func (s *orchStore) startAdminTOTPEnrollment() (adminTOTPRecord, error) {
 	if err != nil {
 		return adminTOTPRecord{}, err
 	}
-	rec := adminTOTPRecord{Secret: secret, Enabled: false, UpdatedAt: time.Now().UTC()}
-	return rec, s.putAdminTOTPLocked(rec)
+	var out adminTOTPRecord
+	err = s.db.Update(func(tx *bolt.Tx) error {
+		var rec adminTOTPRecord
+		if raw := tx.Bucket(bucketMeta).Get(metaAdminTOTP); raw != nil {
+			if err := s.openJSON(raw, &rec); err != nil {
+				return err
+			}
+		}
+		now := time.Now().UTC()
+		if rec.Enabled && strings.TrimSpace(rec.Secret) != "" {
+			rec.PendingSecret = secret
+			rec.UpdatedAt = now
+			out = adminTOTPRecord{Secret: secret, Enabled: false, UpdatedAt: now}
+		} else {
+			rec = adminTOTPRecord{Secret: secret, Enabled: false, UpdatedAt: now}
+			out = rec
+		}
+		sealed, err := s.sealJSON(rec)
+		if err != nil {
+			return err
+		}
+		return tx.Bucket(bucketMeta).Put(metaAdminTOTP, sealed)
+	})
+	return out, err
 }
 
 func (s *orchStore) enableAdminTOTP(code string, now time.Time) error {
@@ -427,10 +452,16 @@ func (s *orchStore) enableAdminTOTP(code string, now time.Time) error {
 		if err := s.openJSON(raw, &rec); err != nil {
 			return err
 		}
-		counter, ok := verifyTOTPCode(rec.Secret, code, now, rec.LastCounter)
+		secret := rec.Secret
+		if strings.TrimSpace(rec.PendingSecret) != "" {
+			secret = rec.PendingSecret
+		}
+		counter, ok := verifyTOTPCode(secret, code, now, rec.LastCounter)
 		if !ok {
 			return errors.New("invalid totp code")
 		}
+		rec.Secret = secret
+		rec.PendingSecret = ""
 		rec.Enabled = true
 		rec.LastCounter = counter
 		rec.UpdatedAt = now.UTC()
@@ -481,16 +512,6 @@ func (s *orchStore) verifyAdminTOTP(code string, now time.Time) (bool, bool, err
 		return nil
 	})
 	return enabled, ok, err
-}
-
-func (s *orchStore) putAdminTOTPLocked(rec adminTOTPRecord) error {
-	sealed, err := s.sealJSON(rec)
-	if err != nil {
-		return err
-	}
-	return s.db.Update(func(tx *bolt.Tx) error {
-		return tx.Bucket(bucketMeta).Put(metaAdminTOTP, sealed)
-	})
 }
 
 func (s *orchStore) setBotSettings(token string, ownerID int64) error {
