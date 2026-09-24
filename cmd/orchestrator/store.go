@@ -453,10 +453,14 @@ func (s *orchStore) enableAdminTOTP(code string, now time.Time) error {
 			return err
 		}
 		secret := rec.Secret
+		lastCounter := rec.LastCounter
 		if strings.TrimSpace(rec.PendingSecret) != "" {
+			// The replay counter belongs to the old secret; codes of a new
+			// secret cannot be replays of it.
 			secret = rec.PendingSecret
+			lastCounter = 0
 		}
-		counter, ok := verifyTOTPCode(secret, code, now, rec.LastCounter)
+		counter, ok := verifyTOTPCode(secret, code, now, lastCounter)
 		if !ok {
 			return errors.New("invalid totp code")
 		}
@@ -1910,8 +1914,11 @@ func (s *orchStore) updateWorkerHeartbeat(id string, haveSeq int64, self map[str
 }
 
 func forceWorkerResync(rec *workerRecord, haveSeq int64) {
-	// A resync may follow lost worker state; ship the APK again with it.
+	// A resync may follow lost worker state; ship the APK again with it. The
+	// sent markers are cleared too, or a stale ack could re-mark it applied.
 	rec.APKAppliedSeq = 0
+	rec.APKSentSeq = 0
+	rec.APKSentAtSeq = 0
 	target := rec.DesiredSeq
 	if rec.AppliedSeq > target {
 		target = rec.AppliedSeq
@@ -2059,8 +2066,13 @@ func (s *orchStore) allocateDeviceIPFrom(tx *bolt.Tx, cidr string, usedIP func(d
 	if err != nil || !prefix.Addr().Is4() {
 		prefix = netip.MustParsePrefix("10.13.13.0/24")
 	}
-	prefix = prefix.Masked()
 	used := map[netip.Addr]struct{}{}
+	// Workers derive the gateway and smoke-test peer as the configured
+	// (unmasked) address +1 and +2; never hand those out to devices.
+	for a, i := prefix.Addr(), 0; i < 3 && a.IsValid(); a, i = a.Next(), i+1 {
+		used[a] = struct{}{}
+	}
+	prefix = prefix.Masked()
 	if err := tx.Bucket(bucketDevices).ForEach(func(_, raw []byte) error {
 		var rec deviceRecord
 		if err := s.openJSON(raw, &rec); err != nil {

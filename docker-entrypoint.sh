@@ -24,9 +24,20 @@ own_dir() {
 	chmod 0700 "$dir"
 }
 
+# Plain if-blocks (not `test && own_dir`) so set -e still aborts on a failed
+# mkdir/chown instead of failing later with EACCES.
 own_dir "${ORCH_STATE_DIR:-./orch-state}"
-[ -n "${ORCH_SIGNER_SOCKET:-}" ] && own_dir "$(dirname "$ORCH_SIGNER_SOCKET")"
-[ -n "${ORCH_SIGNER_KEY_PATH:-}" ] && own_dir "$(dirname "$ORCH_SIGNER_KEY_PATH")"
-[ -n "${ORCH_SIGNER_LEGACY_KEY_PATH:-}" ] && [ -d "$(dirname "$ORCH_SIGNER_LEGACY_KEY_PATH")" ] && own_dir "$(dirname "$ORCH_SIGNER_LEGACY_KEY_PATH")"
+if [ -n "${ORCH_SIGNER_SOCKET:-}" ]; then
+	own_dir "$(dirname "$ORCH_SIGNER_SOCKET")"
+fi
+if [ -n "${ORCH_SIGNER_KEY_PATH:-}" ]; then
+	own_dir "$(dirname "$ORCH_SIGNER_KEY_PATH")"
+fi
+if [ -n "${ORCH_SIGNER_LEGACY_KEY_PATH:-}" ] && [ -d "$(dirname "$ORCH_SIGNER_LEGACY_KEY_PATH")" ]; then
+	own_dir "$(dirname "$ORCH_SIGNER_LEGACY_KEY_PATH")"
+fi
 
-exec setpriv --reuid="$APP_UID" --regid="$APP_GID" --clear-groups -- "$BIN" "$@"
+# Keep only CAP_NET_BIND_SERVICE so ORCH_LISTEN may still use ports below 1024.
+exec setpriv --reuid="$APP_UID" --regid="$APP_GID" --clear-groups \
+	--inh-caps=-all,+net_bind_service --ambient-caps=-all,+net_bind_service \
+	-- "$BIN" "$@"

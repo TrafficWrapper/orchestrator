@@ -186,7 +186,9 @@ func (s *server) signedDiscoverySnapshot() (*discoveryBundleSnapshot, error) {
 	s.discoveryCacheMu.Lock()
 	s.rememberDiscoverySnapshotLocked(s.discoveryCache.Current)
 	s.discoveryCache.Current = next
-	s.discoveryCache.Invalidated = false
+	// An invalidation (e.g. a seq bump) that landed while this build ran must
+	// survive, or the stale bundle would be served for a full TTL.
+	s.discoveryCache.Invalidated = s.discoveryInvalidGen.Load() != gen
 	s.discoveryCacheMu.Unlock()
 	s.discoveryBuilds.Add(1)
 	return next, nil

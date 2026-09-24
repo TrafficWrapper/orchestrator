@@ -11,6 +11,8 @@ services:
       # shared orchestrator state; it is moved out and deleted there.
       ORCH_SIGNER_LEGACY_KEY_PATH: /orch-state/orch-config.key
       ORCH_SIGNER_SOCKET: /run/tw-signer/signer.sock
+      ORCH_UID: ${ORCH_UID:-10001}
+      ORCH_GID: ${ORCH_GID:-10001}
     network_mode: none
     volumes:
       - ./signer-state:/signer-state
@@ -29,6 +31,9 @@ services:
       ORCH_STATE_DIR: /orch-state
       ORCH_SIGNER_SOCKET: /run/tw-signer/signer.sock
       ORCH_LISTEN: ${ORCH_LISTEN:-:9091}
+      ORCH_CLIENT_IP_HEADER: ${ORCH_CLIENT_IP_HEADER:-auto}
+      ORCH_UID: ${ORCH_UID:-10001}
+      ORCH_GID: ${ORCH_GID:-10001}
       ORCH_TLS: ${ORCH_TLS:-1}
       ORCH_PUBLIC_URL: ${ORCH_PUBLIC_URL:-https://127.0.0.1:9091}
       ORCH_EGRESS_PROBE_URL: ${ORCH_EGRESS_PROBE_URL:-http://127.0.0.1:9090/self-describe}

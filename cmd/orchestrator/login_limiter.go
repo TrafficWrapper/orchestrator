@@ -138,10 +138,16 @@ func (l *loginLimiter) recordSuccess(key string) {
 	if l == nil || strings.TrimSpace(key) == "" {
 		return
 	}
+	prefix := pendingPrefixKey(key)
 	key = rateLimitKey(key)
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	delete(l.states, key)
+	// reserveAttempt charges the network before the outcome is known; refund
+	// it so successful logins never count toward the network lockout.
+	if state := l.states[prefix]; state != nil && state.Failures > 0 && !state.isLocked(l.clock()) {
+		state.Failures--
+	}
 }
 
 func (l *loginLimiter) clock() time.Time {
