@@ -24,6 +24,7 @@ import (
 	"time"
 
 	"github.com/flynn/noise"
+	bolt "go.etcd.io/bbolt"
 
 	"github.com/TrafficWrapper/orchestrator/internal/protocol"
 )
@@ -80,6 +81,7 @@ func runServe(cfg orchConfig) error {
 	defer background.Wait()
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write([]byte("ok\n")) })
+	mux.HandleFunc("/readyz", s.handleReadyz)
 	mux.HandleFunc("/discovery/endpoints.json", s.handleDiscoveryEndpointsJSON)
 	mux.HandleFunc("/discovery/endpoints.json.minisig", s.handleDiscoveryEndpointsMinisig)
 	s.registerWebRoutes(mux)
@@ -269,4 +271,47 @@ func selfSigned(name string) ([]byte, []byte, error) {
 		return nil, nil, err
 	}
 	return pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}), pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: keyRaw}), nil
+}
+
+// readyzCacheTTL keeps frequent probes from hammering the signer.
+const readyzCacheTTL = 5 * time.Second
+
+// handleReadyz reports whether the orchestrator can serve configs: the signer
+// answers (a signer outage breaks every pull and enroll while /healthz, a
+// pure liveness probe, stays green) and the database is readable.
+func (s *server) handleReadyz(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	s.readyMu.Lock()
+	cached, at := s.readyResult, s.readyAt
+	s.readyMu.Unlock()
+	if at.IsZero() || time.Since(at) >= readyzCacheTTL {
+		checks := map[string]string{"signer": "ok", "store": "ok"}
+		if _, err := s.signer.publicKey(); err != nil {
+			log.Printf("readyz: signer: %v", err)
+			checks["signer"] = "unavailable"
+		}
+		if err := s.store.db.View(func(*bolt.Tx) error { return nil }); err != nil {
+			log.Printf("readyz: store: %v", err)
+			checks["store"] = "unavailable"
+		}
+		cached = checks
+		s.readyMu.Lock()
+		s.readyResult, s.readyAt = cached, time.Now()
+		s.readyMu.Unlock()
+	}
+	ready := true
+	for _, v := range cached {
+		ready = ready && v == "ok"
+	}
+	w.Header().Set("Cache-Control", "no-store")
+	if !ready {
+		w.Header().Set("content-type", "application/json")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_ = json.NewEncoder(w).Encode(map[string]any{"ok": false, "checks": cached})
+		return
+	}
+	writeJSON(w, map[string]any{"ok": true, "checks": cached})
 }

@@ -1,6 +1,9 @@
 package main
 
 import (
+	"errors"
+	"net/http"
+	"net/http/httptest"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -52,5 +55,25 @@ func TestPublicURLIsLoopback(t *testing.T) {
 		if got := publicURLIsLoopback(raw); got != want {
 			t.Fatalf("%s: %t", raw, got)
 		}
+	}
+}
+
+type failingSigner struct{ fakeSigner }
+
+func (failingSigner) publicKey() (string, error) { return "", errors.New("signer down") }
+
+func TestReadyzReflectsSigner(t *testing.T) {
+	s := newTestServer(t)
+	rec := httptest.NewRecorder()
+	s.handleReadyz(rec, httptest.NewRequest(http.MethodGet, "/readyz", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("ready status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	s2 := newTestServer(t)
+	s2.signer = failingSigner{}
+	rec = httptest.NewRecorder()
+	s2.handleReadyz(rec, httptest.NewRequest(http.MethodGet, "/readyz", nil))
+	if rec.Code != http.StatusServiceUnavailable || !strings.Contains(rec.Body.String(), `"signer":"unavailable"`) {
+		t.Fatalf("signer outage must fail readiness: %d %s", rec.Code, rec.Body.String())
 	}
 }

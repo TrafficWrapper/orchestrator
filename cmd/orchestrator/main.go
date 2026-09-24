@@ -73,6 +73,9 @@ type server struct {
 	adminSessions       sync.Map
 	botMu               sync.Mutex
 	apkPublishMu        sync.Mutex
+	readyMu             sync.Mutex
+	readyResult         map[string]string
+	readyAt             time.Time
 	apkShipOnce         sync.Once
 	apkShipSem          chan struct{}
 	apkArtifactMu       sync.Mutex

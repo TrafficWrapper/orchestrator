@@ -17,6 +17,12 @@ Check:
 - `.env` exists and `ORCH_STATE_DIR` is writable
 - `ORCH_SIGNER_SOCKET` points to the same path for `signer` and `orchestrator`
 - `ORCH_LISTEN` is not already used by another process
+- the log does not start with `invalid configuration:` (malformed booleans,
+  numbers or URLs in the environment fail startup and are all listed there)
+
+When it runs, `GET /healthz` only shows the process is alive; `GET /readyz`
+returns 503 with `{"checks":{...}}` when the signer or the database is not
+usable, which is what breaks worker pulls and enrollment.
 
 For local development, the default self-signed TLS listener is expected:
 
