@@ -143,8 +143,9 @@ func runMain() error {
 		if len(os.Args) < 3 {
 			return errors.New("revoke-device requires device id")
 		}
-		if err := adminPost(cfg, "/admin/v1/revoke-device", map[string]string{"id": os.Args[2]}, os.Stdout); err == nil {
-			return nil
+		if err := adminPost(cfg, "/admin/v1/revoke-device", map[string]string{"id": os.Args[2]}, os.Stdout); !errors.Is(err, errAdminServerUnreachable) {
+			// Reached the server: report its answer instead of bypassing it.
+			return err
 		}
 		st, err := openOrchStore(cfg)
 		if err != nil {
@@ -156,8 +157,9 @@ func runMain() error {
 		if len(os.Args) < 3 {
 			return errors.New("approve-worker requires worker id")
 		}
-		if err := adminPost(cfg, "/admin/v1/approve-worker", map[string]string{"id": os.Args[2]}, os.Stdout); err == nil {
-			return nil
+		if err := adminPost(cfg, "/admin/v1/approve-worker", map[string]string{"id": os.Args[2]}, os.Stdout); !errors.Is(err, errAdminServerUnreachable) {
+			// Reached the server: report its answer instead of bypassing it.
+			return err
 		}
 		st, err := openOrchStore(cfg)
 		if err != nil {
