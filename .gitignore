@@ -34,3 +34,4 @@ build/update-release/
 .vscode/
 *.swp
 .DS_Store
+/cmd/orchestrator/orchestrator
