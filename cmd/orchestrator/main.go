@@ -68,6 +68,10 @@ type server struct {
 	adminSessions       sync.Map
 	botMu               sync.Mutex
 	apkPublishMu        sync.Mutex
+	updateKeyMu         sync.Mutex
+	updateKeyCache      *updateKeyCacheEntry
+	signerPubMu         sync.Mutex
+	signerPub           string
 	egressProbeMu       sync.Mutex
 	egressProbeValue    string
 	egressProbeAt       time.Time

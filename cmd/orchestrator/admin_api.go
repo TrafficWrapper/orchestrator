@@ -127,7 +127,7 @@ func (s *server) handleAdminBootstrapTokenCreate(w http.ResponseWriter, r *http.
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	pub, err := s.signer.publicKey()
+	pub, err := s.signerPublicKey()
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return

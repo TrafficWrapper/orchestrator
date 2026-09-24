@@ -2,10 +2,14 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
 	"encoding/json"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
+	"aead.dev/minisign"
 	"github.com/TrafficWrapper/orchestrator/internal/protocol"
 	bolt "go.etcd.io/bbolt"
 )
@@ -115,5 +119,40 @@ func TestNudgeWakesOnSeqBump(t *testing.T) {
 		}
 	case <-time.After(3 * time.Second):
 		t.Fatal("nudge did not wake on seq bump")
+	}
+}
+
+func TestUpdateKeyCacheReloadsOnFileChange(t *testing.T) {
+	s := newTestServer(t)
+	s.cfg.UpdatePublicKey = ""
+	if _, err := loadOrCreateUpdateSigningKey(&s.cfg); err != nil {
+		t.Fatal(err)
+	}
+	s.cfg.UpdatePublicKey = ""
+	_, first, err := s.loadServerUpdateSigningKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, again, _ := s.loadServerUpdateSigningKey()
+	if again != first {
+		t.Fatal("cached key changed without a file change")
+	}
+	path := filepath.Join(s.cfg.StateDir, "update.key")
+	_, priv, err := minisign.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, _ := priv.MarshalText()
+	if err := os.WriteFile(path, raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	future := time.Now().Add(time.Minute)
+	_ = os.Chtimes(path, future, future)
+	_, second, err := s.loadServerUpdateSigningKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second == first {
+		t.Fatal("replaced update.key was not reloaded")
 	}
 }

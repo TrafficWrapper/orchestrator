@@ -374,8 +374,38 @@ func (s *server) serverUpdateSigningAvailable() bool {
 	return err == nil
 }
 
+// loadServerUpdateSigningKey returns the server-held update key. It is used
+// for every discovery build and client bundle, so the parsed key is cached and
+// only reloaded when update.key's size or mtime changes.
 func (s *server) loadServerUpdateSigningKey() (minisign.PrivateKey, string, error) {
-	raw, err := os.ReadFile(filepath.Join(s.cfg.StateDir, "update.key"))
+	path := filepath.Join(s.cfg.StateDir, "update.key")
+	info, statErr := os.Stat(path)
+	if statErr == nil {
+		s.updateKeyMu.Lock()
+		c := s.updateKeyCache
+		s.updateKeyMu.Unlock()
+		if c != nil && c.size == info.Size() && c.modTime.Equal(info.ModTime()) {
+			return c.priv, c.pub, nil
+		}
+	}
+	priv, pub, err := s.readServerUpdateSigningKey(path)
+	if err == nil && statErr == nil {
+		s.updateKeyMu.Lock()
+		s.updateKeyCache = &updateKeyCacheEntry{priv: priv, pub: pub, size: info.Size(), modTime: info.ModTime()}
+		s.updateKeyMu.Unlock()
+	}
+	return priv, pub, err
+}
+
+type updateKeyCacheEntry struct {
+	priv    minisign.PrivateKey
+	pub     string
+	size    int64
+	modTime time.Time
+}
+
+func (s *server) readServerUpdateSigningKey(path string) (minisign.PrivateKey, string, error) {
+	raw, err := os.ReadFile(path)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			return minisign.PrivateKey{}, "", errors.New("update.key is not present")

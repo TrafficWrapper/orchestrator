@@ -259,3 +259,23 @@ func (c signerClient) call(req signerRequest) (signerResponse, error) {
 	}
 	return resp, nil
 }
+
+// signerPublicKey returns the config-signing public key, asking the signer
+// once and caching the answer (it only changes with a restart-level key
+// rotation). Failures are not cached.
+func (s *server) signerPublicKey() (string, error) {
+	s.signerPubMu.Lock()
+	cached := s.signerPub
+	s.signerPubMu.Unlock()
+	if cached != "" {
+		return cached, nil
+	}
+	pub, err := s.signer.publicKey()
+	if err != nil {
+		return "", err
+	}
+	s.signerPubMu.Lock()
+	s.signerPub = pub
+	s.signerPubMu.Unlock()
+	return pub, nil
+}

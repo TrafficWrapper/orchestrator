@@ -99,7 +99,7 @@ func (s *server) handleDeviceEnroll(peer []byte, raw []byte) (any, error) {
 		if err != nil {
 			return nil, err
 		}
-		pub, err := s.signer.publicKey()
+		pub, err := s.signerPublicKey()
 		if err != nil {
 			return nil, err
 		}
@@ -137,7 +137,7 @@ func (s *server) handleDeviceEnroll(peer []byte, raw []byte) (any, error) {
 	if err != nil {
 		return nil, err
 	}
-	pub, err := s.signer.publicKey()
+	pub, err := s.signerPublicKey()
 	if err != nil {
 		return nil, err
 	}
