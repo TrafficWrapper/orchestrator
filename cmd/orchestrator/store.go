@@ -1998,18 +1998,29 @@ func (s *orchStore) bumpWorkerSeqsTx(tx *bolt.Tx) error {
 }
 
 func (s *orchStore) allocateDeviceIP(tx *bolt.Tx, cidr string) (string, error) {
+	return s.allocateDeviceIPFrom(tx, cidr, func(rec deviceRecord) string { return rec.InternalIP })
+}
+
+// deviceIPPoolReserved is the number of low host addresses kept for the
+// worker gateway and infrastructure.
+const deviceIPPoolReserved = 10
+
+// allocateDeviceIPFrom returns the first free /32 in cidr (IPv4), skipping the
+// reserved low addresses and the broadcast address. usedIP extracts the
+// address a device already holds in this pool.
+func (s *orchStore) allocateDeviceIPFrom(tx *bolt.Tx, cidr string, usedIP func(deviceRecord) string) (string, error) {
 	prefix, err := netip.ParsePrefix(strings.TrimSpace(cidr))
 	if err != nil || !prefix.Addr().Is4() {
 		prefix = netip.MustParsePrefix("10.13.13.0/24")
 	}
+	prefix = prefix.Masked()
 	used := map[netip.Addr]struct{}{}
-	db := tx.Bucket(bucketDevices)
-	if err := db.ForEach(func(_, raw []byte) error {
+	if err := tx.Bucket(bucketDevices).ForEach(func(_, raw []byte) error {
 		var rec deviceRecord
 		if err := s.openJSON(raw, &rec); err != nil {
 			return err
 		}
-		addrText := strings.TrimSuffix(strings.TrimSpace(rec.InternalIP), "/32")
+		addrText := strings.TrimSuffix(strings.TrimSpace(usedIP(rec)), "/32")
 		if addr, err := netip.ParseAddr(addrText); err == nil {
 			used[addr] = struct{}{}
 		}
@@ -2017,16 +2028,13 @@ func (s *orchStore) allocateDeviceIP(tx *bolt.Tx, cidr string) (string, error) {
 	}); err != nil {
 		return "", err
 	}
-	addr := prefix.Addr()
-	if !addr.Is4() {
-		return "", errors.New("device IP pool must be IPv4")
+	next := prefix.Addr()
+	for i := 0; i < deviceIPPoolReserved; i++ {
+		next = next.Next()
 	}
-	raw := addr.As4()
-	for i := 10; i < 255; i++ {
-		raw[3] = byte(i)
-		next := netip.AddrFrom4(raw)
-		if !prefix.Contains(next) {
-			break
+	for ; next.IsValid() && prefix.Contains(next); next = next.Next() {
+		if after := next.Next(); !after.IsValid() || !prefix.Contains(after) {
+			break // broadcast address
 		}
 		if _, ok := used[next]; ok {
 			continue
@@ -2041,49 +2049,9 @@ func (s *orchStore) allocateDeviceIPForProfile(tx *bolt.Tx, profileName, cidr st
 	if profileName == "" || profileName == "awg" {
 		return s.allocateDeviceIP(tx, cidr)
 	}
-	prefix, err := netip.ParsePrefix(strings.TrimSpace(cidr))
-	if err != nil || !prefix.Addr().Is4() {
-		prefix = netip.MustParsePrefix("10.13.13.0/24")
-	}
-	used := map[netip.Addr]struct{}{}
-	db := tx.Bucket(bucketDevices)
-	if err := db.ForEach(func(_, raw []byte) error {
-		var rec deviceRecord
-		if err := s.openJSON(raw, &rec); err != nil {
-			return err
-		}
-		if rec.AWGProfiles == nil {
-			return nil
-		}
-		creds, ok := rec.AWGProfiles[profileName]
-		if !ok {
-			return nil
-		}
-		addrText := strings.TrimSuffix(strings.TrimSpace(creds.InternalIP), "/32")
-		if addr, err := netip.ParseAddr(addrText); err == nil {
-			used[addr] = struct{}{}
-		}
-		return nil
-	}); err != nil {
-		return "", err
-	}
-	addr := prefix.Addr()
-	if !addr.Is4() {
-		return "", errors.New("device IP pool must be IPv4")
-	}
-	raw := addr.As4()
-	for i := 10; i < 255; i++ {
-		raw[3] = byte(i)
-		next := netip.AddrFrom4(raw)
-		if !prefix.Contains(next) {
-			break
-		}
-		if _, ok := used[next]; ok {
-			continue
-		}
-		return next.String() + "/32", nil
-	}
-	return "", errors.New("device IP pool exhausted")
+	return s.allocateDeviceIPFrom(tx, cidr, func(rec deviceRecord) string {
+		return rec.AWGProfiles[profileName].InternalIP
+	})
 }
 
 func randomBase64Key() (string, error) {
