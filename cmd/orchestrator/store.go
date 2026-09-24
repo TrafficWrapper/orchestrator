@@ -1129,9 +1129,16 @@ func deviceAutoBlockReason(reason string) bool {
 	return false
 }
 
-func (s *orchStore) applyDeviceUsageAndBlocks(workerID string, reports []deviceUsage, now time.Time) (int, error) {
-	byID := make(map[string][]deviceUsage, len(reports))
-	byAWG := make(map[string]deviceUsage, len(reports))
+type deviceUsageReports struct {
+	byID  map[string][]deviceUsage
+	byAWG map[string]deviceUsage
+}
+
+func groupDeviceUsageReports(reports []deviceUsage) deviceUsageReports {
+	out := deviceUsageReports{
+		byID:  make(map[string][]deviceUsage, len(reports)),
+		byAWG: make(map[string]deviceUsage, len(reports)),
+	}
 	for _, report := range reports {
 		report.DeviceID = strings.TrimSpace(report.DeviceID)
 		report.AWGPublicKey = strings.TrimSpace(report.AWGPublicKey)
@@ -1144,69 +1151,185 @@ func (s *orchStore) applyDeviceUsageAndBlocks(workerID string, reports []deviceU
 			continue
 		}
 		if report.DeviceID != "" {
-			byID[report.DeviceID] = append(byID[report.DeviceID], report)
+			out.byID[report.DeviceID] = append(out.byID[report.DeviceID], report)
 		}
 		if report.Source == "" && report.AWGPublicKey != "" {
-			byAWG[report.AWGPublicKey] = report
+			out.byAWG[report.AWGPublicKey] = report
 		}
 	}
+	return out
+}
+
+// deviceAWGKeys lists every AWG public key a device may report usage under.
+func deviceAWGKeys(rec deviceRecord) []string {
+	keys := []string{strings.TrimSpace(rec.AWGPublicKey)}
+	for _, profile := range rec.AWGProfiles {
+		keys = append(keys, strings.TrimSpace(profile.AWGPublicKey))
+	}
+	return keys
+}
+
+// applyUsageToDevice folds the reports that belong to rec into its counters
+// and applies quota/expiry blocking. It reports whether rec changed and
+// whether it was newly blocked.
+func applyUsageToDevice(rec *deviceRecord, workerID string, grouped deviceUsageReports, now time.Time) (changed, blocked bool) {
+	if deviceReports := grouped.byID[rec.ID]; len(deviceReports) > 0 {
+		for _, report := range deviceReports {
+			changed = applyDeviceUsageReport(rec, workerID, report, now) || changed
+		}
+	} else if report, ok := grouped.byAWG[strings.TrimSpace(rec.AWGPublicKey)]; ok {
+		changed = applyDeviceUsageReport(rec, workerID, report, now) || changed
+	} else {
+		for _, profile := range rec.AWGProfiles {
+			if report, ok := grouped.byAWG[strings.TrimSpace(profile.AWGPublicKey)]; ok {
+				changed = applyDeviceUsageReport(rec, workerID, report, now) || changed
+				break
+			}
+		}
+	}
+	reason := ""
+	if deviceLimitsExpired(rec.Limits, now) {
+		reason = "expires_at"
+	} else if rec.Limits.TrafficQuotaBytes > 0 && saturatingAddUint64(rec.UsageRxBytes, rec.UsageTxBytes) >= rec.Limits.TrafficQuotaBytes {
+		reason = "traffic_quota_bytes"
+	}
+	if reason != "" && rec.Status == "approved" {
+		rec.Status = "revoked"
+		rec.BlockedReason = reason
+		blockedAt := now.UTC()
+		rec.BlockedAt = &blockedAt
+		if rec.ConfigSeq < 1 {
+			rec.ConfigSeq = 1
+		}
+		log.Printf("device quota block id=%s reason=%s usage_rx=%d usage_tx=%d quota=%d", rec.ID, reason, rec.UsageRxBytes, rec.UsageTxBytes, rec.Limits.TrafficQuotaBytes)
+		return true, true
+	}
+	return changed, false
+}
+
+// applyDeviceUsageAndBlocks applies usage reports and quota/expiry blocks by
+// scanning every device. It is the periodic sweep (expiry needs no report);
+// acks use applyReportedDeviceUsage, which touches only reported devices.
+func (s *orchStore) applyDeviceUsageAndBlocks(workerID string, reports []deviceUsage, now time.Time) (int, error) {
+	grouped := groupDeviceUsageReports(reports)
 	blocked := 0
-	changedAny := false
+	err := s.db.Update(func(tx *bolt.Tx) error {
+		n, err := s.sweepDeviceUsageTx(tx, workerID, grouped, now, nil)
+		blocked = n
+		return err
+	})
+	if err != nil {
+		return 0, err
+	}
+	return blocked, nil
+}
+
+// sweepDeviceUsageTx scans all devices except those in skip. Updates are
+// collected during ForEach and written afterwards: bbolt forbids modifying a
+// bucket while iterating it.
+func (s *orchStore) sweepDeviceUsageTx(tx *bolt.Tx, workerID string, grouped deviceUsageReports, now time.Time, skip map[string]bool) (int, error) {
+	b := tx.Bucket(bucketDevices)
+	type pendingPut struct {
+		key []byte
+		rec deviceRecord
+	}
+	var puts []pendingPut
+	blocked := 0
+	err := b.ForEach(func(k, raw []byte) error {
+		if skip[string(k)] {
+			return nil
+		}
+		var rec deviceRecord
+		if err := s.openJSON(raw, &rec); err != nil {
+			return err
+		}
+		changed, newlyBlocked := applyUsageToDevice(&rec, workerID, grouped, now)
+		if newlyBlocked {
+			blocked++
+		}
+		if changed {
+			puts = append(puts, pendingPut{key: append([]byte(nil), k...), rec: rec})
+		}
+		return nil
+	})
+	if err != nil {
+		return 0, err
+	}
+	for _, p := range puts {
+		sealed, err := s.sealJSON(p.rec)
+		if err != nil {
+			return 0, err
+		}
+		if err := b.Put(p.key, sealed); err != nil {
+			return 0, err
+		}
+	}
+	if blocked > 0 {
+		if err := s.bumpWorkerSeqsTx(tx); err != nil {
+			return 0, err
+		}
+	}
+	return blocked, nil
+}
+
+// applyReportedDeviceUsage is the ack hot path: devices are loaded by id, and
+// the full scan only runs when a report cannot be attributed that way (legacy
+// reports keyed solely by AWG public key).
+func (s *orchStore) applyReportedDeviceUsage(workerID string, reports []deviceUsage, now time.Time) (int, error) {
+	grouped := groupDeviceUsageReports(reports)
+	if len(grouped.byID) == 0 && len(grouped.byAWG) == 0 {
+		return 0, nil
+	}
+	blocked := 0
 	err := s.db.Update(func(tx *bolt.Tx) error {
 		b := tx.Bucket(bucketDevices)
-		err := b.ForEach(func(k, raw []byte) error {
+		resolved := map[string]bool{}
+		coveredAWG := map[string]bool{}
+		needScan := false
+		for id := range grouped.byID {
+			raw := b.Get([]byte(id))
+			if raw == nil {
+				needScan = true
+				continue
+			}
 			var rec deviceRecord
 			if err := s.openJSON(raw, &rec); err != nil {
 				return err
 			}
-			changed := false
-			if deviceReports := byID[rec.ID]; len(deviceReports) > 0 {
-				for _, report := range deviceReports {
-					changed = applyDeviceUsageReport(&rec, workerID, report, now) || changed
-				}
-			} else if report, ok := byAWG[strings.TrimSpace(rec.AWGPublicKey)]; ok {
-				changed = applyDeviceUsageReport(&rec, workerID, report, now) || changed
-			} else {
-				for _, profile := range rec.AWGProfiles {
-					if report, ok := byAWG[strings.TrimSpace(profile.AWGPublicKey)]; ok {
-						changed = applyDeviceUsageReport(&rec, workerID, report, now) || changed
-						break
-					}
-				}
+			resolved[id] = true
+			for _, key := range deviceAWGKeys(rec) {
+				coveredAWG[key] = true
 			}
-			reason := ""
-			if deviceLimitsExpired(rec.Limits, now) {
-				reason = "expires_at"
-			} else if rec.Limits.TrafficQuotaBytes > 0 && saturatingAddUint64(rec.UsageRxBytes, rec.UsageTxBytes) >= rec.Limits.TrafficQuotaBytes {
-				reason = "traffic_quota_bytes"
-			}
-			if reason != "" && rec.Status == "approved" {
-				rec.Status = "revoked"
-				rec.BlockedReason = reason
-				blockedAt := now.UTC()
-				rec.BlockedAt = &blockedAt
-				if rec.ConfigSeq < 1 {
-					rec.ConfigSeq = 1
-				}
-				log.Printf("device quota block id=%s reason=%s usage_rx=%d usage_tx=%d quota=%d", rec.ID, reason, rec.UsageRxBytes, rec.UsageTxBytes, rec.Limits.TrafficQuotaBytes)
+			changed, newlyBlocked := applyUsageToDevice(&rec, workerID, grouped, now)
+			if newlyBlocked {
 				blocked++
-				changed = true
 			}
-			if !changed {
-				return nil
+			if changed {
+				sealed, err := s.sealJSON(rec)
+				if err != nil {
+					return err
+				}
+				if err := b.Put([]byte(id), sealed); err != nil {
+					return err
+				}
 			}
-			sealed, err := s.sealJSON(rec)
+		}
+		for key := range grouped.byAWG {
+			if !coveredAWG[key] {
+				needScan = true
+				break
+			}
+		}
+		if needScan {
+			n, err := s.sweepDeviceUsageTx(tx, workerID, grouped, now, resolved)
 			if err != nil {
 				return err
 			}
-			if err := b.Put(k, sealed); err != nil {
-				return err
+			blocked += n
+			// sweepDeviceUsageTx bumps seqs for its own blocks only.
+			if n > 0 {
+				return nil
 			}
-			changedAny = true
-			return nil
-		})
-		if err != nil {
-			return err
 		}
 		if blocked > 0 {
 			return s.bumpWorkerSeqsTx(tx)
@@ -1215,9 +1338,6 @@ func (s *orchStore) applyDeviceUsageAndBlocks(workerID string, reports []deviceU
 	})
 	if err != nil {
 		return 0, err
-	}
-	if !changedAny {
-		return 0, nil
 	}
 	return blocked, nil
 }
@@ -1652,7 +1772,16 @@ func (s *orchStore) workers() ([]workerRecord, error) {
 }
 
 func (s *orchStore) updateAck(id string, applied int64, observed string, self map[string]any) error {
+	return s.updateAckWithProbe(id, applied, observed, self, nil)
+}
+
+// updateAckWithProbe records an ack and, when probe is non-nil, the egress
+// probe result (possibly empty) in one write transaction.
+func (s *orchStore) updateAckWithProbe(id string, applied int64, observed string, self map[string]any, probe *string) error {
 	return s.updateWorker(id, func(rec *workerRecord) error {
+		if probe != nil {
+			rec.EgressIPProbe = *probe
+		}
 		now := time.Now().UTC()
 		rec.AppliedSeq = applied
 		rec.LastAckAt = &now
@@ -1712,13 +1841,6 @@ func (s *orchStore) markStaleWorkersInactive(cutoff time.Time) (int, error) {
 		s.touchDiscoveryWorkerRevision()
 	}
 	return updated, err
-}
-
-func (s *orchStore) setProbe(id, ip string) error {
-	return s.updateWorker(id, func(rec *workerRecord) error {
-		rec.EgressIPProbe = ip
-		return nil
-	})
 }
 
 func (s *orchStore) updateWorkerSelfDescribe(id string, self map[string]any) error {

@@ -91,6 +91,9 @@ type server struct {
 	adminSessions       sync.Map
 	botMu               sync.Mutex
 	apkPublishMu        sync.Mutex
+	egressProbeMu       sync.Mutex
+	egressProbeValue    string
+	egressProbeAt       time.Time
 	authApprover        authApprover
 	bot                 *telegramBot
 	botCancel           context.CancelFunc
@@ -891,11 +894,10 @@ func (s *server) handleAck(peer []byte, raw []byte) (any, error) {
 	if probe == "" {
 		log.Printf("worker %s egress probe unavailable; observed=%q", rec.ID, req.EgressIPObserved)
 	}
-	_ = s.store.setProbe(rec.ID, probe)
-	if err := s.store.updateAck(rec.ID, req.AppliedVersion, req.EgressIPObserved, req.SelfDescribe); err != nil {
+	if err := s.store.updateAckWithProbe(rec.ID, req.AppliedVersion, req.EgressIPObserved, req.SelfDescribe, &probe); err != nil {
 		return nil, err
 	}
-	quotaBlocks, err := s.store.applyDeviceUsageAndBlocks(rec.ID, req.Usage, time.Now().UTC())
+	quotaBlocks, err := s.store.applyReportedDeviceUsage(rec.ID, req.Usage, time.Now().UTC())
 	if err != nil {
 		return nil, err
 	}
@@ -1590,10 +1592,26 @@ func rejectForbiddenKeys(raw []byte) error {
 	return walk(value, "")
 }
 
+const egressProbeCacheTTL = time.Minute
+
 func (s *server) probeEgressIP(rec workerRecord) string {
 	if s.cfg.EgressProbeURL == "" {
 		return stringFromMap(rec.SelfDescribe, "egress_ip")
 	}
+	// ORCH_EGRESS_PROBE_URL is one URL for the whole orchestrator (meant for a
+	// co-located worker), so the answer is the same for every ack: cache it
+	// instead of blocking each ack on a synchronous HTTP call.
+	s.egressProbeMu.Lock()
+	defer s.egressProbeMu.Unlock()
+	if !s.egressProbeAt.IsZero() && time.Since(s.egressProbeAt) < egressProbeCacheTTL {
+		return s.egressProbeValue
+	}
+	s.egressProbeValue = s.fetchEgressProbe()
+	s.egressProbeAt = time.Now()
+	return s.egressProbeValue
+}
+
+func (s *server) fetchEgressProbe() string {
 	client := http.Client{Timeout: 3 * time.Second}
 	resp, err := client.Get(s.cfg.EgressProbeURL)
 	if err != nil {
@@ -2440,6 +2458,13 @@ func (s *server) runWorkerJanitor(ctx context.Context) {
 				log.Printf("worker stale janitor failed: %v", err)
 			} else if n > 0 {
 				log.Printf("worker stale janitor marked inactive count=%d", n)
+			}
+			// Expiry-based blocks need no usage report, so they are swept here
+			// instead of scanning every device on every worker ack.
+			if blocked, err := s.store.applyDeviceUsageAndBlocks("", nil, time.Now().UTC()); err != nil {
+				log.Printf("device expiry janitor failed: %v", err)
+			} else if blocked > 0 {
+				log.Printf("device expiry janitor blocked count=%d", blocked)
 			}
 		}
 	}
