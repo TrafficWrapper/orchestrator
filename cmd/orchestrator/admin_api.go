@@ -15,16 +15,9 @@ import (
 )
 
 func (s *server) handleAdminBotStatus(w http.ResponseWriter, r *http.Request) {
-	if !s.requireAdmin(w, r) {
-		return
-	}
-	if r.Method != http.MethodGet {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
 	rec, ok, err := s.store.botSettings()
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		writeStoreError(w, http.StatusInternalServerError, err)
 		return
 	}
 	if !ok {
@@ -40,28 +33,20 @@ func (s *server) handleAdminBotStatus(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *server) handleAdminBotSetToken(w http.ResponseWriter, r *http.Request) {
-	if !s.requireAdmin(w, r) {
-		return
-	}
-	if r.Method != http.MethodPost {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
 	var req struct {
 		Token   string `json:"token"`
 		OwnerID int64  `json:"owner_id"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+	if !decodeJSON(w, r, &req) {
 		return
 	}
 	if err := s.store.setBotSettings(req.Token, req.OwnerID); err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+		writeStoreError(w, http.StatusBadRequest, err)
 		return
 	}
 	if s.hasBotFactory() {
 		if err := s.restartOptionalBot(s.baseContext()); err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
+			writeStoreError(w, http.StatusInternalServerError, err)
 			return
 		}
 	}
@@ -70,30 +55,22 @@ func (s *server) handleAdminBotSetToken(w http.ResponseWriter, r *http.Request) 
 }
 
 func (s *server) handleAdminTokenCreate(w http.ResponseWriter, r *http.Request) {
-	if !s.requireAdmin(w, r) {
-		return
-	}
-	if r.Method != http.MethodPost {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
 	var req struct {
 		ID              string `json:"id"`
 		Value           string `json:"value"`
 		TTL             string `json:"ttl"`
 		WorkerStaticPub string `json:"worker_static_pub"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+	if !decodeJSON(w, r, &req) {
 		return
 	}
 	ttl, err := time.ParseDuration(req.TTL)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+		writeStoreError(w, http.StatusBadRequest, err)
 		return
 	}
 	if err := s.store.createToken(req.ID, req.Value, ttl, 1, req.WorkerStaticPub); err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+		writeStoreError(w, http.StatusBadRequest, err)
 		return
 	}
 	s.auditEvent(auditEntry{Event: "enroll_token_create", IP: clientIP(r), Result: "ok", Fields: map[string]string{"id": req.ID, "ttl": ttl.String(), "pinned_worker": strconv.FormatBool(strings.TrimSpace(req.WorkerStaticPub) != "")}})
@@ -101,40 +78,32 @@ func (s *server) handleAdminTokenCreate(w http.ResponseWriter, r *http.Request) 
 }
 
 func (s *server) handleAdminBootstrapTokenCreate(w http.ResponseWriter, r *http.Request) {
-	if !s.requireAdmin(w, r) {
-		return
-	}
-	if r.Method != http.MethodPost {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
 	var req struct {
 		Limits      json.RawMessage `json:"limits"`
 		Expires     string          `json:"expires"`
 		SeedWorkers []string        `json:"seed_workers"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+	if !decodeJSON(w, r, &req) {
 		return
 	}
 	expiresAt, err := parseRFC3339Required(req.Expires)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+		writeStoreError(w, http.StatusBadRequest, err)
 		return
 	}
 	limits, err := parseJSONObjectRaw(string(req.Limits))
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+		writeStoreError(w, http.StatusBadRequest, err)
 		return
 	}
 	pub, err := s.signerPublicKey()
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		writeStoreError(w, http.StatusInternalServerError, err)
 		return
 	}
 	secret, err := randomTokenSecret()
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		writeStoreError(w, http.StatusInternalServerError, err)
 		return
 	}
 	seedWorkers := req.SeedWorkers
@@ -143,7 +112,7 @@ func (s *server) handleAdminBootstrapTokenCreate(w http.ResponseWriter, r *http.
 	}
 	rec, err := s.store.createBootstrapToken(secret, expiresAt, limits, seedWorkers)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+		writeStoreError(w, http.StatusBadRequest, err)
 		return
 	}
 	s.auditEvent(auditEntry{Event: "bootstrap_token_create", IP: clientIP(r), Result: "ok", Fields: map[string]string{"id": rec.ID, "expires_at": rec.ExpiresAt.UTC().Format(time.RFC3339)}})
@@ -151,32 +120,24 @@ func (s *server) handleAdminBootstrapTokenCreate(w http.ResponseWriter, r *http.
 }
 
 func (s *server) handleAdminBootstrapTokenQR(w http.ResponseWriter, r *http.Request) {
-	if !s.requireAdmin(w, r) {
-		return
-	}
-	if r.Method != http.MethodPost {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
 	var req struct {
 		Data string `json:"data"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+	if !decodeJSON(w, r, &req) {
 		return
 	}
 	data := strings.TrimSpace(req.Data)
 	if data == "" {
-		http.Error(w, "data is required", http.StatusBadRequest)
+		writeError(w, "data is required", http.StatusBadRequest)
 		return
 	}
 	if len(data) > 4096 {
-		http.Error(w, "data is too large for bootstrap QR", http.StatusBadRequest)
+		writeError(w, "data is too large for bootstrap QR", http.StatusBadRequest)
 		return
 	}
 	png, err := qrcode.Encode(data, qrcode.Medium, 288)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+		writeStoreError(w, http.StatusBadRequest, err)
 		return
 	}
 	writeJSON(w, map[string]any{
@@ -229,22 +190,14 @@ func seedWorkerURL(rec workerRecord) string {
 }
 
 func (s *server) handleAdminApproveWorker(w http.ResponseWriter, r *http.Request) {
-	if !s.requireAdmin(w, r) {
-		return
-	}
-	if r.Method != http.MethodPost {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
 	var req struct {
 		ID string `json:"id"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+	if !decodeJSON(w, r, &req) {
 		return
 	}
 	if err := s.store.approveWorker(req.ID); err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+		writeStoreError(w, http.StatusBadRequest, err)
 		return
 	}
 	s.auditEvent(auditEntry{Event: "worker_approve", IP: clientIP(r), Result: "ok", Fields: map[string]string{"worker_id": req.ID}})
@@ -252,22 +205,14 @@ func (s *server) handleAdminApproveWorker(w http.ResponseWriter, r *http.Request
 }
 
 func (s *server) handleAdminRevokeDevice(w http.ResponseWriter, r *http.Request) {
-	if !s.requireAdmin(w, r) {
-		return
-	}
-	if r.Method != http.MethodPost {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
 	var req struct {
 		ID string `json:"id"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+	if !decodeJSON(w, r, &req) {
 		return
 	}
 	if err := s.store.revokeDevice(req.ID); err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+		writeStoreError(w, http.StatusBadRequest, err)
 		return
 	}
 	s.auditEvent(auditEntry{Event: "device_revoke", IP: clientIP(r), Result: "ok", Fields: map[string]string{"device_id": req.ID}})
@@ -275,22 +220,14 @@ func (s *server) handleAdminRevokeDevice(w http.ResponseWriter, r *http.Request)
 }
 
 func (s *server) handleAdminDeleteDevice(w http.ResponseWriter, r *http.Request) {
-	if !s.requireAdmin(w, r) {
-		return
-	}
-	if r.Method != http.MethodPost {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
 	var req struct {
 		ID string `json:"id"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+	if !decodeJSON(w, r, &req) {
 		return
 	}
 	if err := s.store.deleteDevice(req.ID); err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+		writeStoreError(w, http.StatusBadRequest, err)
 		return
 	}
 	s.auditEvent(auditEntry{Event: "device_delete", IP: clientIP(r), Result: "ok", Fields: map[string]string{"device_id": req.ID}})
@@ -298,24 +235,16 @@ func (s *server) handleAdminDeleteDevice(w http.ResponseWriter, r *http.Request)
 }
 
 func (s *server) handleAdminDeviceAlias(w http.ResponseWriter, r *http.Request) {
-	if !s.requireAdmin(w, r) {
-		return
-	}
-	if r.Method != http.MethodPost {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
 	var req struct {
 		ID    string `json:"id"`
 		Alias string `json:"alias"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+	if !decodeJSON(w, r, &req) {
 		return
 	}
 	rec, err := s.store.setDeviceAlias(req.ID, req.Alias)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+		writeStoreError(w, http.StatusBadRequest, err)
 		return
 	}
 	s.auditEvent(auditEntry{Event: "device_alias", IP: clientIP(r), Result: "ok", Fields: map[string]string{"device_id": rec.ID}})
@@ -323,16 +252,9 @@ func (s *server) handleAdminDeviceAlias(w http.ResponseWriter, r *http.Request) 
 }
 
 func (s *server) handleAdminWorkers(w http.ResponseWriter, r *http.Request) {
-	if !s.requireAdmin(w, r) {
-		return
-	}
-	if r.Method != http.MethodGet {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
 	workers, err := s.store.workers()
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		writeStoreError(w, http.StatusInternalServerError, err)
 		return
 	}
 	items := make([]any, 0, len(workers))
@@ -343,27 +265,19 @@ func (s *server) handleAdminWorkers(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *server) handleAdminWorkerSetEnabled(w http.ResponseWriter, r *http.Request) {
-	if !s.requireAdmin(w, r) {
-		return
-	}
-	if r.Method != http.MethodPost {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
 	var req struct {
 		ID      string `json:"id"`
 		Enabled *bool  `json:"enabled"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+	if !decodeJSON(w, r, &req) {
 		return
 	}
 	if req.Enabled == nil {
-		http.Error(w, "enabled is required", http.StatusBadRequest)
+		writeError(w, "enabled is required", http.StatusBadRequest)
 		return
 	}
 	if err := s.store.updateWorkerPolicy(req.ID, workerPolicyPatch{Enabled: req.Enabled}); err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+		writeStoreError(w, http.StatusBadRequest, err)
 		return
 	}
 	s.auditEvent(auditEntry{Event: "worker_set_enabled", IP: clientIP(r), Result: "ok", Fields: map[string]string{"worker_id": req.ID, "enabled": strconv.FormatBool(*req.Enabled)}})
@@ -371,33 +285,25 @@ func (s *server) handleAdminWorkerSetEnabled(w http.ResponseWriter, r *http.Requ
 }
 
 func (s *server) handleAdminWorkerProtocol(w http.ResponseWriter, r *http.Request) {
-	if !s.requireAdmin(w, r) {
-		return
-	}
-	if r.Method != http.MethodPost {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
 	var req struct {
 		ID       string `json:"id"`
 		Protocol string `json:"protocol"`
 		Enabled  *bool  `json:"enabled"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+	if !decodeJSON(w, r, &req) {
 		return
 	}
 	if req.Enabled == nil {
-		http.Error(w, "enabled is required", http.StatusBadRequest)
+		writeError(w, "enabled is required", http.StatusBadRequest)
 		return
 	}
 	protocol := normalizeProtocolName(req.Protocol)
 	if protocol == "" {
-		http.Error(w, "unsupported protocol", http.StatusBadRequest)
+		writeError(w, "unsupported protocol", http.StatusBadRequest)
 		return
 	}
 	if err := s.store.updateWorkerPolicy(req.ID, workerPolicyPatch{Protocols: map[string]*bool{protocol: req.Enabled}}); err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+		writeStoreError(w, http.StatusBadRequest, err)
 		return
 	}
 	s.auditEvent(auditEntry{Event: "worker_protocol", IP: clientIP(r), Result: "ok", Fields: map[string]string{"worker_id": req.ID, "protocol": protocol, "enabled": strconv.FormatBool(*req.Enabled)}})
@@ -405,26 +311,19 @@ func (s *server) handleAdminWorkerProtocol(w http.ResponseWriter, r *http.Reques
 }
 
 func (s *server) handleAdminDevices(w http.ResponseWriter, r *http.Request) {
-	if !s.requireAdmin(w, r) {
-		return
-	}
-	if r.Method != http.MethodGet {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
 	devices, err := s.store.devices()
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		writeStoreError(w, http.StatusInternalServerError, err)
 		return
 	}
 	telemetry, err := s.store.telemetrySnapshots()
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		writeStoreError(w, http.StatusInternalServerError, err)
 		return
 	}
 	apkRelease, apkPublished, err := s.store.currentAPKRelease()
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		writeStoreError(w, http.StatusInternalServerError, err)
 		return
 	}
 	items := make([]any, 0, len(devices))
@@ -452,34 +351,20 @@ func (s *server) handleAdminDevices(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *server) handleAdminConfig(w http.ResponseWriter, r *http.Request) {
-	if !s.requireAdmin(w, r) {
-		return
-	}
-	if r.Method != http.MethodGet {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
 	bundle, err := s.buildClientBundle(0)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		writeStoreError(w, http.StatusInternalServerError, err)
 		return
 	}
 	var parsed any
 	if err := json.Unmarshal([]byte(bundle.ConfigJSON), &parsed); err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		writeStoreError(w, http.StatusInternalServerError, err)
 		return
 	}
 	writeJSON(w, map[string]any{"ok": true, "bundle": bundle, "config": parsed})
 }
 
 func (s *server) handleAdminConfigEdit(w http.ResponseWriter, r *http.Request) {
-	if !s.requireAdmin(w, r) {
-		return
-	}
-	if r.Method != http.MethodPost {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
 	var req struct {
 		Workers []struct {
 			ID        string          `json:"id"`
@@ -490,8 +375,7 @@ func (s *server) handleAdminConfigEdit(w http.ResponseWriter, r *http.Request) {
 			Protocols map[string]bool `json:"protocols"`
 		} `json:"workers"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+	if !decodeJSON(w, r, &req) {
 		return
 	}
 	for _, item := range req.Workers {
@@ -510,26 +394,23 @@ func (s *server) handleAdminConfigEdit(w http.ResponseWriter, r *http.Request) {
 			Weight:    item.Weight,
 			Protocols: protocols,
 		}); err != nil {
-			http.Error(w, err.Error(), http.StatusBadRequest)
+			writeStoreError(w, http.StatusBadRequest, err)
 			return
 		}
 		s.auditEvent(auditEntry{Event: "worker_config_edit", IP: clientIP(r), Result: "ok", Fields: map[string]string{"worker_id": id}})
 	}
 	bundle, err := s.buildClientBundle(0)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		writeStoreError(w, http.StatusInternalServerError, err)
 		return
 	}
 	writeJSON(w, map[string]any{"ok": true, "bundle": bundle})
 }
 
 func (s *server) handleAdminStatus(w http.ResponseWriter, r *http.Request) {
-	if !s.requireAdmin(w, r) {
-		return
-	}
 	workers, err := s.store.workers()
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		writeStoreError(w, http.StatusInternalServerError, err)
 		return
 	}
 	for _, worker := range workers {

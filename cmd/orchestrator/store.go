@@ -934,7 +934,7 @@ func (s *orchStore) ensureDeviceAWGProfiles(id string, profiles []awgProfile, aw
 	if err := s.db.View(func(tx *bolt.Tx) error {
 		raw := tx.Bucket(bucketDevices).Get([]byte(id))
 		if raw == nil {
-			return errors.New("device not found")
+			return errDeviceNotFound
 		}
 		var rec deviceRecord
 		if err := s.openJSON(bucketDevices, []byte(id), raw, &rec); err != nil {
@@ -965,7 +965,7 @@ func (s *orchStore) ensureDeviceAWGProfiles(id string, profiles []awgProfile, aw
 		b := tx.Bucket(bucketDevices)
 		raw := b.Get([]byte(id))
 		if raw == nil {
-			return errors.New("device not found")
+			return errDeviceNotFound
 		}
 		var rec deviceRecord
 		if err := s.openJSON(bucketDevices, []byte(id), raw, &rec); err != nil {
@@ -1091,7 +1091,7 @@ func (s *orchStore) device(id string) (deviceRecord, error) {
 	err := s.db.View(func(tx *bolt.Tx) error {
 		raw := tx.Bucket(bucketDevices).Get([]byte(strings.TrimSpace(id)))
 		if raw == nil {
-			return errors.New("device not found")
+			return errDeviceNotFound
 		}
 		return s.openJSON(bucketDevices, []byte(strings.TrimSpace(id)), raw, &rec)
 	})
@@ -1107,7 +1107,7 @@ func (s *orchStore) setDeviceLimits(id string, limits deviceLimits) error {
 		b := tx.Bucket(bucketDevices)
 		raw := b.Get([]byte(id))
 		if raw == nil {
-			return errors.New("device not found")
+			return errDeviceNotFound
 		}
 		var rec deviceRecord
 		if err := s.openJSON(bucketDevices, []byte(id), raw, &rec); err != nil {
@@ -1152,7 +1152,7 @@ func (s *orchStore) recordTelemetry(rec telemetrySnapshotRecord) error {
 		b := tx.Bucket(bucketDevices)
 		raw := b.Get([]byte(rec.DeviceID))
 		if raw == nil {
-			return errors.New("device not found")
+			return errDeviceNotFound
 		}
 		var device deviceRecord
 		if err := s.openJSON(bucketDevices, []byte(rec.DeviceID), raw, &device); err != nil {
@@ -1621,7 +1621,7 @@ func (s *orchStore) revokeDevice(id string) error {
 		db := tx.Bucket(bucketDevices)
 		raw := db.Get([]byte(strings.TrimSpace(id)))
 		if raw == nil {
-			return errors.New("device not found")
+			return errDeviceNotFound
 		}
 		var rec deviceRecord
 		if err := s.openJSON(bucketDevices, []byte(strings.TrimSpace(id)), raw, &rec); err != nil {
@@ -1658,7 +1658,7 @@ func (s *orchStore) setDeviceAlias(id, alias string) (deviceRecord, error) {
 		db := tx.Bucket(bucketDevices)
 		raw := db.Get([]byte(id))
 		if raw == nil {
-			return errors.New("device not found")
+			return errDeviceNotFound
 		}
 		var rec deviceRecord
 		if err := s.openJSON(bucketDevices, []byte(id), raw, &rec); err != nil {
@@ -1707,7 +1707,7 @@ func (s *orchStore) deleteDevice(id string) error {
 		db := tx.Bucket(bucketDevices)
 		raw := db.Get([]byte(id))
 		if raw == nil {
-			return errors.New("device not found")
+			return errDeviceNotFound
 		}
 		var rec deviceRecord
 		if err := s.openJSON(bucketDevices, []byte(id), raw, &rec); err != nil {
@@ -1790,7 +1790,7 @@ func (s *orchStore) updateWorkerPolicy(id string, patch workerPolicyPatch) error
 		b := tx.Bucket(bucketWorkers)
 		raw := b.Get([]byte(strings.TrimSpace(id)))
 		if raw == nil {
-			return errors.New("worker not found")
+			return errWorkerNotFound
 		}
 		var rec workerRecord
 		if err := s.openJSON(bucketWorkers, []byte(strings.TrimSpace(id)), raw, &rec); err != nil {
@@ -1903,7 +1903,7 @@ func (s *orchStore) worker(id string) (workerRecord, error) {
 	err := s.db.View(func(tx *bolt.Tx) error {
 		raw := tx.Bucket(bucketWorkers).Get([]byte(id))
 		if raw == nil {
-			return errors.New("worker not found")
+			return errWorkerNotFound
 		}
 		return s.openJSON(bucketWorkers, []byte(id), raw, &rec)
 	})
@@ -2054,7 +2054,7 @@ func (s *orchStore) updateWorkerHeartbeat(id string, haveSeq int64, self map[str
 	if err := s.db.View(func(tx *bolt.Tx) error {
 		raw := tx.Bucket(bucketWorkers).Get([]byte(id))
 		if raw == nil {
-			return errors.New("worker not found")
+			return errWorkerNotFound
 		}
 		var rec workerRecord
 		if err := s.openJSON(bucketWorkers, []byte(id), raw, &rec); err != nil {
@@ -2165,7 +2165,7 @@ func (s *orchStore) mutateWorkerTx(tx *bolt.Tx, id string, fn func(*workerRecord
 	b := tx.Bucket(bucketWorkers)
 	raw := b.Get([]byte(id))
 	if raw == nil {
-		return workerRecord{}, false, errors.New("worker not found")
+		return workerRecord{}, false, errWorkerNotFound
 	}
 	var rec workerRecord
 	if err := s.openJSON(bucketWorkers, []byte(id), raw, &rec); err != nil {

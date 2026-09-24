@@ -308,8 +308,8 @@ func TestAdminDeleteDeviceRequiresCSRFAndPurgesActiveDevice(t *testing.T) {
 	beforeSeq := workers[0].DesiredSeq
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("/admin/v1/login", s.handleAdminLogin)
-	mux.HandleFunc("/admin/v1/delete-device", s.handleAdminDeleteDevice)
+	mux.HandleFunc("/admin/v1/login", s.route("/admin/v1/login"))
+	mux.HandleFunc("/admin/v1/delete-device", s.route("/admin/v1/delete-device"))
 	ts := httptest.NewServer(mux)
 	defer ts.Close()
 
@@ -395,9 +395,9 @@ func TestAdminDeviceAliasRequiresCSRFAndSanitizes(t *testing.T) {
 	}
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("/admin/v1/login", s.handleAdminLogin)
-	mux.HandleFunc("/admin/v1/device-alias", s.handleAdminDeviceAlias)
-	mux.HandleFunc("/admin/v1/devices", s.handleAdminDevices)
+	mux.HandleFunc("/admin/v1/login", s.route("/admin/v1/login"))
+	mux.HandleFunc("/admin/v1/device-alias", s.route("/admin/v1/device-alias"))
+	mux.HandleFunc("/admin/v1/devices", s.route("/admin/v1/devices"))
 	ts := httptest.NewServer(mux)
 	defer ts.Close()
 
@@ -702,9 +702,9 @@ func TestAdminAuthAndConfigEdit(t *testing.T) {
 		t.Fatal(err)
 	}
 	mux := http.NewServeMux()
-	mux.HandleFunc("/admin/v1/login", s.handleAdminLogin)
-	mux.HandleFunc("/admin/v1/config", s.handleAdminConfig)
-	mux.HandleFunc("/admin/v1/config/edit", s.handleAdminConfigEdit)
+	mux.HandleFunc("/admin/v1/login", s.route("/admin/v1/login"))
+	mux.HandleFunc("/admin/v1/config", s.route("/admin/v1/config"))
+	mux.HandleFunc("/admin/v1/config/edit", s.route("/admin/v1/config/edit"))
 	ts := httptest.NewServer(mux)
 	defer ts.Close()
 
@@ -781,8 +781,8 @@ func TestAdminBootstrapQRCode(t *testing.T) {
 		t.Fatal(err)
 	}
 	mux := http.NewServeMux()
-	mux.HandleFunc("/admin/v1/login", s.handleAdminLogin)
-	mux.HandleFunc("/admin/v1/bootstrap-token/qr", s.handleAdminBootstrapTokenQR)
+	mux.HandleFunc("/admin/v1/login", s.route("/admin/v1/login"))
+	mux.HandleFunc("/admin/v1/bootstrap-token/qr", s.route("/admin/v1/bootstrap-token/qr"))
 	ts := httptest.NewServer(mux)
 	defer ts.Close()
 
@@ -823,8 +823,8 @@ func TestWebUIRequiresSessionAndUsesCSRF(t *testing.T) {
 	}
 	mux := http.NewServeMux()
 	s.registerWebRoutes(mux)
-	mux.HandleFunc("/admin/v1/login", s.handleAdminLogin)
-	mux.HandleFunc("/admin/v1/workers/set-enabled", s.handleAdminWorkerSetEnabled)
+	mux.HandleFunc("/admin/v1/login", s.route("/admin/v1/login"))
+	mux.HandleFunc("/admin/v1/workers/set-enabled", s.route("/admin/v1/workers/set-enabled"))
 	ts := httptest.NewServer(mux)
 	defer ts.Close()
 
@@ -935,9 +935,9 @@ func TestFirstRunPasswordMustChangeFlow(t *testing.T) {
 	}
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("/admin/v1/login", s.handleAdminLogin)
-	mux.HandleFunc("/admin/v1/password/change", s.handleAdminPasswordChange)
-	mux.HandleFunc("/admin/v1/config", s.handleAdminConfig)
+	mux.HandleFunc("/admin/v1/login", s.route("/admin/v1/login"))
+	mux.HandleFunc("/admin/v1/password/change", s.route("/admin/v1/password/change"))
+	mux.HandleFunc("/admin/v1/config", s.route("/admin/v1/config"))
 	ts := httptest.NewServer(mux)
 	defer ts.Close()
 
@@ -1006,8 +1006,8 @@ func TestAdminPasswordChangeWithRegularSessionRequiresCurrentSecretAndCSRF(t *te
 		t.Fatal(err)
 	}
 	mux := http.NewServeMux()
-	mux.HandleFunc("/admin/v1/login", s.handleAdminLogin)
-	mux.HandleFunc("/admin/v1/password/change", s.handleAdminPasswordChange)
+	mux.HandleFunc("/admin/v1/login", s.route("/admin/v1/login"))
+	mux.HandleFunc("/admin/v1/password/change", s.route("/admin/v1/password/change"))
 	ts := httptest.NewServer(mux)
 	defer ts.Close()
 
@@ -1095,9 +1095,9 @@ func TestWebBotTokenSettingsUsesSessionCSRFAndEncryptedStore(t *testing.T) {
 		t.Fatal(err)
 	}
 	mux := http.NewServeMux()
-	mux.HandleFunc("/admin/v1/login", s.handleAdminLogin)
-	mux.HandleFunc("/admin/v1/bot/set-token", s.handleAdminBotSetToken)
-	mux.HandleFunc("/admin/v1/bot/status", s.handleAdminBotStatus)
+	mux.HandleFunc("/admin/v1/login", s.route("/admin/v1/login"))
+	mux.HandleFunc("/admin/v1/bot/set-token", s.route("/admin/v1/bot/set-token"))
+	mux.HandleFunc("/admin/v1/bot/status", s.route("/admin/v1/bot/status"))
 	ts := httptest.NewServer(mux)
 	defer ts.Close()
 
@@ -1172,9 +1172,9 @@ func TestAdminAPKPublishStoresArtifactAndRejectsRollback(t *testing.T) {
 		t.Fatal(err)
 	}
 	mux := http.NewServeMux()
-	mux.HandleFunc("/admin/v1/login", s.handleAdminLogin)
-	mux.HandleFunc("/admin/v1/apk/draft", s.handleAdminAPKDraft)
-	mux.HandleFunc("/admin/v1/apk/publish", s.handleAdminAPKPublish)
+	mux.HandleFunc("/admin/v1/login", s.route("/admin/v1/login"))
+	mux.HandleFunc("/admin/v1/apk/draft", s.route("/admin/v1/apk/draft"))
+	mux.HandleFunc("/admin/v1/apk/publish", s.route("/admin/v1/apk/publish"))
 	ts := httptest.NewServer(mux)
 	defer ts.Close()
 
@@ -1287,9 +1287,9 @@ func TestAdminAPKPublishAutoSignsWithServerUpdateKey(t *testing.T) {
 		t.Fatal(err)
 	}
 	mux := http.NewServeMux()
-	mux.HandleFunc("/admin/v1/login", s.handleAdminLogin)
-	mux.HandleFunc("/admin/v1/apk/status", s.handleAdminAPKStatus)
-	mux.HandleFunc("/admin/v1/apk/publish", s.handleAdminAPKPublish)
+	mux.HandleFunc("/admin/v1/login", s.route("/admin/v1/login"))
+	mux.HandleFunc("/admin/v1/apk/status", s.route("/admin/v1/apk/status"))
+	mux.HandleFunc("/admin/v1/apk/publish", s.route("/admin/v1/apk/publish"))
 	ts := httptest.NewServer(mux)
 	defer ts.Close()
 
@@ -1336,8 +1336,8 @@ func TestAdminAPKDownloadRequiresAuthAndServesCurrentRelease(t *testing.T) {
 		t.Fatal(err)
 	}
 	mux := http.NewServeMux()
-	mux.HandleFunc("/admin/v1/login", s.handleAdminLogin)
-	mux.HandleFunc("/admin/v1/apk/download", s.handleAdminAPKDownload)
+	mux.HandleFunc("/admin/v1/login", s.route("/admin/v1/login"))
+	mux.HandleFunc("/admin/v1/apk/download", s.route("/admin/v1/apk/download"))
 	ts := httptest.NewServer(mux)
 	defer ts.Close()
 

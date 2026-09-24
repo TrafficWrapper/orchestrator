@@ -2,6 +2,7 @@ package main
 
 import (
 	"errors"
+	"net/http"
 	"strings"
 	"time"
 
@@ -104,7 +105,7 @@ func (s *orchStore) updateDeviceClientVersionFromTelemetry(id, version string) (
 		b := tx.Bucket(bucketDevices)
 		raw := b.Get([]byte(id))
 		if raw == nil {
-			return errors.New("device not found")
+			return errDeviceNotFound
 		}
 		var rec deviceRecord
 		if err := s.openJSON(bucketDevices, []byte(id), raw, &rec); err != nil {
@@ -169,4 +170,14 @@ func (s *orchStore) updateWorkerSelfDescribe(id string, self map[string]any) err
 
 func (s *orchStore) allocateDeviceIP(tx *bolt.Tx, cidr string) (string, error) {
 	return s.newDeviceIPIndex(tx).allocate("awg", cidr)
+}
+
+// route returns the production handler (with its admin wrapper) for path.
+func (s *server) route(path string) http.HandlerFunc {
+	for _, rt := range s.apiRoutes() {
+		if rt.path == path {
+			return rt.handler
+		}
+	}
+	panic("no route " + path)
 }

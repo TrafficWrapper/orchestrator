@@ -23,16 +23,9 @@ import (
 )
 
 func (s *server) handleAdminAPKStatus(w http.ResponseWriter, r *http.Request) {
-	if !s.requireAdmin(w, r) {
-		return
-	}
-	if r.Method != http.MethodGet {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
 	rec, ok, err := s.store.currentAPKRelease()
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		writeStoreError(w, http.StatusInternalServerError, err)
 		return
 	}
 	writeJSON(w, map[string]any{
@@ -45,31 +38,24 @@ func (s *server) handleAdminAPKStatus(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *server) handleAdminAPKDownload(w http.ResponseWriter, r *http.Request) {
-	if !s.requireAdmin(w, r) {
-		return
-	}
-	if r.Method != http.MethodGet {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
 	rec, ok, err := s.store.currentAPKRelease()
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		writeStoreError(w, http.StatusInternalServerError, err)
 		return
 	}
 	if !ok || strings.TrimSpace(rec.APKPath) == "" {
-		http.Error(w, "apk release is not published", http.StatusNotFound)
+		writeError(w, "apk release is not published", http.StatusNotFound)
 		return
 	}
 	file, err := os.Open(rec.APKPath)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusNotFound)
+		writeStoreError(w, http.StatusNotFound, err)
 		return
 	}
 	defer file.Close()
 	stat, err := file.Stat()
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		writeStoreError(w, http.StatusInternalServerError, err)
 		return
 	}
 	name := fmt.Sprintf("TrafficWrapper-%d.apk", rec.VersionCode)
@@ -79,31 +65,24 @@ func (s *server) handleAdminAPKDownload(w http.ResponseWriter, r *http.Request) 
 }
 
 func (s *server) handleAdminAPKInspect(w http.ResponseWriter, r *http.Request) {
-	if !s.requireAdmin(w, r) {
-		return
-	}
-	if r.Method != http.MethodPost {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
 	if err := r.ParseMultipartForm(160 << 20); err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+		writeStoreError(w, http.StatusBadRequest, err)
 		return
 	}
 	apkFile, apkHeader, err := r.FormFile("apk")
 	if err != nil {
-		http.Error(w, "apk file is required", http.StatusBadRequest)
+		writeError(w, "apk file is required", http.StatusBadRequest)
 		return
 	}
 	defer apkFile.Close()
 	sha, size, err := hashMultipartFile(apkFile)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+		writeStoreError(w, http.StatusBadRequest, err)
 		return
 	}
 	version, versionErr := inspectAPKVersion(apkFile, size)
 	if _, err := apkFile.Seek(0, io.SeekStart); err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+		writeStoreError(w, http.StatusBadRequest, err)
 		return
 	}
 	resp := map[string]any{
@@ -124,13 +103,6 @@ func (s *server) handleAdminAPKInspect(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *server) handleAdminAPKDraft(w http.ResponseWriter, r *http.Request) {
-	if !s.requireAdmin(w, r) {
-		return
-	}
-	if r.Method != http.MethodPost {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
 	var req struct {
 		VersionCode int64  `json:"version_code"`
 		VersionName string `json:"version_name"`
@@ -141,8 +113,7 @@ func (s *server) handleAdminAPKDraft(w http.ResponseWriter, r *http.Request) {
 		Notes       string `json:"notes"`
 		Seq         int64  `json:"seq"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+	if !decodeJSON(w, r, &req) {
 		return
 	}
 	seq := req.Seq
@@ -150,7 +121,7 @@ func (s *server) handleAdminAPKDraft(w http.ResponseWriter, r *http.Request) {
 		var err error
 		seq, err = s.store.nextAPKSeq()
 		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
+			writeStoreError(w, http.StatusInternalServerError, err)
 			return
 		}
 	}
@@ -165,29 +136,22 @@ func (s *server) handleAdminAPKDraft(w http.ResponseWriter, r *http.Request) {
 		Notes:       req.Notes,
 	})
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+		writeStoreError(w, http.StatusBadRequest, err)
 		return
 	}
 	writeJSON(w, map[string]any{"ok": true, "seq": seq, "manifest_json": manifestJSON})
 }
 
 func (s *server) handleAdminAPKPublish(w http.ResponseWriter, r *http.Request) {
-	if !s.requireAdmin(w, r) {
-		return
-	}
-	if r.Method != http.MethodPost {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
 	if err := r.ParseMultipartForm(160 << 20); err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+		writeStoreError(w, http.StatusBadRequest, err)
 		return
 	}
 	manifestJSON := strings.TrimSpace(r.FormValue("manifest_json"))
 	minisig := strings.TrimSpace(r.FormValue("manifest_minisig"))
 	apkFile, apkHeader, err := r.FormFile("apk")
 	if err != nil {
-		http.Error(w, "apk file is required", http.StatusBadRequest)
+		writeError(w, "apk file is required", http.StatusBadRequest)
 		return
 	}
 	defer apkFile.Close()
@@ -196,17 +160,17 @@ func (s *server) handleAdminAPKPublish(w http.ResponseWriter, r *http.Request) {
 	if manifestJSON == "" && minisig == "" {
 		priv, pubText, err := s.loadServerUpdateSigningKey()
 		if err != nil {
-			http.Error(w, "server update signing key unavailable: "+err.Error(), http.StatusBadRequest)
+			writeError(w, "server update signing key unavailable: "+err.Error(), http.StatusBadRequest)
 			return
 		}
 		sha, size, err := hashMultipartFile(apkFile)
 		if err != nil {
-			http.Error(w, err.Error(), http.StatusBadRequest)
+			writeStoreError(w, http.StatusBadRequest, err)
 			return
 		}
 		version, versionErr := inspectAPKVersion(apkFile, size)
 		if _, err := apkFile.Seek(0, io.SeekStart); err != nil {
-			http.Error(w, err.Error(), http.StatusBadRequest)
+			writeStoreError(w, http.StatusBadRequest, err)
 			return
 		}
 		if parsed := parseFormInt64(r, "version_code"); parsed > 0 {
@@ -216,12 +180,12 @@ func (s *server) handleAdminAPKPublish(w http.ResponseWriter, r *http.Request) {
 			version.VersionName = value
 		}
 		if versionErr != nil && (version.VersionCode <= 0 || strings.TrimSpace(version.VersionName) == "") {
-			http.Error(w, "could not read APK version; fill version_code and version_name manually: "+versionErr.Error(), http.StatusBadRequest)
+			writeError(w, "could not read APK version; fill version_code and version_name manually: "+versionErr.Error(), http.StatusBadRequest)
 			return
 		}
 		seq, err := s.store.nextAPKSeq()
 		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
+			writeStoreError(w, http.StatusInternalServerError, err)
 			return
 		}
 		manifestJSON, err = buildAPKManifest(apkManifestInput{
@@ -235,33 +199,33 @@ func (s *server) handleAdminAPKPublish(w http.ResponseWriter, r *http.Request) {
 			Notes:       r.FormValue("notes"),
 		})
 		if err != nil {
-			http.Error(w, err.Error(), http.StatusBadRequest)
+			writeStoreError(w, http.StatusBadRequest, err)
 			return
 		}
 		minisig = string(minisign.Sign(priv, []byte(manifestJSON)))
 		if err := verifyManifestSignature(manifestJSON, minisig, pubText); err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
+			writeStoreError(w, http.StatusInternalServerError, err)
 			return
 		}
 		serverSigned = true
 	} else {
 		if manifestJSON == "" || minisig == "" {
-			http.Error(w, "manifest_json and manifest_minisig are required for offline signing", http.StatusBadRequest)
+			writeError(w, "manifest_json and manifest_minisig are required for offline signing", http.StatusBadRequest)
 			return
 		}
 		if err := verifyManifestSignature(manifestJSON, minisig, s.cfg.UpdatePublicKey); err != nil {
-			http.Error(w, err.Error(), http.StatusBadRequest)
+			writeStoreError(w, http.StatusBadRequest, err)
 			return
 		}
 	}
 	manifest, err = parseAPKManifest(manifestJSON)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+		writeStoreError(w, http.StatusBadRequest, err)
 		return
 	}
 	release, err := s.storeAPKRelease(manifest, manifestJSON, minisig, apkFile, apkHeader)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+		writeStoreError(w, http.StatusBadRequest, err)
 		return
 	}
 	log.Printf("published APK update seq=%d version=%s(%d) sha256=%s server_signed=%t", release.Seq, release.VersionName, release.VersionCode, release.APKSHA256, serverSigned)

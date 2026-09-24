@@ -450,7 +450,12 @@ func adminRequest(cfg orchConfig, method, path string, body io.Reader, out io.Wr
 	defer resp.Body.Close()
 	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if resp.StatusCode >= 300 {
-		return fmt.Errorf("admin http %d: %s", resp.StatusCode, strings.TrimSpace(string(raw)))
+		message := strings.TrimSpace(string(raw))
+		var apiErr apiError
+		if json.Unmarshal(raw, &apiErr) == nil && apiErr.Error != "" {
+			message = apiErr.Error
+		}
+		return fmt.Errorf("admin http %d: %s", resp.StatusCode, message)
 	}
 	_, _ = out.Write(raw)
 	return nil

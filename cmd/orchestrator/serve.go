@@ -82,46 +82,10 @@ func runServe(cfg orchConfig) error {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write([]byte("ok\n")) })
 	mux.HandleFunc("/readyz", s.handleReadyz)
-	mux.HandleFunc("/discovery/endpoints.json", s.handleDiscoveryEndpointsJSON)
-	mux.HandleFunc("/discovery/endpoints.json.minisig", s.handleDiscoveryEndpointsMinisig)
 	s.registerWebRoutes(mux)
-	mux.HandleFunc("/w/v1/handshake/start", s.handleHandshakeStart)
-	mux.HandleFunc("/w/v1/enroll", s.handleNoise(s.handleEnroll))
-	mux.HandleFunc("/w/v1/config/pull", s.handleNoise(s.handlePull))
-	mux.HandleFunc("/w/v1/nudge/wait", s.handleNoiseContext(s.handleNudge))
-	mux.HandleFunc("/w/v1/ack", s.handleNoise(s.handleAck))
-	mux.HandleFunc("/w/v1/telemetry", s.handleNoise(s.handleWorkerTelemetry))
-	mux.HandleFunc("/d/v1/handshake/start", s.handleHandshakeStart)
-	mux.HandleFunc("/d/v1/enroll", s.handleNoise(s.handleDeviceEnroll))
-	mux.HandleFunc("/admin/v1/login", s.handleAdminLogin)
-	mux.HandleFunc("/admin/v1/logout", s.handleAdminLogout)
-	mux.HandleFunc("/admin/v1/password/change", s.handleAdminPasswordChange)
-	mux.HandleFunc("/admin/v1/password/force-set", s.handleAdminPasswordForceSet)
-	mux.HandleFunc("/admin/v1/totp/enroll", s.handleAdminTOTPEnroll)
-	mux.HandleFunc("/admin/v1/totp/enable", s.handleAdminTOTPEnable)
-	mux.HandleFunc("/admin/v1/totp/disable", s.handleAdminTOTPDisable)
-	mux.HandleFunc("/admin/v1/bot/status", s.handleAdminBotStatus)
-	mux.HandleFunc("/admin/v1/bot/set-token", s.handleAdminBotSetToken)
-	mux.HandleFunc("/admin/v1/token/create", s.handleAdminTokenCreate)
-	mux.HandleFunc("/admin/v1/bootstrap-token/create", s.handleAdminBootstrapTokenCreate)
-	mux.HandleFunc("/admin/v1/bootstrap-token/qr", s.handleAdminBootstrapTokenQR)
-	mux.HandleFunc("/admin/v1/approve-worker", s.handleAdminApproveWorker)
-	mux.HandleFunc("/admin/v1/revoke-device", s.handleAdminRevokeDevice)
-	mux.HandleFunc("/admin/v1/delete-device", s.handleAdminDeleteDevice)
-	mux.HandleFunc("/admin/v1/device-alias", s.handleAdminDeviceAlias)
-	mux.HandleFunc("/admin/v1/workers", s.handleAdminWorkers)
-	mux.HandleFunc("/admin/v1/workers/set-enabled", s.handleAdminWorkerSetEnabled)
-	mux.HandleFunc("/admin/v1/workers/protocol", s.handleAdminWorkerProtocol)
-	mux.HandleFunc("/admin/v1/devices", s.handleAdminDevices)
-	mux.HandleFunc("/admin/v1/config", s.handleAdminConfig)
-	mux.HandleFunc("/admin/v1/config/edit", s.handleAdminConfigEdit)
-	mux.HandleFunc("/admin/v1/apk/status", s.handleAdminAPKStatus)
-	mux.HandleFunc("/admin/v1/apk/download", s.handleAdminAPKDownload)
-	mux.HandleFunc("/admin/v1/apk/inspect", s.handleAdminAPKInspect)
-	mux.HandleFunc("/admin/v1/apk/draft", s.handleAdminAPKDraft)
-	mux.HandleFunc("/admin/v1/apk/publish", s.handleAdminAPKPublish)
-	mux.HandleFunc("/admin/v1/discovery/bump", s.handleAdminDiscoveryBump)
-	mux.HandleFunc("/admin/v1/status", s.handleAdminStatus)
+	for _, rt := range s.apiRoutes() {
+		mux.HandleFunc(rt.path, rt.handler)
+	}
 	addr := cfg.Listen
 	log.Printf("orchestrator serve listen=%s tls=%t public_key=%s", addr, cfg.TLS, protocol.KeyToBase64(static.Public))
 	httpServer := newOrchestratorHTTPServer(addr, mux)
@@ -314,4 +278,56 @@ func (s *server) handleReadyz(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, map[string]any{"ok": true, "checks": cached})
+}
+
+type apiRoute struct {
+	path    string
+	handler http.HandlerFunc
+}
+
+// apiRoutes is the single table of API endpoints. Admin handlers only get
+// method, session and CSRF checks through s.admin, so they must never be
+// registered from anywhere else (tests look routes up here too).
+func (s *server) apiRoutes() []apiRoute {
+	return []apiRoute{
+		{"/discovery/endpoints.json", s.handleDiscoveryEndpointsJSON},
+		{"/discovery/endpoints.json.minisig", s.handleDiscoveryEndpointsMinisig},
+		{"/w/v1/handshake/start", s.handleHandshakeStart},
+		{"/w/v1/enroll", s.handleNoise(s.handleEnroll)},
+		{"/w/v1/config/pull", s.handleNoise(s.handlePull)},
+		{"/w/v1/nudge/wait", s.handleNoiseContext(s.handleNudge)},
+		{"/w/v1/ack", s.handleNoise(s.handleAck)},
+		{"/w/v1/telemetry", s.handleNoise(s.handleWorkerTelemetry)},
+		{"/d/v1/handshake/start", s.handleHandshakeStart},
+		{"/d/v1/enroll", s.handleNoise(s.handleDeviceEnroll)},
+		{"/admin/v1/login", s.handleAdminLogin},
+		{"/admin/v1/logout", s.handleAdminLogout},
+		{"/admin/v1/password/change", s.handleAdminPasswordChange},
+		{"/admin/v1/password/force-set", s.admin(adminPOST, s.handleAdminPasswordForceSet)},
+		{"/admin/v1/totp/enroll", s.admin(adminPOST, s.handleAdminTOTPEnroll)},
+		{"/admin/v1/totp/enable", s.admin(adminPOST, s.handleAdminTOTPEnable)},
+		{"/admin/v1/totp/disable", s.admin(adminPOST, s.handleAdminTOTPDisable)},
+		{"/admin/v1/bot/status", s.admin(adminGET, s.handleAdminBotStatus)},
+		{"/admin/v1/bot/set-token", s.admin(adminPOST, s.handleAdminBotSetToken)},
+		{"/admin/v1/token/create", s.admin(adminPOST, s.handleAdminTokenCreate)},
+		{"/admin/v1/bootstrap-token/create", s.admin(adminPOST, s.handleAdminBootstrapTokenCreate)},
+		{"/admin/v1/bootstrap-token/qr", s.admin(adminPOST, s.handleAdminBootstrapTokenQR)},
+		{"/admin/v1/approve-worker", s.admin(adminPOST, s.handleAdminApproveWorker)},
+		{"/admin/v1/revoke-device", s.admin(adminPOST, s.handleAdminRevokeDevice)},
+		{"/admin/v1/delete-device", s.admin(adminPOST, s.handleAdminDeleteDevice)},
+		{"/admin/v1/device-alias", s.admin(adminPOST, s.handleAdminDeviceAlias)},
+		{"/admin/v1/workers", s.admin(adminGET, s.handleAdminWorkers)},
+		{"/admin/v1/workers/set-enabled", s.admin(adminPOST, s.handleAdminWorkerSetEnabled)},
+		{"/admin/v1/workers/protocol", s.admin(adminPOST, s.handleAdminWorkerProtocol)},
+		{"/admin/v1/devices", s.admin(adminGET, s.handleAdminDevices)},
+		{"/admin/v1/config", s.admin(adminGET, s.handleAdminConfig)},
+		{"/admin/v1/config/edit", s.admin(adminPOST, s.handleAdminConfigEdit)},
+		{"/admin/v1/apk/status", s.admin(adminGET, s.handleAdminAPKStatus)},
+		{"/admin/v1/apk/download", s.admin(adminGET, s.handleAdminAPKDownload)},
+		{"/admin/v1/apk/inspect", s.admin(adminPOST, s.handleAdminAPKInspect)},
+		{"/admin/v1/apk/draft", s.admin(adminPOST, s.handleAdminAPKDraft)},
+		{"/admin/v1/apk/publish", s.admin(adminPOST, s.handleAdminAPKPublish)},
+		{"/admin/v1/discovery/bump", s.admin(adminPOST, s.handleAdminDiscoveryBump)},
+		{"/admin/v1/status", s.admin(adminGET, s.handleAdminStatus)},
+	}
 }

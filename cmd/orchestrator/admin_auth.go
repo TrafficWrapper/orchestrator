@@ -21,7 +21,7 @@ type adminSession struct {
 
 func (s *server) handleAdminLogin(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		writeError(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
 	ip := clientIP(r)
@@ -30,8 +30,7 @@ func (s *server) handleAdminLogin(w http.ResponseWriter, r *http.Request) {
 		Secret   string `json:"secret"`
 		TOTPCode string `json:"totp_code,omitempty"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+	if !decodeJSON(w, r, &req) {
 		return
 	}
 	attempt := limiter.reserveAttempt(ip)
@@ -43,13 +42,13 @@ func (s *server) handleAdminLogin(w http.ResponseWriter, r *http.Request) {
 			Result: "locked",
 			Fields: map[string]string{"locked_until": attempt.LockedUntil.UTC().Format(time.RFC3339)},
 		})
-		http.Error(w, "too many failed login attempts", http.StatusTooManyRequests)
+		writeError(w, "too many failed login attempts", http.StatusTooManyRequests)
 		return
 	}
 	ok, mustChange, err := s.store.verifyAdminPassword(req.Secret)
 	if err != nil {
 		s.auditEvent(auditEntry{Event: "admin_login", IP: ip, Result: "failed", Fields: map[string]string{"reason": "verify_error"}})
-		http.Error(w, err.Error(), http.StatusForbidden)
+		writeStoreError(w, http.StatusForbidden, err)
 		return
 	}
 	if !ok {
@@ -58,16 +57,16 @@ func (s *server) handleAdminLogin(w http.ResponseWriter, r *http.Request) {
 			fields["locked_until"] = attempt.LockedUntil.UTC().Format(time.RFC3339)
 			w.Header().Set("Retry-After", retryAfterSeconds(attempt.LockedUntil, limiter.clock()))
 			s.auditEvent(auditEntry{Event: "admin_login", IP: ip, Result: "locked", Fields: fields})
-			http.Error(w, "too many failed login attempts", http.StatusTooManyRequests)
+			writeError(w, "too many failed login attempts", http.StatusTooManyRequests)
 			return
 		}
 		s.auditEvent(auditEntry{Event: "admin_login", IP: ip, Result: "failed", Fields: fields})
-		http.Error(w, "invalid admin secret", http.StatusForbidden)
+		writeError(w, "invalid admin secret", http.StatusForbidden)
 		return
 	}
 	if enabled, totpOK, err := s.store.verifyAdminTOTP(req.TOTPCode, time.Now().UTC()); err != nil {
 		s.auditEvent(auditEntry{Event: "admin_login", IP: ip, Result: "failed", Fields: map[string]string{"reason": "totp_error"}})
-		http.Error(w, err.Error(), http.StatusForbidden)
+		writeStoreError(w, http.StatusForbidden, err)
 		return
 	} else if enabled && !totpOK {
 		fields := map[string]string{"reason": "bad_totp"}
@@ -75,11 +74,11 @@ func (s *server) handleAdminLogin(w http.ResponseWriter, r *http.Request) {
 			fields["locked_until"] = attempt.LockedUntil.UTC().Format(time.RFC3339)
 			w.Header().Set("Retry-After", retryAfterSeconds(attempt.LockedUntil, limiter.clock()))
 			s.auditEvent(auditEntry{Event: "admin_login", IP: ip, Result: "locked", Fields: fields})
-			http.Error(w, "too many failed login attempts", http.StatusTooManyRequests)
+			writeError(w, "too many failed login attempts", http.StatusTooManyRequests)
 			return
 		}
 		s.auditEvent(auditEntry{Event: "admin_login", IP: ip, Result: "failed", Fields: fields})
-		http.Error(w, "invalid totp code", http.StatusForbidden)
+		writeError(w, "invalid totp code", http.StatusForbidden)
 		return
 	}
 	limiter.recordSuccess(ip)
@@ -96,12 +95,12 @@ func (s *server) handleAdminLogin(w http.ResponseWriter, r *http.Request) {
 		})
 		if err != nil {
 			s.auditEvent(auditEntry{Event: "admin_login_approval", IP: ip, Result: "failed", Fields: map[string]string{"reason": "approval_error"}})
-			http.Error(w, err.Error(), http.StatusForbidden)
+			writeStoreError(w, http.StatusForbidden, err)
 			return
 		}
 		if !approved {
 			s.auditEvent(auditEntry{Event: "admin_login_approval", IP: ip, Result: "denied"})
-			http.Error(w, "admin login approval denied", http.StatusForbidden)
+			writeError(w, "admin login approval denied", http.StatusForbidden)
 			return
 		}
 	}
@@ -151,12 +150,12 @@ func (s *server) pruneExpiredAdminSessions(now time.Time) {
 
 func (s *server) handleAdminLogout(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		writeError(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
 	token, source, session, ok := s.lookupAdminSession(r)
 	if ok && source == "cookie" && !csrfTokenMatches(session.CSRFToken, r.Header.Get("x-csrf-token")) {
-		http.Error(w, "csrf token required", http.StatusForbidden)
+		writeError(w, "csrf token required", http.StatusForbidden)
 		return
 	}
 	if token != "" {
@@ -178,16 +177,9 @@ func (s *server) handleAdminLogout(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *server) handleAdminTOTPEnroll(w http.ResponseWriter, r *http.Request) {
-	if !s.requireAdmin(w, r) {
-		return
-	}
-	if r.Method != http.MethodPost {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
 	rec, err := s.store.startAdminTOTPEnrollment()
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		writeStoreError(w, http.StatusInternalServerError, err)
 		return
 	}
 	s.auditEvent(auditEntry{Event: "admin_totp_enroll", IP: clientIP(r), Result: "ok"})
@@ -199,23 +191,15 @@ func (s *server) handleAdminTOTPEnroll(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *server) handleAdminTOTPEnable(w http.ResponseWriter, r *http.Request) {
-	if !s.requireAdmin(w, r) {
-		return
-	}
-	if r.Method != http.MethodPost {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
 	var req struct {
 		Code string `json:"code"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+	if !decodeJSON(w, r, &req) {
 		return
 	}
 	if err := s.store.enableAdminTOTP(req.Code, time.Now().UTC()); err != nil {
 		s.auditEvent(auditEntry{Event: "admin_totp_enable", IP: clientIP(r), Result: "failed"})
-		http.Error(w, err.Error(), http.StatusForbidden)
+		writeStoreError(w, http.StatusForbidden, err)
 		return
 	}
 	s.auditEvent(auditEntry{Event: "admin_totp_enable", IP: clientIP(r), Result: "ok"})
@@ -223,32 +207,25 @@ func (s *server) handleAdminTOTPEnable(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *server) handleAdminTOTPDisable(w http.ResponseWriter, r *http.Request) {
-	if !s.requireAdmin(w, r) {
-		return
-	}
-	if r.Method != http.MethodPost {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
 	var req struct {
 		Code string `json:"code"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil && !errors.Is(err, io.EOF) {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+		writeStoreError(w, http.StatusBadRequest, err)
 		return
 	}
 	// Turning 2FA off must prove possession of the second factor, otherwise a
 	// stolen session could strip it with a single request.
 	if enabled, ok, err := s.store.verifyAdminTOTP(req.Code, time.Now().UTC()); err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		writeStoreError(w, http.StatusInternalServerError, err)
 		return
 	} else if enabled && !ok {
 		s.auditEvent(auditEntry{Event: "admin_totp_disable", IP: clientIP(r), Result: "failed", Fields: map[string]string{"reason": "bad_totp"}})
-		http.Error(w, "valid totp code required", http.StatusForbidden)
+		writeError(w, "valid totp code required", http.StatusForbidden)
 		return
 	}
 	if err := s.store.disableAdminTOTP(); err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		writeStoreError(w, http.StatusInternalServerError, err)
 		return
 	}
 	s.revokeAdminSessions()
@@ -288,20 +265,20 @@ func (s *server) lookupAdminSession(r *http.Request) (string, string, adminSessi
 func (s *server) requireAdmin(w http.ResponseWriter, r *http.Request) bool {
 	token, source, session, ok := s.lookupAdminSession(r)
 	if token == "" {
-		http.Error(w, "admin session required", http.StatusUnauthorized)
+		writeError(w, "admin session required", http.StatusUnauthorized)
 		return false
 	}
 	if !ok {
-		http.Error(w, "admin session invalid", http.StatusForbidden)
+		writeError(w, "admin session invalid", http.StatusForbidden)
 		return false
 	}
 	if session.MustChange {
-		http.Error(w, "password change required", http.StatusForbidden)
+		writeError(w, "password change required", http.StatusForbidden)
 		return false
 	}
 	if source == "cookie" && r.Method != http.MethodGet && r.Method != http.MethodHead {
 		if !csrfTokenMatches(session.CSRFToken, r.Header.Get("x-csrf-token")) {
-			http.Error(w, "csrf token required", http.StatusForbidden)
+			writeError(w, "csrf token required", http.StatusForbidden)
 			return false
 		}
 	}
@@ -310,40 +287,39 @@ func (s *server) requireAdmin(w http.ResponseWriter, r *http.Request) bool {
 
 func (s *server) handleAdminPasswordChange(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		writeError(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
 	ip := clientIP(r)
 	token, source, session, ok := s.lookupAdminSession(r)
 	if token == "" {
-		http.Error(w, "admin session required", http.StatusUnauthorized)
+		writeError(w, "admin session required", http.StatusUnauthorized)
 		return
 	}
 	if !ok {
-		http.Error(w, "admin session invalid", http.StatusForbidden)
+		writeError(w, "admin session invalid", http.StatusForbidden)
 		return
 	}
 	if source == "cookie" && !csrfTokenMatches(session.CSRFToken, r.Header.Get("x-csrf-token")) {
-		http.Error(w, "csrf token required", http.StatusForbidden)
+		writeError(w, "csrf token required", http.StatusForbidden)
 		return
 	}
 	var req struct {
 		CurrentSecret string `json:"current_secret"`
 		NewSecret     string `json:"new_secret"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+	if !decodeJSON(w, r, &req) {
 		return
 	}
 	okPassword, _, err := s.store.verifyAdminPassword(req.CurrentSecret)
 	if err != nil {
 		s.auditEvent(auditEntry{Event: "admin_password_change", IP: ip, Result: "failed", Fields: map[string]string{"reason": "verify_error"}})
-		http.Error(w, err.Error(), http.StatusForbidden)
+		writeStoreError(w, http.StatusForbidden, err)
 		return
 	}
 	if !okPassword {
 		s.auditEvent(auditEntry{Event: "admin_password_change", IP: ip, Result: "failed", Fields: map[string]string{"reason": "bad_current_secret"}})
-		http.Error(w, "invalid current admin secret", http.StatusForbidden)
+		writeError(w, "invalid current admin secret", http.StatusForbidden)
 		return
 	}
 	// Ask for the out-of-band approval before touching the credential: a denial
@@ -356,18 +332,18 @@ func (s *server) handleAdminPasswordChange(w http.ResponseWriter, r *http.Reques
 		})
 		if err != nil {
 			s.auditEvent(auditEntry{Event: "admin_password_change", IP: ip, Result: "failed", Fields: map[string]string{"reason": "approval_error"}})
-			http.Error(w, err.Error(), http.StatusForbidden)
+			writeStoreError(w, http.StatusForbidden, err)
 			return
 		}
 		if !approved {
 			s.auditEvent(auditEntry{Event: "admin_password_change", IP: ip, Result: "denied"})
-			http.Error(w, "admin login approval denied", http.StatusForbidden)
+			writeError(w, "admin login approval denied", http.StatusForbidden)
 			return
 		}
 	}
 	if err := s.store.setAdminPassword(req.NewSecret); err != nil {
 		s.auditEvent(auditEntry{Event: "admin_password_change", IP: ip, Result: "failed", Fields: map[string]string{"reason": "set_failed"}})
-		http.Error(w, err.Error(), http.StatusBadRequest)
+		writeStoreError(w, http.StatusBadRequest, err)
 		return
 	}
 	log.Printf("admin password changed at=%s remote=%s", time.Now().UTC().Format(time.RFC3339), r.RemoteAddr)
@@ -383,22 +359,14 @@ func csrfTokenMatches(expected, provided string) bool {
 }
 
 func (s *server) handleAdminPasswordForceSet(w http.ResponseWriter, r *http.Request) {
-	if !s.requireAdmin(w, r) {
-		return
-	}
-	if r.Method != http.MethodPost {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
 	var req struct {
 		NewSecret string `json:"new_secret"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+	if !decodeJSON(w, r, &req) {
 		return
 	}
 	if err := s.store.setAdminPassword(req.NewSecret); err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+		writeStoreError(w, http.StatusBadRequest, err)
 		return
 	}
 	s.revokeAdminSessions()

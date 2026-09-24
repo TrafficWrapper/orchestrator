@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"strings"
 	"time"
 
@@ -115,7 +116,7 @@ func (s *server) handleDeviceEnroll(peer []byte, raw []byte) (any, error) {
 			SignerPublicKey: pub,
 			ClientBundle:    bundle,
 		}, nil
-	} else if err.Error() != "device not found" {
+	} else if !errors.Is(err, errNotFound) {
 		return nil, err
 	}
 	device := deviceRecord{
