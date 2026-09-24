@@ -16,6 +16,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"aead.dev/minisign"
@@ -519,24 +520,71 @@ func (s *server) storeAPKRelease(manifest apkReleaseRecord, manifestJSON, minisi
 	return manifest, nil
 }
 
+const (
+	// maxConcurrentAPKShipments bounds pulls that carry the APK at once: each
+	// one is JSON-encoded, encrypted and base64-encoded again (several times
+	// the APK size in memory), and a release sends every worker to pull.
+	maxConcurrentAPKShipments = 2
+	apkShipmentWait           = 30 * time.Second
+)
+
 // updateArtifactForPull returns the APK update only when the worker has not
 // yet acknowledged the current release (or reports no applied state), so
-// config-only bumps do not re-ship the whole APK to every worker.
-func (s *server) updateArtifactForPull(worker workerRecord, haveSeq int64) (*updateArtifact, error) {
+// config-only bumps do not re-ship the whole APK. The returned release func
+// must run after the response is written. When all shipment slots stay busy
+// the pull goes out without the APK; since it is not marked sent, the next
+// pull ships it.
+func (s *server) updateArtifactForPull(worker workerRecord, haveSeq int64) (*updateArtifact, func(), error) {
 	rel, ok, err := s.store.currentAPKRelease()
 	if err != nil || !ok {
-		return nil, err
+		return nil, nil, err
 	}
 	if haveSeq > 0 && worker.APKAppliedSeq == rel.Seq {
-		return nil, nil
+		return nil, nil, nil
+	}
+	release, acquired := s.acquireAPKShipment(apkShipmentWait)
+	if !acquired {
+		log.Printf("apk shipment slots busy; worker %s pulls without update this time", worker.ID)
+		return nil, nil, nil
+	}
+	update, err := s.cachedUpdateArtifact(rel)
+	if err != nil {
+		release()
+		return nil, nil, err
+	}
+	if err := s.store.markWorkerAPKSent(worker.ID, rel.Seq, worker.DesiredSeq); err != nil {
+		release()
+		return nil, nil, err
+	}
+	return update, release, nil
+}
+
+func (s *server) acquireAPKShipment(wait time.Duration) (func(), bool) {
+	s.apkShipOnce.Do(func() { s.apkShipSem = make(chan struct{}, maxConcurrentAPKShipments) })
+	timer := time.NewTimer(wait)
+	defer timer.Stop()
+	select {
+	case s.apkShipSem <- struct{}{}:
+		var once sync.Once
+		return func() { once.Do(func() { <-s.apkShipSem }) }, true
+	case <-timer.C:
+		return nil, false
+	}
+}
+
+// cachedUpdateArtifact reads and base64-encodes a release once; the artifact
+// is shared read-only by all pulls of that release.
+func (s *server) cachedUpdateArtifact(rel apkReleaseRecord) (*updateArtifact, error) {
+	s.apkArtifactMu.Lock()
+	defer s.apkArtifactMu.Unlock()
+	if s.apkArtifact != nil && s.apkArtifactSeq == rel.Seq {
+		return s.apkArtifact, nil
 	}
 	update, err := readUpdateArtifact(rel)
 	if err != nil {
 		return nil, err
 	}
-	if err := s.store.markWorkerAPKSent(worker.ID, rel.Seq, worker.DesiredSeq); err != nil {
-		return nil, err
-	}
+	s.apkArtifact, s.apkArtifactSeq = update, rel.Seq
 	return update, nil
 }
 

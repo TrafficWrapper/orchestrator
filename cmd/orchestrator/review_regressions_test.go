@@ -35,7 +35,7 @@ func TestResyncShipsAPKEvenIfStaleAckFollows(t *testing.T) {
 	}
 	w := addApprovedWorkerWithStatic(t, s, "resync-worker")
 	rec, _ := s.store.worker(w.ID)
-	if _, err := s.updateArtifactForPull(rec, rec.DesiredSeq-1); err != nil {
+	if _, err := pullArtifactForTest(s, rec, rec.DesiredSeq-1); err != nil {
 		t.Fatal(err)
 	}
 	if err := s.store.updateAck(rec.ID, rec.DesiredSeq, "", nil); err != nil {
@@ -50,7 +50,7 @@ func TestResyncShipsAPKEvenIfStaleAckFollows(t *testing.T) {
 		t.Fatal(err)
 	}
 	rec, _ = s.store.worker(w.ID)
-	if update, _ := s.updateArtifactForPull(rec, have); update == nil {
+	if update, _ := pullArtifactForTest(s, rec, have); update == nil {
 		t.Fatal("resync pull must ship the APK")
 	}
 }

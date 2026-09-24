@@ -42,6 +42,8 @@ type pullResponse struct {
 	WorkerBundle signedConfig    `json:"worker_bundle,omitempty"`
 	ClientBundle signedConfig    `json:"client_bundle,omitempty"`
 	Update       *updateArtifact `json:"update,omitempty"`
+	// release frees the APK shipment slot once the response is written.
+	release func()
 }
 
 type updateArtifact struct {
@@ -137,11 +139,11 @@ func (s *server) handlePull(peer []byte, raw []byte) (any, error) {
 	if err != nil {
 		return nil, err
 	}
-	update, err := s.updateArtifactForPull(rec, req.HaveSeq)
+	update, release, err := s.updateArtifactForPull(rec, req.HaveSeq)
 	if err != nil {
 		return nil, err
 	}
-	return pullResponse{OK: true, Status: rec.Status, WorkerID: rec.ID, DesiredSeq: rec.DesiredSeq, WorkerBundle: wb, ClientBundle: cb, Update: update}, nil
+	return pullResponse{OK: true, Status: rec.Status, WorkerID: rec.ID, DesiredSeq: rec.DesiredSeq, WorkerBundle: wb, ClientBundle: cb, Update: update, release: release}, nil
 }
 
 const (
@@ -257,4 +259,10 @@ func (s *server) fetchEgressProbe() string {
 		return stringFromMap(body, "egress_ip")
 	}
 	return strings.TrimSpace(string(raw))
+}
+
+func (p pullResponse) releaseAfterWrite() {
+	if p.release != nil {
+		p.release()
+	}
 }
