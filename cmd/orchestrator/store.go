@@ -1088,12 +1088,16 @@ func clientVersionWouldRollback(current, next string) bool {
 	if current == "" {
 		return false
 	}
-	currentCode := clientVersionCode(current)
-	nextCode := clientVersionCode(next)
-	if currentCode == 0 {
+	if clientVersionCode(current) == 0 {
 		return false
 	}
-	return nextCode == 0 || nextCode < currentCode
+	if len(clientVersionParts(current)) == 1 || len(clientVersionParts(next)) == 1 {
+		// A bare version code on either side: only the code space compares.
+		nextCode := clientVersionCode(next)
+		return nextCode == 0 || nextCode < clientVersionCode(current)
+	}
+	cmp, ok := compareClientVersions(next, current)
+	return !ok || cmp < 0
 }
 
 // applyDeviceLimitsChange sets new limits. A cleared limit set or a changed

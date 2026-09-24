@@ -55,7 +55,64 @@ func parseClientVersionToken(token string) int {
 			return 0
 		}
 	}
-	return major*10000 + minor*100 + patch
+	// The code space (major*10000 + minor*100 + patch) is what operators use
+	// for thresholds, so it cannot be widened. Saturate minor/patch at 99 so
+	// the code stays monotonic and 1.100.0 or 0.1.100 never alias the next
+	// minor/major release; exact ordering uses compareClientVersions.
+	return major*10000 + min(minor, 99)*100 + min(patch, 99)
+}
+
+// clientVersionParts extracts the first dotted numeric version in value.
+func clientVersionParts(value string) []int {
+	raw := strings.TrimSpace(value)
+	for i := 0; i < len(raw); i++ {
+		if raw[i] < '0' || raw[i] > '9' {
+			continue
+		}
+		j := i
+		for j < len(raw) && ((raw[j] >= '0' && raw[j] <= '9') || raw[j] == '.') {
+			j++
+		}
+		var parts []int
+		for _, field := range strings.Split(strings.Trim(raw[i:j], "."), ".") {
+			n, err := strconv.Atoi(field)
+			if err != nil {
+				parts = nil
+				break
+			}
+			parts = append(parts, n)
+		}
+		if len(parts) > 0 {
+			return parts
+		}
+		i = j
+	}
+	return nil
+}
+
+// compareClientVersions orders two version strings component by component;
+// ok is false when either has no numeric version.
+func compareClientVersions(a, b string) (cmp int, ok bool) {
+	pa, pb := clientVersionParts(a), clientVersionParts(b)
+	if len(pa) == 0 || len(pb) == 0 {
+		return 0, false
+	}
+	for i := 0; i < len(pa) || i < len(pb); i++ {
+		var x, y int
+		if i < len(pa) {
+			x = pa[i]
+		}
+		if i < len(pb) {
+			y = pb[i]
+		}
+		if x != y {
+			if x < y {
+				return -1, true
+			}
+			return 1, true
+		}
+	}
+	return 0, true
 }
 
 func minVersionFor(feature string) int {
