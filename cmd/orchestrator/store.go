@@ -886,9 +886,10 @@ const tokenRetentionAfterUse = 7 * 24 * time.Hour
 
 func (s *orchStore) pruneDeadTokens(now time.Time) (int, error) {
 	var dead [][]byte
-	err := s.db.Update(func(tx *bolt.Tx) error {
-		b := tx.Bucket(bucketTokens)
-		if err := b.ForEach(func(k, v []byte) error {
+	// Scan read-only: the janitor runs every 30s and an empty write
+	// transaction still costs an fsync.
+	if err := s.db.View(func(tx *bolt.Tx) error {
+		return tx.Bucket(bucketTokens).ForEach(func(k, v []byte) error {
 			var rec tokenRecord
 			if err := json.Unmarshal(v, &rec); err != nil {
 				return nil
@@ -899,9 +900,12 @@ func (s *orchStore) pruneDeadTokens(now time.Time) (int, error) {
 				dead = append(dead, append([]byte(nil), k...))
 			}
 			return nil
-		}); err != nil {
-			return err
-		}
+		})
+	}); err != nil || len(dead) == 0 {
+		return 0, err
+	}
+	err := s.db.Update(func(tx *bolt.Tx) error {
+		b := tx.Bucket(bucketTokens)
 		for _, k := range dead {
 			if err := b.Delete(k); err != nil {
 				return err
@@ -1281,6 +1285,20 @@ func deviceAWGKeys(rec deviceRecord) []string {
 	return keys
 }
 
+// deviceBlockReason names why an approved device must be blocked now, or "".
+func deviceBlockReason(rec deviceRecord, now time.Time) string {
+	if rec.Status != "approved" {
+		return ""
+	}
+	if deviceLimitsExpired(rec.Limits, now) {
+		return "expires_at"
+	}
+	if rec.Limits.TrafficQuotaBytes > 0 && saturatingAddUint64(rec.UsageRxBytes, rec.UsageTxBytes) >= rec.Limits.TrafficQuotaBytes {
+		return "traffic_quota_bytes"
+	}
+	return ""
+}
+
 // applyUsageToDevice folds the reports that belong to rec into its counters
 // and applies quota/expiry blocking. It reports whether rec changed and
 // whether it was newly blocked.
@@ -1299,13 +1317,8 @@ func applyUsageToDevice(rec *deviceRecord, workerID string, grouped deviceUsageR
 			}
 		}
 	}
-	reason := ""
-	if deviceLimitsExpired(rec.Limits, now) {
-		reason = "expires_at"
-	} else if rec.Limits.TrafficQuotaBytes > 0 && saturatingAddUint64(rec.UsageRxBytes, rec.UsageTxBytes) >= rec.Limits.TrafficQuotaBytes {
-		reason = "traffic_quota_bytes"
-	}
-	if reason != "" && rec.Status == "approved" {
+	reason := deviceBlockReason(*rec, now)
+	if reason != "" {
 		rec.Status = "revoked"
 		rec.BlockedReason = reason
 		blockedAt := now.UTC()
@@ -1324,6 +1337,26 @@ func applyUsageToDevice(rec *deviceRecord, workerID string, grouped deviceUsageR
 // acks use applyReportedDeviceUsage, which touches only reported devices.
 func (s *orchStore) applyDeviceUsageAndBlocks(workerID string, reports []deviceUsage, now time.Time) (int, error) {
 	grouped := groupDeviceUsageReports(reports)
+	if len(grouped.byID) == 0 && len(grouped.byAWG) == 0 {
+		// Periodic sweep: find devices to block read-only first so the
+		// writer lock is not held across a full decrypt when there are none.
+		pending := false
+		if err := s.db.View(func(tx *bolt.Tx) error {
+			return tx.Bucket(bucketDevices).ForEach(func(k, raw []byte) error {
+				if pending {
+					return nil
+				}
+				var rec deviceRecord
+				if err := s.openJSON(bucketDevices, k, raw, &rec); err != nil {
+					return err
+				}
+				pending = deviceBlockReason(rec, now) != ""
+				return nil
+			})
+		}); err != nil || !pending {
+			return 0, err
+		}
+	}
 	blocked := 0
 	err := s.db.Update(func(tx *bolt.Tx) error {
 		n, err := s.sweepDeviceUsageTx(tx, workerID, grouped, now, nil)
@@ -2007,7 +2040,34 @@ func applyAck(rec *workerRecord, applied int64, observed string, self map[string
 	}
 }
 
+func workerStale(rec workerRecord, cutoff time.Time) bool {
+	if rec.Status != "approved" && rec.Status != "active" {
+		return false
+	}
+	lastSeen := rec.CreatedAt
+	if rec.ApprovedAt != nil {
+		lastSeen = *rec.ApprovedAt
+	}
+	if rec.LastAckAt != nil {
+		lastSeen = *rec.LastAckAt
+	}
+	return !lastSeen.After(cutoff)
+}
+
 func (s *orchStore) markStaleWorkersInactive(cutoff time.Time) (int, error) {
+	any := false
+	if err := s.db.View(func(tx *bolt.Tx) error {
+		return tx.Bucket(bucketWorkers).ForEach(func(k, raw []byte) error {
+			var rec workerRecord
+			if err := s.openJSON(bucketWorkers, k, raw, &rec); err != nil {
+				return err
+			}
+			any = any || workerStale(rec, cutoff)
+			return nil
+		})
+	}); err != nil || !any {
+		return 0, err
+	}
 	updated := 0
 	err := s.db.Update(func(tx *bolt.Tx) error {
 		return rewriteBucket(tx.Bucket(bucketWorkers), func(k, raw []byte) ([]byte, error) {
@@ -2015,17 +2075,7 @@ func (s *orchStore) markStaleWorkersInactive(cutoff time.Time) (int, error) {
 			if err := s.openJSON(bucketWorkers, k, raw, &rec); err != nil {
 				return nil, err
 			}
-			if rec.Status != "approved" && rec.Status != "active" {
-				return nil, nil
-			}
-			lastSeen := rec.CreatedAt
-			if rec.ApprovedAt != nil {
-				lastSeen = *rec.ApprovedAt
-			}
-			if rec.LastAckAt != nil {
-				lastSeen = *rec.LastAckAt
-			}
-			if lastSeen.After(cutoff) {
+			if !workerStale(rec, cutoff) {
 				return nil, nil
 			}
 			rec.Status = "inactive"

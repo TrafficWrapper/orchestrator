@@ -59,3 +59,25 @@ func TestRecordAckReturnsSeqAfterQuotaBump(t *testing.T) {
 		t.Fatalf("stored=%+v desired=%d", stored, desired)
 	}
 }
+
+func TestIdleJanitorDoesNotWrite(t *testing.T) {
+	s := newTestServer(t)
+	w := addApprovedWorkerWithStatic(t, s, "idle-worker")
+	rec, _ := s.store.worker(w.ID)
+	_ = s.store.updateWorkerHeartbeat(w.ID, rec.DesiredSeq, rec.SelfDescribe)
+	putQuotaDevice(t, s, deviceRecord{ID: "idle-dev", Status: "approved", CreatedAt: time.Now().UTC()})
+	before := lastTxID(t, s)
+	now := time.Now().UTC()
+	if n, err := s.store.markStaleWorkersInactive(now.Add(-workerFreshTTL)); err != nil || n != 0 {
+		t.Fatalf("stale=%d err=%v", n, err)
+	}
+	if n, err := s.store.pruneDeadTokens(now); err != nil || n != 0 {
+		t.Fatalf("pruned=%d err=%v", n, err)
+	}
+	if n, err := s.store.applyDeviceUsageAndBlocks("", nil, now); err != nil || n != 0 {
+		t.Fatalf("blocked=%d err=%v", n, err)
+	}
+	if after := lastTxID(t, s); after != before {
+		t.Fatalf("idle janitor wrote to the DB (tx %d -> %d)", before, after)
+	}
+}
