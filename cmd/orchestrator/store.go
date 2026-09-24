@@ -53,16 +53,18 @@ type orchStore struct {
 	// another key.
 	rejectLegacySealed atomic.Bool
 
-	// approvedCache holds decrypted approved devices for the committed DB
-	// state identified by approvedCacheTx (see approvedDevices).
 	// seqSignal is closed (and replaced) after every commit that changes a
 	// worker's DesiredSeq, waking nudge long-polls without DB polling.
 	seqSignalMu sync.Mutex
 	seqSignal   chan struct{}
 
-	approvedCacheMu sync.Mutex
-	approvedCacheTx int
-	approvedCache   []deviceRecord
+	// approvedCache holds decrypted approved devices for the device-config
+	// revision approvedCacheRev (the devices bucket sequence, see
+	// approvedDevices).
+	approvedCacheMu  sync.Mutex
+	approvedCacheRev uint64
+	approvedCacheSet bool
+	approvedCache    []deviceRecord
 }
 
 type tokenRecord struct {
@@ -1611,18 +1613,19 @@ func (s *orchStore) telemetrySnapshots() (map[string]telemetrySnapshotRecord, er
 	return out, err
 }
 
-// approvedDevices returns approved, fully provisioned devices. Every worker
-// pull needs this list, and after a seq bump all workers pull at once, so the
-// decrypted result is cached per committed DB state: a read transaction's ID
-// is the ID of the last committed write, and the list is built inside that
-// same transaction, so a cache hit can never return data older than the DB.
-// Callers must treat the returned records as read-only.
+// approvedDevices returns approved, fully provisioned devices for worker
+// config. Every pull needs it and a seq bump sends all workers to pull at
+// once, so the decrypted list is cached per device-config revision: the
+// devices bucket sequence, advanced by bumpWorkerSeqsTx in the same
+// transaction as any config change and read here in the same snapshot as the
+// data. Usage counters and client versions (not part of worker config) do not
+// advance it and may be stale in the result. Treat records as read-only.
 func (s *orchStore) approvedDevices() ([]deviceRecord, error) {
 	var out []deviceRecord
 	err := s.db.View(func(tx *bolt.Tx) error {
-		rev := tx.ID()
+		rev := tx.Bucket(bucketDevices).Sequence()
 		s.approvedCacheMu.Lock()
-		if s.approvedCache != nil && s.approvedCacheTx == rev {
+		if s.approvedCacheSet && s.approvedCacheRev == rev {
 			out = append([]deviceRecord(nil), s.approvedCache...)
 			s.approvedCacheMu.Unlock()
 			return nil
@@ -1645,9 +1648,10 @@ func (s *orchStore) approvedDevices() ([]deviceRecord, error) {
 			return err
 		}
 		s.approvedCacheMu.Lock()
-		if rev >= s.approvedCacheTx {
-			s.approvedCacheTx = rev
+		if !s.approvedCacheSet || rev >= s.approvedCacheRev {
+			s.approvedCacheRev = rev
 			s.approvedCache = fresh
+			s.approvedCacheSet = true
 		}
 		s.approvedCacheMu.Unlock()
 		out = append([]deviceRecord(nil), fresh...)
@@ -2327,6 +2331,12 @@ func (s *orchStore) signalWorkerSeqChange() {
 
 func (s *orchStore) bumpWorkerSeqsTx(tx *bolt.Tx) error {
 	tx.OnCommit(s.signalWorkerSeqChange)
+	// Every change to device config that workers must see goes through a
+	// seq bump; advancing the devices bucket sequence here versions the
+	// approvedDevices cache without counting usage/heartbeat writes.
+	if _, err := tx.Bucket(bucketDevices).NextSequence(); err != nil {
+		return err
+	}
 	return rewriteBucket(tx.Bucket(bucketWorkers), func(k, raw []byte) ([]byte, error) {
 		var rec workerRecord
 		if err := s.openJSON(bucketWorkers, k, raw, &rec); err != nil {
