@@ -1806,14 +1806,13 @@ func (s *orchStore) updateAckWithProbe(id string, applied int64, observed string
 func (s *orchStore) markStaleWorkersInactive(cutoff time.Time) (int, error) {
 	updated := 0
 	err := s.db.Update(func(tx *bolt.Tx) error {
-		b := tx.Bucket(bucketWorkers)
-		return b.ForEach(func(k, raw []byte) error {
+		return rewriteBucket(tx.Bucket(bucketWorkers), func(_, raw []byte) ([]byte, error) {
 			var rec workerRecord
 			if err := s.openJSON(raw, &rec); err != nil {
-				return err
+				return nil, err
 			}
 			if rec.Status != "approved" && rec.Status != "active" {
-				return nil
+				return nil, nil
 			}
 			lastSeen := rec.CreatedAt
 			if rec.ApprovedAt != nil {
@@ -1823,18 +1822,11 @@ func (s *orchStore) markStaleWorkersInactive(cutoff time.Time) (int, error) {
 				lastSeen = *rec.LastAckAt
 			}
 			if lastSeen.After(cutoff) {
-				return nil
+				return nil, nil
 			}
 			rec.Status = "inactive"
-			sealed, err := s.sealJSON(rec)
-			if err != nil {
-				return err
-			}
-			if err := b.Put(k, sealed); err != nil {
-				return err
-			}
 			updated++
-			return nil
+			return s.sealJSON(rec)
 		})
 	})
 	if err == nil && updated > 0 {
@@ -1963,26 +1955,45 @@ func workerDiscoveryFingerprint(rec workerRecord, now time.Time) [sha256.Size]by
 	return sha256.Sum256(raw)
 }
 
-func (s *orchStore) bumpWorkerSeqsTx(tx *bolt.Tx) error {
-	b := tx.Bucket(bucketWorkers)
-	return b.ForEach(func(k, raw []byte) error {
-		var rec workerRecord
-		if err := s.openJSON(raw, &rec); err != nil {
+// rewriteBucket calls fn for every key and stores the non-nil values it
+// returns once iteration finishes; bbolt forbids modifying a bucket from
+// inside ForEach.
+func rewriteBucket(b *bolt.Bucket, fn func(k, v []byte) ([]byte, error)) error {
+	type pendingPut struct{ key, value []byte }
+	var puts []pendingPut
+	if err := b.ForEach(func(k, v []byte) error {
+		next, err := fn(k, v)
+		if err != nil || next == nil {
 			return err
 		}
+		puts = append(puts, pendingPut{key: append([]byte(nil), k...), value: next})
+		return nil
+	}); err != nil {
+		return err
+	}
+	for _, p := range puts {
+		if err := b.Put(p.key, p.value); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s *orchStore) bumpWorkerSeqsTx(tx *bolt.Tx) error {
+	return rewriteBucket(tx.Bucket(bucketWorkers), func(_, raw []byte) ([]byte, error) {
+		var rec workerRecord
+		if err := s.openJSON(raw, &rec); err != nil {
+			return nil, err
+		}
 		if rec.Status != "approved" && rec.Status != "active" {
-			return nil
+			return nil, nil
 		}
 		if rec.DesiredSeq < 1 {
 			rec.DesiredSeq = 1
 		} else {
 			rec.DesiredSeq++
 		}
-		sealed, err := s.sealJSON(rec)
-		if err != nil {
-			return err
-		}
-		return b.Put(k, sealed)
+		return s.sealJSON(rec)
 	})
 }
 
