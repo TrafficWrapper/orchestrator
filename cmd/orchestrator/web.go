@@ -211,20 +211,11 @@ func (s *server) renderWeb(w http.ResponseWriter, data webPageData) {
 }
 
 func (s *server) webSession(r *http.Request) (adminSession, bool) {
-	cookie, err := r.Cookie("tw_admin_session")
-	if err != nil || strings.TrimSpace(cookie.Value) == "" {
+	cookie, err := r.Cookie(adminSessionCookie)
+	if err != nil {
 		return adminSession{}, false
 	}
-	value, ok := s.adminSessions.Load(cookie.Value)
-	if !ok {
-		return adminSession{}, false
-	}
-	session := value.(adminSession)
-	if time.Now().UTC().After(session.ExpiresAt) {
-		s.adminSessions.Delete(cookie.Value)
-		return adminSession{}, false
-	}
-	return session, true
+	return s.sessionByToken(cookie.Value)
 }
 
 func (s *server) webData(templateName, title, path string, session adminSession) (webPageData, error) {
@@ -254,7 +245,7 @@ func (s *server) webData(templateName, title, path string, session adminSession)
 		Authenticated:  true,
 		CSRFToken:      session.CSRFToken,
 		SessionExpires: session.ExpiresAt.Format(time.RFC3339),
-		ConfigSeq:      webConfigSeq(workers),
+		ConfigSeq:      platformConfigSeq(workers),
 		WorkerTotal:    len(workers),
 		DeviceTotal:    len(devices),
 		Health:         "ok",
@@ -284,7 +275,7 @@ func (s *server) webData(templateName, title, path string, session adminSession)
 			AWG:            workerProtocolEnabled(worker, "awg"),
 		}
 		item.APKSyncState = apkSyncState(worker, apkRelease, apkPublished)
-		if item.Enabled && item.Status == "active" {
+		if workerCountsAsActive(worker) {
 			page.WorkerActive++
 		}
 		page.Workers = append(page.Workers, item)
@@ -333,7 +324,15 @@ func (s *server) webData(templateName, title, path string, session adminSession)
 	return page, nil
 }
 
-func webConfigSeq(workers []workerRecord) int64 {
+// workerCountsAsActive is the one definition of an "active" worker shown by
+// the web dashboard and the Telegram bot: enabled and acking its config.
+func workerCountsAsActive(worker workerRecord) bool {
+	return !worker.Disabled && worker.Status == "active"
+}
+
+// platformConfigSeq is the config seq reported to the owner: the highest
+// desired seq among approved/active workers (at least 1).
+func platformConfigSeq(workers []workerRecord) int64 {
 	seq := int64(1)
 	for _, worker := range workers {
 		if worker.Status != "approved" && worker.Status != "active" {

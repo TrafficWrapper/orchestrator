@@ -113,7 +113,7 @@ func (s *server) createAdminSession(w http.ResponseWriter, r *http.Request, must
 	expires := time.Now().UTC().Add(12 * time.Hour)
 	s.adminSessions.Store(token, adminSession{Token: token, CSRFToken: csrf, ExpiresAt: expires, MustChange: mustChange})
 	http.SetCookie(w, &http.Cookie{
-		Name:     "tw_admin_session",
+		Name:     adminSessionCookie,
 		Value:    token,
 		Path:     "/",
 		HttpOnly: true,
@@ -162,7 +162,7 @@ func (s *server) handleAdminLogout(w http.ResponseWriter, r *http.Request) {
 		s.adminSessions.Delete(token)
 	}
 	http.SetCookie(w, &http.Cookie{
-		Name:     "tw_admin_session",
+		Name:     adminSessionCookie,
 		Value:    "",
 		Path:     "/",
 		HttpOnly: true,
@@ -242,7 +242,7 @@ func (s *server) lookupAdminSession(r *http.Request) (string, string, adminSessi
 		source = "bearer"
 	}
 	if token == "" {
-		if cookie, err := r.Cookie("tw_admin_session"); err == nil {
+		if cookie, err := r.Cookie(adminSessionCookie); err == nil {
 			token = cookie.Value
 			source = "cookie"
 		}
@@ -250,16 +250,28 @@ func (s *server) lookupAdminSession(r *http.Request) (string, string, adminSessi
 	if token == "" {
 		return "", "", adminSession{}, false
 	}
+	session, ok := s.sessionByToken(token)
+	return token, source, session, ok
+}
+
+// adminSessionCookie names the admin session cookie (web UI and API).
+const adminSessionCookie = "tw_admin_session"
+
+// sessionByToken returns the live session for token, dropping it if expired.
+func (s *server) sessionByToken(token string) (adminSession, bool) {
+	if strings.TrimSpace(token) == "" {
+		return adminSession{}, false
+	}
 	value, ok := s.adminSessions.Load(token)
 	if !ok {
-		return token, source, adminSession{}, false
+		return adminSession{}, false
 	}
 	session := value.(adminSession)
 	if time.Now().UTC().After(session.ExpiresAt) {
 		s.adminSessions.Delete(token)
-		return token, source, adminSession{}, false
+		return adminSession{}, false
 	}
-	return token, source, session, true
+	return session, true
 }
 
 func (s *server) requireAdmin(w http.ResponseWriter, r *http.Request) bool {

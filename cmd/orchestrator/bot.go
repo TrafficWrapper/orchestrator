@@ -531,7 +531,7 @@ func (b *telegramBot) statusText() string {
 	devices, _ := b.server.store.devices()
 	activeWorkers := 0
 	for _, worker := range workers {
-		if !worker.Disabled && (worker.Status == "active" || worker.Status == "approved") {
+		if workerCountsAsActive(worker) {
 			activeWorkers++
 		}
 	}
@@ -547,7 +547,7 @@ func (b *telegramBot) statusText() string {
 		len(workers),
 		approvedDevices,
 		len(devices),
-		maxWorkerDesiredSeq(workers),
+		platformConfigSeq(workers),
 	)
 }
 
@@ -805,16 +805,6 @@ func botHelpText() string {
 		"/approve — pending approvals",
 		"/limit <device_id> <quota> <rate> <expiry> — задать лимиты",
 	}, "\n")
-}
-
-func maxWorkerDesiredSeq(workers []workerRecord) int64 {
-	var out int64
-	for _, worker := range workers {
-		if worker.DesiredSeq > out {
-			out = worker.DesiredSeq
-		}
-	}
-	return out
 }
 
 func onOffText(on bool) string {

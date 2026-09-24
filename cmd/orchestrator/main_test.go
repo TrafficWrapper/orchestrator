@@ -1536,11 +1536,11 @@ func TestWebConfigSeqUsesLoadedWorkersOnly(t *testing.T) {
 		{Status: "approved", DesiredSeq: 3},
 		{Status: "active", DesiredSeq: 7},
 	}
-	if got := webConfigSeq(workers); got != 7 {
+	if got := platformConfigSeq(workers); got != 7 {
 		t.Fatalf("webConfigSeq = %d, want 7", got)
 	}
-	if got := webConfigSeq(nil); got != 1 {
-		t.Fatalf("webConfigSeq(nil) = %d, want 1", got)
+	if got := platformConfigSeq(nil); got != 1 {
+		t.Fatalf("platformConfigSeq(nil) = %d, want 1", got)
 	}
 }
 
