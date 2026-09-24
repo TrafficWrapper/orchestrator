@@ -140,22 +140,24 @@ type deviceRecord struct {
 	ClientVersion   string `json:"client_version,omitempty"`
 	// RealityFlow is "" or xtls-rprx-vision, chosen from the capabilities the
 	// app declared at enrollment; workers set it on the device's account.
-	RealityFlow    string                        `json:"reality_flow,omitempty"`
-	AWGPublicKey   string                        `json:"awg_public_key,omitempty"`
-	RealityUUID    string                        `json:"reality_uuid,omitempty"`
-	InternalIP     string                        `json:"internal_ip,omitempty"`
-	PSK2           string                        `json:"psk2,omitempty"`
-	AWGProfiles    map[string]deviceAWGProfile   `json:"awg_profiles,omitempty"`
-	BootstrapToken string                        `json:"bootstrap_token"`
-	Limits         deviceLimits                  `json:"limits,omitempty"`
-	UsageRxBytes   uint64                        `json:"usage_rx_bytes,omitempty"`
-	UsageTxBytes   uint64                        `json:"usage_tx_bytes,omitempty"`
-	UsageCounters  map[string]deviceUsageCounter `json:"usage_counters,omitempty"`
-	UsageUpdatedAt *time.Time                    `json:"usage_updated_at,omitempty"`
-	BlockedAt      *time.Time                    `json:"blocked_at,omitempty"`
-	BlockedReason  string                        `json:"blocked_reason,omitempty"`
-	CreatedAt      time.Time                     `json:"created_at"`
-	ConfigSeq      int64                         `json:"config_seq"`
+	RealityFlow string `json:"reality_flow,omitempty"`
+	// ClientCapabilities is the capability list the app sent at enrollment.
+	ClientCapabilities []string                      `json:"client_capabilities,omitempty"`
+	AWGPublicKey       string                        `json:"awg_public_key,omitempty"`
+	RealityUUID        string                        `json:"reality_uuid,omitempty"`
+	InternalIP         string                        `json:"internal_ip,omitempty"`
+	PSK2               string                        `json:"psk2,omitempty"`
+	AWGProfiles        map[string]deviceAWGProfile   `json:"awg_profiles,omitempty"`
+	BootstrapToken     string                        `json:"bootstrap_token"`
+	Limits             deviceLimits                  `json:"limits,omitempty"`
+	UsageRxBytes       uint64                        `json:"usage_rx_bytes,omitempty"`
+	UsageTxBytes       uint64                        `json:"usage_tx_bytes,omitempty"`
+	UsageCounters      map[string]deviceUsageCounter `json:"usage_counters,omitempty"`
+	UsageUpdatedAt     *time.Time                    `json:"usage_updated_at,omitempty"`
+	BlockedAt          *time.Time                    `json:"blocked_at,omitempty"`
+	BlockedReason      string                        `json:"blocked_reason,omitempty"`
+	CreatedAt          time.Time                     `json:"created_at"`
+	ConfigSeq          int64                         `json:"config_seq"`
 }
 
 type deviceUsageCounter struct {

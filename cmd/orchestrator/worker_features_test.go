@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -220,5 +221,31 @@ func TestRealityFallbackRoutesAreOptInAndFlowless(t *testing.T) {
 	fb := routes[1].(map[string]any)
 	if intFromMap(fb, "port", 0) != 8443 || fb["network"] != "xhttp" || fb["flow"] != nil || fb["flows"] != nil {
 		t.Fatalf("bad fallback route: %v", fb)
+	}
+}
+
+func TestAWGProfileRouteSkipsEmptyWorkerFields(t *testing.T) {
+	route := map[string]any{"params": map[string]any{}}
+	inheritAWGWorkerFields(route, map[string]any{"endpoint_v6": "", "dns": []any{}})
+	if _, ok := route["endpoint_v6"]; ok {
+		t.Fatalf("empty endpoint_v6 copied: %v", route)
+	}
+	if _, ok := route["dns"]; ok {
+		t.Fatalf("empty dns copied: %v", route)
+	}
+}
+
+func TestEnrollClientCapabilitiesAlias(t *testing.T) {
+	req := deviceEnrollRequest{
+		ClientCapabilities: []string{"tunnel_dns", "reality_vision", " "},
+		Capabilities:       []string{"reality_vision", "ipv6_endpoints"},
+	}
+	got := req.capabilities()
+	want := []string{"ipv6_endpoints", "reality_vision", "tunnel_dns"}
+	if !slices.Equal(got, want) {
+		t.Fatalf("capabilities=%v want %v", got, want)
+	}
+	if deviceRealityFlow(deviceEnrollRequest{ClientCapabilities: []string{"reality_vision"}}.capabilities()) != realityFlowVision {
+		t.Fatal("client_capabilities must negotiate Vision")
 	}
 }

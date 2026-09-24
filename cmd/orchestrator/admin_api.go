@@ -337,6 +337,7 @@ func (s *server) handleAdminDevices(w http.ResponseWriter, r *http.Request) {
 			"status":                   device.Status,
 			"client_version":           device.ClientVersion, // enroll-time snapshot kept for API compatibility
 			"reality_flow":             device.RealityFlow,
+			"client_capabilities":      device.ClientCapabilities,
 			"reality_cohort":           realityCohortIndex(device.ID, realityCohortSlots),
 			"installed_version":        installedVersion,
 			"installed_version_source": versionSource,

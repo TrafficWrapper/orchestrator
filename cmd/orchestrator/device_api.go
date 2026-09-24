@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"errors"
+	"slices"
 	"strings"
 	"time"
 
@@ -20,9 +21,25 @@ type deviceEnrollRequest struct {
 	EnrollmentNonce string `json:"enrollment_nonce,omitempty"`
 	ClientVersion   string `json:"client_version,omitempty"`
 	AWGPublicKey    string `json:"awg_public_key,omitempty"`
-	// Capabilities the app supports, e.g. "reality_vision". Absent in older
-	// apps, which therefore keep the flow-less REALITY account.
-	Capabilities []string `json:"capabilities,omitempty"`
+	// ClientCapabilities lists what the app supports, e.g. "reality_vision",
+	// "reality_short_id", "ipv6_endpoints", "tunnel_dns". Absent in older apps,
+	// which therefore keep the flow-less REALITY account. Capabilities is an
+	// accepted alias.
+	ClientCapabilities []string `json:"client_capabilities,omitempty"`
+	Capabilities       []string `json:"capabilities,omitempty"`
+}
+
+// capabilities returns the declared client capabilities from either field,
+// trimmed, deduplicated and sorted.
+func (r deviceEnrollRequest) capabilities() []string {
+	var out []string
+	for _, c := range append(append([]string(nil), r.ClientCapabilities...), r.Capabilities...) {
+		if c = strings.TrimSpace(c); c != "" && !slices.Contains(out, c) {
+			out = append(out, c)
+		}
+	}
+	slices.Sort(out)
+	return out
 }
 
 type deviceEnrollResponse struct {
@@ -105,9 +122,11 @@ func (s *server) handleDeviceEnroll(peer []byte, raw []byte) (any, error) {
 		}
 		// Re-enrollment re-negotiates Vision: an upgraded app turns it on, a
 		// reinstalled older app (no capabilities) turns it back off.
-		if flow := deviceRealityFlow(req.Capabilities); flow != existing.RealityFlow {
-			existing, err = s.store.updateDevice(existing.ID, true, func(rec *deviceRecord) error {
+		caps := req.capabilities()
+		if flow := deviceRealityFlow(caps); flow != existing.RealityFlow || !slices.Equal(caps, existing.ClientCapabilities) {
+			existing, err = s.store.updateDevice(existing.ID, flow != existing.RealityFlow, func(rec *deviceRecord) error {
 				rec.RealityFlow = flow
+				rec.ClientCapabilities = caps
 				return nil
 			})
 			if err != nil {
@@ -139,16 +158,17 @@ func (s *server) handleDeviceEnroll(peer []byte, raw []byte) (any, error) {
 		return nil, err
 	}
 	device := deviceRecord{
-		ID:              id,
-		NoisePublicKey:  noisePub,
-		IdentityPubKey:  identityPub,
-		IdentityKeyType: strings.TrimSpace(req.IdentityKeyType),
-		AndroidID:       strings.TrimSpace(req.AndroidID),
-		Model:           strings.TrimSpace(req.Model),
-		EnrollmentNonce: strings.TrimSpace(req.EnrollmentNonce),
-		ClientVersion:   strings.TrimSpace(req.ClientVersion),
-		AWGPublicKey:    awgPublic,
-		RealityFlow:     deviceRealityFlow(req.Capabilities),
+		ID:                 id,
+		NoisePublicKey:     noisePub,
+		IdentityPubKey:     identityPub,
+		IdentityKeyType:    strings.TrimSpace(req.IdentityKeyType),
+		AndroidID:          strings.TrimSpace(req.AndroidID),
+		Model:              strings.TrimSpace(req.Model),
+		EnrollmentNonce:    strings.TrimSpace(req.EnrollmentNonce),
+		ClientVersion:      strings.TrimSpace(req.ClientVersion),
+		AWGPublicKey:       awgPublic,
+		RealityFlow:        deviceRealityFlow(req.capabilities()),
+		ClientCapabilities: req.capabilities(),
 	}
 	_, stored, err := s.store.consumeBootstrapToken(req.BootstrapToken, device, awgProfiles)
 	if err != nil {

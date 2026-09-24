@@ -103,7 +103,7 @@ AWG остаётся fallback path, когда REALITY unhealthy.
 ## REALITY Vision, когорты short ID и ротация AWG
 
 - **Vision (на устройство).** Приложение передаёт в `/d/v1/enroll`
-  `capabilities: ["reality_vision"]`; оркестратор сохраняет для устройства
+  `client_capabilities: ["reality_vision", ...]` (синоним `capabilities`); оркестратор сохраняет для устройства
   `reality_flow = "xtls-rprx-vision"`, возвращает его в ответе enroll и
   отправляет воркерам в `desired_state.approved_devices[].reality_flow`.
   Повторный enroll без capability его снимает. Общий клиентский бандл flow не

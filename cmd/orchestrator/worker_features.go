@@ -254,7 +254,7 @@ func inheritAWGWorkerFields(route map[string]any, raw any) {
 	params, _ := route["params"].(map[string]any)
 	for _, key := range []string{"endpoint_v6", "dns"} {
 		value, ok := awg[key]
-		if !ok {
+		if !ok || isEmptyValue(value) {
 			continue
 		}
 		if _, exists := route[key]; !exists {
@@ -266,4 +266,20 @@ func inheritAWGWorkerFields(route map[string]any, raw any) {
 			}
 		}
 	}
+}
+
+// isEmptyValue reports whether a self-describe value is the worker's "feature
+// off" form: an empty string or list.
+func isEmptyValue(value any) bool {
+	switch v := value.(type) {
+	case nil:
+		return true
+	case string:
+		return strings.TrimSpace(v) == ""
+	case []any:
+		return len(v) == 0
+	case []string:
+		return len(v) == 0
+	}
+	return false
 }

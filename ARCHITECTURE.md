@@ -100,7 +100,7 @@ policy; AWG remains a fallback path when REALITY is unhealthy.
 
 ## REALITY Vision, Short ID Cohorts and AWG Rotation
 
-- **Vision (per device).** The app lists `capabilities: ["reality_vision"]` in
+- **Vision (per device).** The app lists `client_capabilities: ["reality_vision", ...]` (alias `capabilities`) in
   `/d/v1/enroll`; the orchestrator then stores `reality_flow =
   "xtls-rprx-vision"` for the device, returns it in the enroll response and
   sends it to workers in `desired_state.approved_devices[].reality_flow`.
