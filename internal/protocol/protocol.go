@@ -15,6 +15,13 @@ import (
 	"golang.org/x/crypto/pbkdf2"
 )
 
+// HashIterations is the PBKDF2 work factor for newly hashed secrets. Tests
+// lower it (never below MinHashIterations, which VerifySecret enforces).
+var HashIterations = 150000
+
+// MinHashIterations is the weakest stored hash VerifySecret accepts.
+const MinHashIterations = 10000
+
 const (
 	Prologue = "TrafficWrapper orchestrator worker v1"
 	KeySize  = 32
@@ -88,7 +95,7 @@ func HashSecret(secret string) (string, error) {
 	if _, err := rand.Read(salt); err != nil {
 		return "", err
 	}
-	const iterations = 150000
+	iterations := HashIterations
 	key := pbkdf2.Key([]byte(secret), salt, iterations, KeySize, sha256.New)
 	return fmt.Sprintf("pbkdf2-sha256:%d:%s:%s", iterations, base64.StdEncoding.EncodeToString(salt), base64.StdEncoding.EncodeToString(key)), nil
 }
@@ -99,7 +106,7 @@ func VerifySecret(encoded, secret string) bool {
 		return false
 	}
 	iterations, err := strconv.Atoi(parts[1])
-	if err != nil || iterations < 10000 {
+	if err != nil || iterations < MinHashIterations {
 		return false
 	}
 	salt, err := base64.StdEncoding.DecodeString(parts[2])
