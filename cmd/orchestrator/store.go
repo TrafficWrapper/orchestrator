@@ -3,6 +3,7 @@ package main
 import (
 	"crypto/aes"
 	"crypto/cipher"
+	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
@@ -40,6 +41,7 @@ var (
 type orchStore struct {
 	db                      *bolt.DB
 	aead                    cipher.AEAD
+	tokenLookupKey          []byte
 	discoveryWorkerRevision atomic.Uint64
 }
 
@@ -54,6 +56,9 @@ type tokenRecord struct {
 	Limits          json.RawMessage `json:"limits,omitempty"`
 	SeedWorkers     []string        `json:"seed_workers,omitempty"`
 	WorkerStaticPub string          `json:"worker_static_pub,omitempty"`
+	// Lookup is a keyed HMAC of the secret used to find the record without
+	// running PBKDF2 against every stored token. Legacy records lack it.
+	Lookup string `json:"lookup,omitempty"`
 }
 
 type workerRecord struct {
@@ -73,13 +78,22 @@ type workerRecord struct {
 	ConfigPriority   *int            `json:"config_priority,omitempty"`
 	ConfigWeight     *int            `json:"config_weight,omitempty"`
 	ProtocolEnabled  map[string]bool `json:"protocol_enabled,omitempty"`
+	// APK delivery tracking: the release seq last shipped in a pull, the
+	// worker config seq it shipped with, and the release seq the worker has
+	// acknowledged applying. Lets pulls skip re-sending an unchanged APK.
+	APKSentSeq    int64 `json:"apk_sent_seq,omitempty"`
+	APKSentAtSeq  int64 `json:"apk_sent_at_seq,omitempty"`
+	APKAppliedSeq int64 `json:"apk_applied_seq,omitempty"`
 }
 
 type adminTOTPRecord struct {
-	Secret      string    `json:"secret"`
-	Enabled     bool      `json:"enabled"`
-	LastCounter int64     `json:"last_counter"`
-	UpdatedAt   time.Time `json:"updated_at"`
+	Secret string `json:"secret"`
+	// PendingSecret holds a re-enrollment secret while the current one stays
+	// active, so an unfinished re-enrollment never switches 2FA off.
+	PendingSecret string    `json:"pending_secret,omitempty"`
+	Enabled       bool      `json:"enabled"`
+	LastCounter   int64     `json:"last_counter"`
+	UpdatedAt     time.Time `json:"updated_at"`
 }
 
 type deviceRecord struct {
@@ -198,7 +212,7 @@ func openOrchStore(cfg orchConfig) (*orchStore, error) {
 	if err != nil {
 		return nil, err
 	}
-	s := &orchStore{db: db, aead: aead}
+	s := &orchStore{db: db, aead: aead, tokenLookupKey: deriveTokenLookupKey(key)}
 	err = db.Update(func(tx *bolt.Tx) error {
 		for _, b := range [][]byte{bucketWorkers, bucketTokens, bucketDevices, bucketTelemetry, bucketMeta} {
 			if _, err := tx.CreateBucketIfNotExists(b); err != nil {
@@ -402,8 +416,30 @@ func (s *orchStore) startAdminTOTPEnrollment() (adminTOTPRecord, error) {
 	if err != nil {
 		return adminTOTPRecord{}, err
 	}
-	rec := adminTOTPRecord{Secret: secret, Enabled: false, UpdatedAt: time.Now().UTC()}
-	return rec, s.putAdminTOTPLocked(rec)
+	var out adminTOTPRecord
+	err = s.db.Update(func(tx *bolt.Tx) error {
+		var rec adminTOTPRecord
+		if raw := tx.Bucket(bucketMeta).Get(metaAdminTOTP); raw != nil {
+			if err := s.openJSON(raw, &rec); err != nil {
+				return err
+			}
+		}
+		now := time.Now().UTC()
+		if rec.Enabled && strings.TrimSpace(rec.Secret) != "" {
+			rec.PendingSecret = secret
+			rec.UpdatedAt = now
+			out = adminTOTPRecord{Secret: secret, Enabled: false, UpdatedAt: now}
+		} else {
+			rec = adminTOTPRecord{Secret: secret, Enabled: false, UpdatedAt: now}
+			out = rec
+		}
+		sealed, err := s.sealJSON(rec)
+		if err != nil {
+			return err
+		}
+		return tx.Bucket(bucketMeta).Put(metaAdminTOTP, sealed)
+	})
+	return out, err
 }
 
 func (s *orchStore) enableAdminTOTP(code string, now time.Time) error {
@@ -416,10 +452,20 @@ func (s *orchStore) enableAdminTOTP(code string, now time.Time) error {
 		if err := s.openJSON(raw, &rec); err != nil {
 			return err
 		}
-		counter, ok := verifyTOTPCode(rec.Secret, code, now, rec.LastCounter)
+		secret := rec.Secret
+		lastCounter := rec.LastCounter
+		if strings.TrimSpace(rec.PendingSecret) != "" {
+			// The replay counter belongs to the old secret; codes of a new
+			// secret cannot be replays of it.
+			secret = rec.PendingSecret
+			lastCounter = 0
+		}
+		counter, ok := verifyTOTPCode(secret, code, now, lastCounter)
 		if !ok {
 			return errors.New("invalid totp code")
 		}
+		rec.Secret = secret
+		rec.PendingSecret = ""
 		rec.Enabled = true
 		rec.LastCounter = counter
 		rec.UpdatedAt = now.UTC()
@@ -470,16 +516,6 @@ func (s *orchStore) verifyAdminTOTP(code string, now time.Time) (bool, bool, err
 		return nil
 	})
 	return enabled, ok, err
-}
-
-func (s *orchStore) putAdminTOTPLocked(rec adminTOTPRecord) error {
-	sealed, err := s.sealJSON(rec)
-	if err != nil {
-		return err
-	}
-	return s.db.Update(func(tx *bolt.Tx) error {
-		return tx.Bucket(bucketMeta).Put(metaAdminTOTP, sealed)
-	})
 }
 
 func (s *orchStore) setBotSettings(token string, ownerID int64) error {
@@ -581,6 +617,7 @@ func (s *orchStore) createToken(id, secret string, ttl time.Duration, maxUses in
 	rec := tokenRecord{
 		ID:              strings.TrimSpace(id),
 		Hash:            hash,
+		Lookup:          s.tokenLookup(secret),
 		ExpiresAt:       time.Now().UTC().Add(ttl),
 		MaxUses:         maxUses,
 		CreatedAt:       time.Now().UTC(),
@@ -603,6 +640,7 @@ func (s *orchStore) createBootstrapToken(secret string, expiresAt time.Time, lim
 	rec := tokenRecord{
 		ID:          randID(),
 		Hash:        hash,
+		Lookup:      s.tokenLookup(secret),
 		Kind:        "bootstrap",
 		ExpiresAt:   expiresAt.UTC(),
 		MaxUses:     1,
@@ -668,6 +706,12 @@ func (s *orchStore) consumeBootstrapToken(secret string, device deviceRecord, pr
 	err = s.db.Update(func(tx *bolt.Tx) error {
 		tb := tx.Bucket(bucketTokens)
 		db := tx.Bucket(bucketDevices)
+		// Re-check inside the write tx: a concurrent enroll of the same
+		// identity would otherwise overwrite the first device record (new
+		// PSK/IP) and burn both tokens. Aborting here keeps this token.
+		if db.Get([]byte(device.ID)) != nil {
+			return errors.New("device already enrolled; retry enrollment")
+		}
 		raw := tb.Get([]byte(matchedID))
 		if raw == nil {
 			return errors.New("invalid, expired, or exhausted bootstrap token")
@@ -738,49 +782,111 @@ func (s *orchStore) consumeBootstrapToken(secret string, device deviceRecord, pr
 }
 
 func (s *orchStore) findTokenID(secret, workerStaticPub string, now time.Time) (string, error) {
-	var matched string
-	err := s.db.View(func(tx *bolt.Tx) error {
-		return tx.Bucket(bucketTokens).ForEach(func(k, v []byte) error {
-			if matched != "" {
-				return nil
-			}
-			var rec tokenRecord
-			if err := json.Unmarshal(v, &rec); err != nil {
-				return err
-			}
-			if !tokenRecordConsumable(rec, now, workerStaticPub) {
-				return nil
-			}
-			if protocol.VerifySecret(rec.Hash, secret) {
-				matched = string(k)
-			}
-			return nil
-		})
+	return s.findTokenIDMatching(secret, func(rec tokenRecord) bool {
+		return tokenRecordConsumable(rec, now, workerStaticPub)
 	})
-	return matched, err
 }
 
 func (s *orchStore) findBootstrapTokenID(secret string, now time.Time) (string, error) {
-	var matched string
+	return s.findTokenIDMatching(secret, func(rec tokenRecord) bool {
+		return rec.Kind == "bootstrap" && now.Before(rec.ExpiresAt) && rec.Uses < rec.MaxUses
+	})
+}
+
+// findTokenIDMatching locates a usable token by its keyed lookup HMAC inside a
+// short read transaction and runs the expensive PBKDF2 verification outside
+// it, so unauthenticated guesses cost one hash instead of one per token and
+// never hold a bbolt read transaction open.
+func (s *orchStore) findTokenIDMatching(secret string, usable func(tokenRecord) bool) (string, error) {
+	if secret == "" {
+		return "", nil
+	}
+	lookup := s.tokenLookup(secret)
+	var exact *tokenRecord
+	var legacy []tokenRecord
 	err := s.db.View(func(tx *bolt.Tx) error {
 		return tx.Bucket(bucketTokens).ForEach(func(k, v []byte) error {
-			if matched != "" {
+			if exact != nil {
 				return nil
 			}
 			var rec tokenRecord
 			if err := json.Unmarshal(v, &rec); err != nil {
 				return err
 			}
-			if rec.Kind != "bootstrap" || !now.Before(rec.ExpiresAt) || rec.Uses >= rec.MaxUses {
+			if !usable(rec) {
 				return nil
 			}
-			if protocol.VerifySecret(rec.Hash, secret) {
-				matched = string(k)
+			rec.ID = string(k)
+			if rec.Lookup == "" {
+				legacy = append(legacy, rec)
+				return nil
+			}
+			if hmac.Equal([]byte(rec.Lookup), []byte(lookup)) {
+				exact = &rec
 			}
 			return nil
 		})
 	})
-	return matched, err
+	if err != nil {
+		return "", err
+	}
+	if exact != nil {
+		if protocol.VerifySecret(exact.Hash, secret) {
+			return exact.ID, nil
+		}
+		return "", nil
+	}
+	for _, rec := range legacy {
+		if protocol.VerifySecret(rec.Hash, secret) {
+			return rec.ID, nil
+		}
+	}
+	return "", nil
+}
+
+func deriveTokenLookupKey(masterKey []byte) []byte {
+	mac := hmac.New(sha256.New, masterKey)
+	mac.Write([]byte("TrafficWrapper token lookup v1"))
+	return mac.Sum(nil)
+}
+
+func (s *orchStore) tokenLookup(secret string) string {
+	mac := hmac.New(sha256.New, s.tokenLookupKey)
+	mac.Write([]byte(secret))
+	return hex.EncodeToString(mac.Sum(nil))
+}
+
+// tokenRetentionAfterUse keeps spent or expired tokens briefly for audit and
+// troubleshooting before pruneDeadTokens drops them; every live token is
+// scanned on each enroll attempt, so dead ones must not pile up forever.
+const tokenRetentionAfterUse = 7 * 24 * time.Hour
+
+func (s *orchStore) pruneDeadTokens(now time.Time) (int, error) {
+	var dead [][]byte
+	err := s.db.Update(func(tx *bolt.Tx) error {
+		b := tx.Bucket(bucketTokens)
+		if err := b.ForEach(func(k, v []byte) error {
+			var rec tokenRecord
+			if err := json.Unmarshal(v, &rec); err != nil {
+				return nil
+			}
+			expiredLongAgo := now.Sub(rec.ExpiresAt) > tokenRetentionAfterUse
+			exhaustedLongAgo := rec.MaxUses > 0 && rec.Uses >= rec.MaxUses && now.Sub(rec.CreatedAt) > tokenRetentionAfterUse
+			if expiredLongAgo || exhaustedLongAgo {
+				dead = append(dead, append([]byte(nil), k...))
+			}
+			return nil
+		}); err != nil {
+			return err
+		}
+		for _, k := range dead {
+			if err := b.Delete(k); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	return len(dead), err
 }
 
 func tokenRecordConsumable(rec tokenRecord, now time.Time, workerStaticPub string) bool {
@@ -945,7 +1051,7 @@ func (s *orchStore) setDeviceLimits(id string, limits deviceLimits) error {
 		if err := s.openJSON(raw, &rec); err != nil {
 			return err
 		}
-		rec.Limits = limits
+		applyDeviceLimitsChange(&rec, limits, time.Now().UTC())
 		if rec.ConfigSeq < 1 {
 			rec.ConfigSeq = 1
 		}
@@ -1025,17 +1131,61 @@ func clientVersionWouldRollback(current, next string) bool {
 	if current == "" {
 		return false
 	}
-	currentCode := clientVersionCode(current)
-	nextCode := clientVersionCode(next)
-	if currentCode == 0 {
+	if clientVersionCode(current) == 0 {
 		return false
 	}
-	return nextCode == 0 || nextCode < currentCode
+	if len(clientVersionParts(current)) == 1 || len(clientVersionParts(next)) == 1 {
+		// A bare version code on either side: only the code space compares.
+		nextCode := clientVersionCode(next)
+		return nextCode == 0 || nextCode < clientVersionCode(current)
+	}
+	cmp, ok := compareClientVersions(next, current)
+	return !ok || cmp < 0
 }
 
-func (s *orchStore) applyDeviceUsageAndBlocks(workerID string, reports []deviceUsage, now time.Time) (int, error) {
-	byID := make(map[string][]deviceUsage, len(reports))
-	byAWG := make(map[string]deviceUsage, len(reports))
+// applyDeviceLimitsChange sets new limits. A cleared limit set or a changed
+// traffic quota restarts usage accounting, so the quota counts from the moment
+// it is set instead of blocking immediately on lifetime usage. A device that
+// was blocked automatically (quota or expiry) is restored when the new limits
+// no longer trip; a manual revoke is never undone here.
+func applyDeviceLimitsChange(rec *deviceRecord, limits deviceLimits, now time.Time) {
+	if limits == (deviceLimits{}) || limits.TrafficQuotaBytes != rec.Limits.TrafficQuotaBytes {
+		rec.UsageRxBytes = 0
+		rec.UsageTxBytes = 0
+	}
+	rec.Limits = limits
+	if rec.Status != "revoked" || !deviceAutoBlockReason(rec.BlockedReason) {
+		return
+	}
+	if deviceLimitsExpired(rec.Limits, now) {
+		return
+	}
+	if rec.Limits.TrafficQuotaBytes > 0 && saturatingAddUint64(rec.UsageRxBytes, rec.UsageTxBytes) >= rec.Limits.TrafficQuotaBytes {
+		return
+	}
+	rec.Status = "approved"
+	rec.BlockedReason = ""
+	rec.BlockedAt = nil
+}
+
+func deviceAutoBlockReason(reason string) bool {
+	switch strings.TrimSpace(reason) {
+	case "traffic_quota_bytes", "expires_at":
+		return true
+	}
+	return false
+}
+
+type deviceUsageReports struct {
+	byID  map[string][]deviceUsage
+	byAWG map[string]deviceUsage
+}
+
+func groupDeviceUsageReports(reports []deviceUsage) deviceUsageReports {
+	out := deviceUsageReports{
+		byID:  make(map[string][]deviceUsage, len(reports)),
+		byAWG: make(map[string]deviceUsage, len(reports)),
+	}
 	for _, report := range reports {
 		report.DeviceID = strings.TrimSpace(report.DeviceID)
 		report.AWGPublicKey = strings.TrimSpace(report.AWGPublicKey)
@@ -1048,69 +1198,185 @@ func (s *orchStore) applyDeviceUsageAndBlocks(workerID string, reports []deviceU
 			continue
 		}
 		if report.DeviceID != "" {
-			byID[report.DeviceID] = append(byID[report.DeviceID], report)
+			out.byID[report.DeviceID] = append(out.byID[report.DeviceID], report)
 		}
 		if report.Source == "" && report.AWGPublicKey != "" {
-			byAWG[report.AWGPublicKey] = report
+			out.byAWG[report.AWGPublicKey] = report
 		}
 	}
+	return out
+}
+
+// deviceAWGKeys lists every AWG public key a device may report usage under.
+func deviceAWGKeys(rec deviceRecord) []string {
+	keys := []string{strings.TrimSpace(rec.AWGPublicKey)}
+	for _, profile := range rec.AWGProfiles {
+		keys = append(keys, strings.TrimSpace(profile.AWGPublicKey))
+	}
+	return keys
+}
+
+// applyUsageToDevice folds the reports that belong to rec into its counters
+// and applies quota/expiry blocking. It reports whether rec changed and
+// whether it was newly blocked.
+func applyUsageToDevice(rec *deviceRecord, workerID string, grouped deviceUsageReports, now time.Time) (changed, blocked bool) {
+	if deviceReports := grouped.byID[rec.ID]; len(deviceReports) > 0 {
+		for _, report := range deviceReports {
+			changed = applyDeviceUsageReport(rec, workerID, report, now) || changed
+		}
+	} else if report, ok := grouped.byAWG[strings.TrimSpace(rec.AWGPublicKey)]; ok {
+		changed = applyDeviceUsageReport(rec, workerID, report, now) || changed
+	} else {
+		for _, profile := range rec.AWGProfiles {
+			if report, ok := grouped.byAWG[strings.TrimSpace(profile.AWGPublicKey)]; ok {
+				changed = applyDeviceUsageReport(rec, workerID, report, now) || changed
+				break
+			}
+		}
+	}
+	reason := ""
+	if deviceLimitsExpired(rec.Limits, now) {
+		reason = "expires_at"
+	} else if rec.Limits.TrafficQuotaBytes > 0 && saturatingAddUint64(rec.UsageRxBytes, rec.UsageTxBytes) >= rec.Limits.TrafficQuotaBytes {
+		reason = "traffic_quota_bytes"
+	}
+	if reason != "" && rec.Status == "approved" {
+		rec.Status = "revoked"
+		rec.BlockedReason = reason
+		blockedAt := now.UTC()
+		rec.BlockedAt = &blockedAt
+		if rec.ConfigSeq < 1 {
+			rec.ConfigSeq = 1
+		}
+		log.Printf("device quota block id=%s reason=%s usage_rx=%d usage_tx=%d quota=%d", rec.ID, reason, rec.UsageRxBytes, rec.UsageTxBytes, rec.Limits.TrafficQuotaBytes)
+		return true, true
+	}
+	return changed, false
+}
+
+// applyDeviceUsageAndBlocks applies usage reports and quota/expiry blocks by
+// scanning every device. It is the periodic sweep (expiry needs no report);
+// acks use applyReportedDeviceUsage, which touches only reported devices.
+func (s *orchStore) applyDeviceUsageAndBlocks(workerID string, reports []deviceUsage, now time.Time) (int, error) {
+	grouped := groupDeviceUsageReports(reports)
 	blocked := 0
-	changedAny := false
+	err := s.db.Update(func(tx *bolt.Tx) error {
+		n, err := s.sweepDeviceUsageTx(tx, workerID, grouped, now, nil)
+		blocked = n
+		return err
+	})
+	if err != nil {
+		return 0, err
+	}
+	return blocked, nil
+}
+
+// sweepDeviceUsageTx scans all devices except those in skip. Updates are
+// collected during ForEach and written afterwards: bbolt forbids modifying a
+// bucket while iterating it.
+func (s *orchStore) sweepDeviceUsageTx(tx *bolt.Tx, workerID string, grouped deviceUsageReports, now time.Time, skip map[string]bool) (int, error) {
+	b := tx.Bucket(bucketDevices)
+	type pendingPut struct {
+		key []byte
+		rec deviceRecord
+	}
+	var puts []pendingPut
+	blocked := 0
+	err := b.ForEach(func(k, raw []byte) error {
+		if skip[string(k)] {
+			return nil
+		}
+		var rec deviceRecord
+		if err := s.openJSON(raw, &rec); err != nil {
+			return err
+		}
+		changed, newlyBlocked := applyUsageToDevice(&rec, workerID, grouped, now)
+		if newlyBlocked {
+			blocked++
+		}
+		if changed {
+			puts = append(puts, pendingPut{key: append([]byte(nil), k...), rec: rec})
+		}
+		return nil
+	})
+	if err != nil {
+		return 0, err
+	}
+	for _, p := range puts {
+		sealed, err := s.sealJSON(p.rec)
+		if err != nil {
+			return 0, err
+		}
+		if err := b.Put(p.key, sealed); err != nil {
+			return 0, err
+		}
+	}
+	if blocked > 0 {
+		if err := s.bumpWorkerSeqsTx(tx); err != nil {
+			return 0, err
+		}
+	}
+	return blocked, nil
+}
+
+// applyReportedDeviceUsage is the ack hot path: devices are loaded by id, and
+// the full scan only runs when a report cannot be attributed that way (legacy
+// reports keyed solely by AWG public key).
+func (s *orchStore) applyReportedDeviceUsage(workerID string, reports []deviceUsage, now time.Time) (int, error) {
+	grouped := groupDeviceUsageReports(reports)
+	if len(grouped.byID) == 0 && len(grouped.byAWG) == 0 {
+		return 0, nil
+	}
+	blocked := 0
 	err := s.db.Update(func(tx *bolt.Tx) error {
 		b := tx.Bucket(bucketDevices)
-		err := b.ForEach(func(k, raw []byte) error {
+		resolved := map[string]bool{}
+		coveredAWG := map[string]bool{}
+		needScan := false
+		for id := range grouped.byID {
+			raw := b.Get([]byte(id))
+			if raw == nil {
+				needScan = true
+				continue
+			}
 			var rec deviceRecord
 			if err := s.openJSON(raw, &rec); err != nil {
 				return err
 			}
-			changed := false
-			if deviceReports := byID[rec.ID]; len(deviceReports) > 0 {
-				for _, report := range deviceReports {
-					changed = applyDeviceUsageReport(&rec, workerID, report, now) || changed
-				}
-			} else if report, ok := byAWG[strings.TrimSpace(rec.AWGPublicKey)]; ok {
-				changed = applyDeviceUsageReport(&rec, workerID, report, now) || changed
-			} else {
-				for _, profile := range rec.AWGProfiles {
-					if report, ok := byAWG[strings.TrimSpace(profile.AWGPublicKey)]; ok {
-						changed = applyDeviceUsageReport(&rec, workerID, report, now) || changed
-						break
-					}
-				}
+			resolved[id] = true
+			for _, key := range deviceAWGKeys(rec) {
+				coveredAWG[key] = true
 			}
-			reason := ""
-			if deviceLimitsExpired(rec.Limits, now) {
-				reason = "expires_at"
-			} else if rec.Limits.TrafficQuotaBytes > 0 && saturatingAddUint64(rec.UsageRxBytes, rec.UsageTxBytes) >= rec.Limits.TrafficQuotaBytes {
-				reason = "traffic_quota_bytes"
-			}
-			if reason != "" && rec.Status == "approved" {
-				rec.Status = "revoked"
-				rec.BlockedReason = reason
-				blockedAt := now.UTC()
-				rec.BlockedAt = &blockedAt
-				if rec.ConfigSeq < 1 {
-					rec.ConfigSeq = 1
-				}
-				log.Printf("device quota block id=%s reason=%s usage_rx=%d usage_tx=%d quota=%d", rec.ID, reason, rec.UsageRxBytes, rec.UsageTxBytes, rec.Limits.TrafficQuotaBytes)
+			changed, newlyBlocked := applyUsageToDevice(&rec, workerID, grouped, now)
+			if newlyBlocked {
 				blocked++
-				changed = true
 			}
-			if !changed {
-				return nil
+			if changed {
+				sealed, err := s.sealJSON(rec)
+				if err != nil {
+					return err
+				}
+				if err := b.Put([]byte(id), sealed); err != nil {
+					return err
+				}
 			}
-			sealed, err := s.sealJSON(rec)
+		}
+		for key := range grouped.byAWG {
+			if !coveredAWG[key] {
+				needScan = true
+				break
+			}
+		}
+		if needScan {
+			n, err := s.sweepDeviceUsageTx(tx, workerID, grouped, now, resolved)
 			if err != nil {
 				return err
 			}
-			if err := b.Put(k, sealed); err != nil {
-				return err
+			blocked += n
+			// sweepDeviceUsageTx bumps seqs for its own blocks only.
+			if n > 0 {
+				return nil
 			}
-			changedAny = true
-			return nil
-		})
-		if err != nil {
-			return err
 		}
 		if blocked > 0 {
 			return s.bumpWorkerSeqsTx(tx)
@@ -1119,9 +1385,6 @@ func (s *orchStore) applyDeviceUsageAndBlocks(workerID string, reports []deviceU
 	})
 	if err != nil {
 		return 0, err
-	}
-	if !changedAny {
-		return 0, nil
 	}
 	return blocked, nil
 }
@@ -1261,6 +1524,11 @@ func (s *orchStore) revokeDevice(id string) error {
 			return err
 		}
 		rec.Status = "revoked"
+		// A manual revoke overrides any automatic block so that later limit
+		// changes cannot silently restore the device.
+		rec.BlockedReason = "manual"
+		now := time.Now().UTC()
+		rec.BlockedAt = &now
 		sealed, err := s.sealJSON(rec)
 		if err != nil {
 			return err
@@ -1343,6 +1611,9 @@ func (s *orchStore) deleteDevice(id string) error {
 		}
 		needsRevoke := rec.Status != "revoked"
 		if err := db.Delete([]byte(rec.ID)); err != nil {
+			return err
+		}
+		if err := tx.Bucket(bucketTelemetry).Delete([]byte(rec.ID)); err != nil {
 			return err
 		}
 		if needsRevoke {
@@ -1551,10 +1822,22 @@ func (s *orchStore) workers() ([]workerRecord, error) {
 }
 
 func (s *orchStore) updateAck(id string, applied int64, observed string, self map[string]any) error {
+	return s.updateAckWithProbe(id, applied, observed, self, nil)
+}
+
+// updateAckWithProbe records an ack and, when probe is non-nil, the egress
+// probe result (possibly empty) in one write transaction.
+func (s *orchStore) updateAckWithProbe(id string, applied int64, observed string, self map[string]any, probe *string) error {
 	return s.updateWorker(id, func(rec *workerRecord) error {
+		if probe != nil {
+			rec.EgressIPProbe = *probe
+		}
 		now := time.Now().UTC()
 		rec.AppliedSeq = applied
 		rec.LastAckAt = &now
+		if rec.APKSentSeq > 0 && applied >= rec.APKSentAtSeq {
+			rec.APKAppliedSeq = rec.APKSentSeq
+		}
 		rec.EgressIPObserved = observed
 		if len(self) > 0 {
 			rec.SelfDescribe = self
@@ -1573,14 +1856,13 @@ func (s *orchStore) updateAck(id string, applied int64, observed string, self ma
 func (s *orchStore) markStaleWorkersInactive(cutoff time.Time) (int, error) {
 	updated := 0
 	err := s.db.Update(func(tx *bolt.Tx) error {
-		b := tx.Bucket(bucketWorkers)
-		return b.ForEach(func(k, raw []byte) error {
+		return rewriteBucket(tx.Bucket(bucketWorkers), func(_, raw []byte) ([]byte, error) {
 			var rec workerRecord
 			if err := s.openJSON(raw, &rec); err != nil {
-				return err
+				return nil, err
 			}
 			if rec.Status != "approved" && rec.Status != "active" {
-				return nil
+				return nil, nil
 			}
 			lastSeen := rec.CreatedAt
 			if rec.ApprovedAt != nil {
@@ -1590,31 +1872,17 @@ func (s *orchStore) markStaleWorkersInactive(cutoff time.Time) (int, error) {
 				lastSeen = *rec.LastAckAt
 			}
 			if lastSeen.After(cutoff) {
-				return nil
+				return nil, nil
 			}
 			rec.Status = "inactive"
-			sealed, err := s.sealJSON(rec)
-			if err != nil {
-				return err
-			}
-			if err := b.Put(k, sealed); err != nil {
-				return err
-			}
 			updated++
-			return nil
+			return s.sealJSON(rec)
 		})
 	})
 	if err == nil && updated > 0 {
 		s.touchDiscoveryWorkerRevision()
 	}
 	return updated, err
-}
-
-func (s *orchStore) setProbe(id, ip string) error {
-	return s.updateWorker(id, func(rec *workerRecord) error {
-		rec.EgressIPProbe = ip
-		return nil
-	})
 }
 
 func (s *orchStore) updateWorkerSelfDescribe(id string, self map[string]any) error {
@@ -1646,6 +1914,11 @@ func (s *orchStore) updateWorkerHeartbeat(id string, haveSeq int64, self map[str
 }
 
 func forceWorkerResync(rec *workerRecord, haveSeq int64) {
+	// A resync may follow lost worker state; ship the APK again with it. The
+	// sent markers are cleared too, or a stale ack could re-mark it applied.
+	rec.APKAppliedSeq = 0
+	rec.APKSentSeq = 0
+	rec.APKSentAtSeq = 0
 	target := rec.DesiredSeq
 	if rec.AppliedSeq > target {
 		target = rec.AppliedSeq
@@ -1667,6 +1940,14 @@ func forceWorkerResync(rec *workerRecord, haveSeq int64) {
 		target = 1
 	}
 	rec.DesiredSeq = target
+}
+
+func (s *orchStore) markWorkerAPKSent(id string, apkSeq, atSeq int64) error {
+	return s.updateWorker(id, func(rec *workerRecord) error {
+		rec.APKSentSeq = apkSeq
+		rec.APKSentAtSeq = atSeq
+		return nil
+	})
 }
 
 func (s *orchStore) updateWorker(id string, fn func(*workerRecord) error) error {
@@ -1727,42 +2008,77 @@ func workerDiscoveryFingerprint(rec workerRecord, now time.Time) [sha256.Size]by
 	return sha256.Sum256(raw)
 }
 
-func (s *orchStore) bumpWorkerSeqsTx(tx *bolt.Tx) error {
-	b := tx.Bucket(bucketWorkers)
-	return b.ForEach(func(k, raw []byte) error {
-		var rec workerRecord
-		if err := s.openJSON(raw, &rec); err != nil {
+// rewriteBucket calls fn for every key and stores the non-nil values it
+// returns once iteration finishes; bbolt forbids modifying a bucket from
+// inside ForEach.
+func rewriteBucket(b *bolt.Bucket, fn func(k, v []byte) ([]byte, error)) error {
+	type pendingPut struct{ key, value []byte }
+	var puts []pendingPut
+	if err := b.ForEach(func(k, v []byte) error {
+		next, err := fn(k, v)
+		if err != nil || next == nil {
 			return err
 		}
+		puts = append(puts, pendingPut{key: append([]byte(nil), k...), value: next})
+		return nil
+	}); err != nil {
+		return err
+	}
+	for _, p := range puts {
+		if err := b.Put(p.key, p.value); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s *orchStore) bumpWorkerSeqsTx(tx *bolt.Tx) error {
+	return rewriteBucket(tx.Bucket(bucketWorkers), func(_, raw []byte) ([]byte, error) {
+		var rec workerRecord
+		if err := s.openJSON(raw, &rec); err != nil {
+			return nil, err
+		}
 		if rec.Status != "approved" && rec.Status != "active" {
-			return nil
+			return nil, nil
 		}
 		if rec.DesiredSeq < 1 {
 			rec.DesiredSeq = 1
 		} else {
 			rec.DesiredSeq++
 		}
-		sealed, err := s.sealJSON(rec)
-		if err != nil {
-			return err
-		}
-		return b.Put(k, sealed)
+		return s.sealJSON(rec)
 	})
 }
 
 func (s *orchStore) allocateDeviceIP(tx *bolt.Tx, cidr string) (string, error) {
+	return s.allocateDeviceIPFrom(tx, cidr, func(rec deviceRecord) string { return rec.InternalIP })
+}
+
+// deviceIPPoolReserved is the number of low host addresses kept for the
+// worker gateway and infrastructure.
+const deviceIPPoolReserved = 10
+
+// allocateDeviceIPFrom returns the first free /32 in cidr (IPv4), skipping the
+// reserved low addresses and the broadcast address. usedIP extracts the
+// address a device already holds in this pool.
+func (s *orchStore) allocateDeviceIPFrom(tx *bolt.Tx, cidr string, usedIP func(deviceRecord) string) (string, error) {
 	prefix, err := netip.ParsePrefix(strings.TrimSpace(cidr))
 	if err != nil || !prefix.Addr().Is4() {
 		prefix = netip.MustParsePrefix("10.13.13.0/24")
 	}
 	used := map[netip.Addr]struct{}{}
-	db := tx.Bucket(bucketDevices)
-	if err := db.ForEach(func(_, raw []byte) error {
+	// Workers derive the gateway and smoke-test peer as the configured
+	// (unmasked) address +1 and +2; never hand those out to devices.
+	for a, i := prefix.Addr(), 0; i < 3 && a.IsValid(); a, i = a.Next(), i+1 {
+		used[a] = struct{}{}
+	}
+	prefix = prefix.Masked()
+	if err := tx.Bucket(bucketDevices).ForEach(func(_, raw []byte) error {
 		var rec deviceRecord
 		if err := s.openJSON(raw, &rec); err != nil {
 			return err
 		}
-		addrText := strings.TrimSuffix(strings.TrimSpace(rec.InternalIP), "/32")
+		addrText := strings.TrimSuffix(strings.TrimSpace(usedIP(rec)), "/32")
 		if addr, err := netip.ParseAddr(addrText); err == nil {
 			used[addr] = struct{}{}
 		}
@@ -1770,16 +2086,13 @@ func (s *orchStore) allocateDeviceIP(tx *bolt.Tx, cidr string) (string, error) {
 	}); err != nil {
 		return "", err
 	}
-	addr := prefix.Addr()
-	if !addr.Is4() {
-		return "", errors.New("device IP pool must be IPv4")
+	next := prefix.Addr()
+	for i := 0; i < deviceIPPoolReserved; i++ {
+		next = next.Next()
 	}
-	raw := addr.As4()
-	for i := 10; i < 255; i++ {
-		raw[3] = byte(i)
-		next := netip.AddrFrom4(raw)
-		if !prefix.Contains(next) {
-			break
+	for ; next.IsValid() && prefix.Contains(next); next = next.Next() {
+		if after := next.Next(); !after.IsValid() || !prefix.Contains(after) {
+			break // broadcast address
 		}
 		if _, ok := used[next]; ok {
 			continue
@@ -1794,49 +2107,9 @@ func (s *orchStore) allocateDeviceIPForProfile(tx *bolt.Tx, profileName, cidr st
 	if profileName == "" || profileName == "awg" {
 		return s.allocateDeviceIP(tx, cidr)
 	}
-	prefix, err := netip.ParsePrefix(strings.TrimSpace(cidr))
-	if err != nil || !prefix.Addr().Is4() {
-		prefix = netip.MustParsePrefix("10.13.13.0/24")
-	}
-	used := map[netip.Addr]struct{}{}
-	db := tx.Bucket(bucketDevices)
-	if err := db.ForEach(func(_, raw []byte) error {
-		var rec deviceRecord
-		if err := s.openJSON(raw, &rec); err != nil {
-			return err
-		}
-		if rec.AWGProfiles == nil {
-			return nil
-		}
-		creds, ok := rec.AWGProfiles[profileName]
-		if !ok {
-			return nil
-		}
-		addrText := strings.TrimSuffix(strings.TrimSpace(creds.InternalIP), "/32")
-		if addr, err := netip.ParseAddr(addrText); err == nil {
-			used[addr] = struct{}{}
-		}
-		return nil
-	}); err != nil {
-		return "", err
-	}
-	addr := prefix.Addr()
-	if !addr.Is4() {
-		return "", errors.New("device IP pool must be IPv4")
-	}
-	raw := addr.As4()
-	for i := 10; i < 255; i++ {
-		raw[3] = byte(i)
-		next := netip.AddrFrom4(raw)
-		if !prefix.Contains(next) {
-			break
-		}
-		if _, ok := used[next]; ok {
-			continue
-		}
-		return next.String() + "/32", nil
-	}
-	return "", errors.New("device IP pool exhausted")
+	return s.allocateDeviceIPFrom(tx, cidr, func(rec deviceRecord) string {
+		return rec.AWGProfiles[profileName].InternalIP
+	})
 }
 
 func randomBase64Key() (string, error) {

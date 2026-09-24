@@ -19,6 +19,19 @@ TrafficWrapper разделяет четыре trust roots:
 owner-controlled secret storage. Не коммитьте `.env`, `orch-state/`,
 `worker-state/`, release keystores или minisign private keys.
 
+## Переход на изолированный signer
+
+Релизы, где `docker-compose.yml` использует `./signer-state`, при первом старте
+signer автоматически переносят config-signing key из `./orch-state`
+(`ORCH_SIGNER_LEGACY_KEY_PATH`); публичный ключ, закреплённый у workers и
+клиентов, не меняется. Перед обновлением сделайте бэкап `./orch-state`. После
+первого старта проверьте, что `./signer-state/orch-config.key` есть, а
+`./orch-state/orch-config.key` удалён, и добавьте `./signer-state` в бэкапы.
+Если signer не стартует, потому что ключи есть в обоих местах и различаются,
+оставьте тот, чей public key совпадает с развёрнутыми конфигами. Контейнеры
+теперь работают от uid `10001`; entrypoint сам меняет владельца state-каталогов,
+но seed APK в `./seed` должен быть доступен на чтение всем.
+
 ## Ротация config-signing key
 
 Config-signing key хранится signer process и доступен через

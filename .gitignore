@@ -5,6 +5,7 @@
 *-state/
 orch-state/
 worker-state/
+signer-run/
 *.key
 *.pem
 *.crt
@@ -33,3 +34,4 @@ build/update-release/
 .vscode/
 *.swp
 .DS_Store
+/cmd/orchestrator/orchestrator

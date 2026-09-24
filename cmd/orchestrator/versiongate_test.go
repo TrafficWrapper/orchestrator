@@ -173,3 +173,35 @@ func clientBundleRealityFingerprint(t *testing.T, s *server, clientVersion strin
 	t.Fatalf("reality route fingerprint not found in %s", bundle.ConfigJSON)
 	return ""
 }
+
+func TestClientVersionCodeDoesNotAliasAcrossReleases(t *testing.T) {
+	if a, b := clientVersionCode("1.100.0"), clientVersionCode("2.0.0"); a >= b {
+		t.Fatalf("1.100.0 (%d) must stay below 2.0.0 (%d)", a, b)
+	}
+	if a, b := clientVersionCode("0.1.100"), clientVersionCode("0.2.0"); a >= b {
+		t.Fatalf("0.1.100 (%d) must stay below 0.2.0 (%d)", a, b)
+	}
+	if got := clientVersionCode("0.1.31"); got != 131 {
+		t.Fatalf("existing code space changed: %d", got)
+	}
+}
+
+func TestClientVersionRollbackUsesComponentOrder(t *testing.T) {
+	cases := []struct {
+		current, next string
+		rollback      bool
+	}{
+		{"0.1.99", "0.1.100", false},
+		{"0.1.100", "0.1.99", true},
+		{"0.1.100", "0.1.101", false},
+		{"1.2.3", "1.2.3", false},
+		{"150", "151", false},
+		{"150", "149", true},
+		{"0.1.31", "garbage", true},
+	}
+	for _, tc := range cases {
+		if got := clientVersionWouldRollback(tc.current, tc.next); got != tc.rollback {
+			t.Fatalf("rollback(%q -> %q)=%t want %t", tc.current, tc.next, got, tc.rollback)
+		}
+	}
+}

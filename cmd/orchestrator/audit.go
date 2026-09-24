@@ -122,18 +122,24 @@ func (l *auditLog) Log(entry auditEntry) {
 	entry.Hash = ""
 	payload, err := json.Marshal(entry)
 	if err != nil {
+		log.Printf("audit: dropped %s event: marshal: %v", entry.Event, err)
 		return
 	}
 	sum := sha256.Sum256(append([]byte(entry.PrevHash+"\n"), payload...))
 	entry.Hash = hex.EncodeToString(sum[:])
 	raw, err := json.Marshal(entry)
 	if err != nil {
+		log.Printf("audit: dropped %s event: marshal: %v", entry.Event, err)
 		return
 	}
+	// Security events must not vanish silently (e.g. on a full disk).
 	if _, err := l.file.Write(append(raw, '\n')); err != nil {
+		log.Printf("audit: failed to write %s event: %v", entry.Event, err)
 		return
 	}
-	_ = l.file.Sync()
+	if err := l.file.Sync(); err != nil {
+		log.Printf("audit: failed to sync %s event: %v", entry.Event, err)
+	}
 	l.prevHash = entry.Hash
 }
 

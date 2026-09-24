@@ -12,12 +12,15 @@ import (
 	"math"
 	"mime/multipart"
 	"net/http"
+	neturl "net/url"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
+	"unicode/utf8"
 )
 
 const (
@@ -25,6 +28,8 @@ const (
 	botPollTimeoutSeconds     = 25
 	botPollErrorBackoff       = 5 * time.Second
 	botLoginApprovalTTL       = 2 * time.Minute
+	botAPKUploadTimeout       = 15 * time.Minute
+	botProblemNoticeMaxRunes  = 512
 	botMessageMaxDevices      = 12
 	botMessageMaxWorkers      = 12
 	botPendingNotifyInterval  = 30 * time.Second
@@ -66,6 +71,8 @@ type telegramBot struct {
 	approver *botAuthApprover
 	limitMu  sync.Mutex
 	limits   map[int64]telegramLimitState
+	// apkUploading guards the single background /get_apk upload.
+	apkUploading atomic.Bool
 }
 
 type botAuthApprover struct {
@@ -122,6 +129,10 @@ type telegramHTTPClient struct {
 	token  string
 	apiURL string
 	client *http.Client
+	// uploadClient has no overall timeout; uploads are bounded by their
+	// context instead, since a 50 MB APK cannot finish within client's 35s
+	// on a slow link.
+	uploadClient *http.Client
 }
 
 func botCommand(cfg orchConfig, args []string) error {
@@ -254,9 +265,10 @@ func newTelegramBot(s *server, settings botSettingsRecord, client telegramAPI) *
 
 func newTelegramHTTPClient(token string) telegramAPI {
 	return &telegramHTTPClient{
-		token:  strings.TrimSpace(token),
-		apiURL: telegramAPIBaseURL,
-		client: &http.Client{Timeout: 35 * time.Second},
+		token:        strings.TrimSpace(token),
+		apiURL:       telegramAPIBaseURL,
+		client:       &http.Client{Timeout: 35 * time.Second},
+		uploadClient: &http.Client{},
 	}
 }
 
@@ -349,9 +361,20 @@ func (b *telegramBot) handleMessage(ctx context.Context, msg telegramMessage) {
 	case "/publish_apk":
 		_ = b.sendOwnerMessage(ctx, b.apkText(), nil)
 	case "/get_apk":
-		if err := b.sendCurrentAPK(ctx); err != nil {
-			_ = b.sendOwnerMessage(ctx, "APK: "+err.Error(), nil)
+		// Uploading up to 50 MB can take minutes; run it in the background so
+		// the poll loop keeps serving login approvals and alerts meanwhile.
+		if !b.apkUploading.CompareAndSwap(false, true) {
+			_ = b.sendOwnerMessage(ctx, "APK уже отправляется, дождитесь завершения.", nil)
+			return
 		}
+		go func() {
+			defer b.apkUploading.Store(false)
+			uploadCtx, cancel := context.WithTimeout(ctx, botAPKUploadTimeout)
+			defer cancel()
+			if err := b.sendCurrentAPK(uploadCtx); err != nil {
+				_ = b.sendOwnerMessage(ctx, "APK: "+err.Error(), nil)
+			}
+		}()
 	case "/approve":
 		text, keyboard := b.approveText()
 		_ = b.sendOwnerMessage(ctx, text, keyboard)
@@ -435,8 +458,55 @@ func (b *telegramBot) handleWorkerCallback(ctx context.Context, cb telegramCallb
 	}
 }
 
+// telegramMessageMaxRunes stays under the Bot API's 4096-character limit for
+// sendMessage text; longer messages are split.
+const telegramMessageMaxRunes = 4000
+
 func (b *telegramBot) sendOwnerMessage(ctx context.Context, text string, keyboard *telegramInlineKeyboard) error {
-	return b.client.sendMessage(ctx, b.ownerID, text, keyboard)
+	chunks := splitTelegramText(text, telegramMessageMaxRunes)
+	for i, chunk := range chunks {
+		var kb *telegramInlineKeyboard
+		if i == len(chunks)-1 {
+			kb = keyboard
+		}
+		if err := b.client.sendMessage(ctx, b.ownerID, chunk, kb); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// splitTelegramText splits text into chunks of at most maxRunes, preferring
+// line boundaries and hard-cutting only lines that are longer on their own.
+func splitTelegramText(text string, maxRunes int) []string {
+	if utf8.RuneCountInString(text) <= maxRunes {
+		return []string{text}
+	}
+	var chunks []string
+	var cur []rune
+	flush := func() {
+		if len(cur) > 0 {
+			chunks = append(chunks, string(cur))
+			cur = cur[:0]
+		}
+	}
+	for i, line := range strings.Split(text, "\n") {
+		runes := []rune(line)
+		if i > 0 {
+			runes = append([]rune{'\n'}, runes...)
+		}
+		if len(cur)+len(runes) > maxRunes {
+			flush()
+			runes = []rune(strings.TrimPrefix(string(runes), "\n"))
+		}
+		for len(runes) > maxRunes {
+			chunks = append(chunks, string(runes[:maxRunes]))
+			runes = runes[maxRunes:]
+		}
+		cur = append(cur, runes...)
+	}
+	flush()
+	return chunks
 }
 
 func (b *telegramBot) statusText() string {
@@ -1042,7 +1112,7 @@ func (c *telegramHTTPClient) sendDocument(ctx context.Context, chatID int64, pat
 		return err
 	}
 	req.Header.Set("Content-Type", writer.FormDataContentType())
-	resp, err := c.client.Do(req)
+	resp, err := c.doWith(c.uploadHTTPClient(), req)
 	if err != nil {
 		return err
 	}
@@ -1058,6 +1128,45 @@ func (c *telegramHTTPClient) sendDocument(ctx context.Context, chatID int64, pat
 		return errors.New(firstNotBlank(env.Error, "telegram sendDocument failed"))
 	}
 	return nil
+}
+
+// do sends a Bot API request. The bot token is part of the request URL and
+// net/http embeds that URL in transport errors, so it is redacted before the
+// error can reach logs.
+func (c *telegramHTTPClient) do(req *http.Request) (*http.Response, error) {
+	return c.doWith(c.client, req)
+}
+
+func (c *telegramHTTPClient) uploadHTTPClient() *http.Client {
+	if c.uploadClient != nil {
+		return c.uploadClient
+	}
+	return c.client
+}
+
+func (c *telegramHTTPClient) doWith(client *http.Client, req *http.Request) (*http.Response, error) {
+	resp, err := client.Do(req)
+	if err != nil {
+		err = redactTelegramToken(err, c.token)
+	}
+	return resp, err
+}
+
+func redactTelegramToken(err error, token string) error {
+	if err == nil || strings.TrimSpace(token) == "" {
+		return err
+	}
+	var urlErr *neturl.Error
+	if errors.As(err, &urlErr) {
+		urlErr.URL = strings.ReplaceAll(urlErr.URL, token, "<redacted>")
+		if !strings.Contains(err.Error(), token) {
+			return err
+		}
+	}
+	if strings.Contains(err.Error(), token) {
+		return errors.New(strings.ReplaceAll(err.Error(), token, "<redacted>"))
+	}
+	return err
 }
 
 func (c *telegramHTTPClient) answerCallback(ctx context.Context, callbackID, text string) error {
@@ -1089,7 +1198,7 @@ func (c *telegramHTTPClient) call(ctx context.Context, method string, payload an
 		return err
 	}
 	req.Header.Set("Content-Type", "application/json")
-	resp, err := c.client.Do(req)
+	resp, err := c.do(req)
 	if err != nil {
 		return err
 	}

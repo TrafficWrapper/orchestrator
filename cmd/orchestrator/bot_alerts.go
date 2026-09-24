@@ -297,7 +297,9 @@ func (b *telegramBot) sendProblemNotices(ctx context.Context, notices []botProbl
 	}
 	lines := []string{"Проблемы платформы"}
 	for _, notice := range notices {
-		lines = append(lines, notice.Text)
+		// Labels come from worker self-descriptions and device aliases of
+		// unbounded length; keep one notice from sinking the whole batch.
+		lines = append(lines, truncateRunes(notice.Text, botProblemNoticeMaxRunes))
 	}
 	return b.sendOwnerMessage(ctx, strings.Join(lines, "\n"), nil)
 }
@@ -435,4 +437,12 @@ func dashText(value string) string {
 		return "-"
 	}
 	return value
+}
+
+func truncateRunes(text string, maxRunes int) string {
+	runes := []rune(text)
+	if len(runes) <= maxRunes {
+		return text
+	}
+	return string(runes[:maxRunes-1]) + "…"
 }

@@ -24,6 +24,7 @@ import (
 	"mime/multipart"
 	"net"
 	"net/http"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -43,6 +44,9 @@ type orchConfig struct {
 	StateDir                string
 	Listen                  string
 	SignerSocket            string
+	SignerKeyPath           string
+	SignerLegacyKeyPath     string
+	ClientIPHeader          string
 	PublicURL               string
 	EgressProbeURL          string
 	AdminSecret             string
@@ -66,6 +70,7 @@ type server struct {
 	sessionCount     atomic.Int64
 	handshakeMu      sync.Mutex
 	handshakeRates   map[string]handshakeRate
+	handshakePending map[string]int
 	handshakePrune   time.Time
 	telemetryNonceMu sync.Mutex
 	telemetryNonces  map[string]map[string]time.Time
@@ -74,21 +79,35 @@ type server struct {
 	audit            *auditLog
 	discoverySeqMu   sync.Mutex
 	discoveryCacheMu sync.Mutex
-	discoveryCache   discoveryBundleCache
-	discoveryBuilds  atomic.Int64
-	discoveryRateMu  sync.Mutex
-	discoveryRates   map[string]discoveryRequestRate
-	adminSessions    sync.Map
-	botMu            sync.Mutex
-	authApprover     authApprover
-	bot              *telegramBot
-	botCancel        context.CancelFunc
-	botFactory       telegramClientFactory
+	// discoveryBuildMu serializes bundle rebuilds; the fields below it are
+	// guarded by it.
+	discoveryBuildMu    sync.Mutex
+	discoveryBuildErr   error
+	discoveryBuildErrAt time.Time
+	discoveryBuildErrGn uint64
+	discoveryInvalidGen atomic.Uint64
+	discoveryCache      discoveryBundleCache
+	discoveryBuilds     atomic.Int64
+	discoveryRateMu     sync.Mutex
+	discoveryRates      map[string]discoveryRequestRate
+	adminSessions       sync.Map
+	botMu               sync.Mutex
+	apkPublishMu        sync.Mutex
+	egressProbeMu       sync.Mutex
+	egressProbeValue    string
+	egressProbeAt       time.Time
+	authApprover        authApprover
+	bot                 *telegramBot
+	botCancel           context.CancelFunc
+	botFactory          telegramClientFactory
 }
 
 type noiseSession struct {
 	hs        *noise.HandshakeState
 	createdAt time.Time
+	// pendingKey identifies the source bucket charged for this pending
+	// handshake (see reserveHandshakeStart).
+	pendingKey string
 }
 
 type handshakeRate struct {
@@ -251,13 +270,18 @@ const (
 	telemetryNonceDeviceMax  = 16 * 1024
 	noiseSessionTTL          = 30 * time.Second
 	noiseSessionJanitorEvery = 5 * time.Second
-	maxNoiseSessions         = 1024
-	handshakeRateWindow      = 10 * time.Second
-	handshakeRateLimit       = 30
-	handshakeRatePruneEvery  = time.Second
-	maxHandshakeRateKeys     = 64 * 1024
-	workerFreshTTL           = 2 * time.Minute
-	workerJanitorEvery       = 30 * time.Second
+	maxNoiseSessions         = 16 * 1024
+	// Pending (unfinished) handshakes allowed per rate-limit key (IPv4 or
+	// IPv6 /64) and per wider prefix (IPv4 /24, IPv6 /48), so a few sources
+	// cannot occupy the global pool and lock real workers/devices out.
+	maxPendingHandshakesPerKey    = 16
+	maxPendingHandshakesPerPrefix = 128
+	handshakeRateWindow           = 10 * time.Second
+	handshakeRateLimit            = 30
+	handshakeRatePruneEvery       = time.Second
+	maxHandshakeRateKeys          = 64 * 1024
+	workerFreshTTL                = 2 * time.Minute
+	workerJanitorEvery            = 30 * time.Second
 )
 
 type nudgeResponse struct {
@@ -347,6 +371,9 @@ func readConfig() orchConfig {
 		StateDir:                getenv("ORCH_STATE_DIR", "./orch-state"),
 		Listen:                  getenv("ORCH_LISTEN", ":9091"),
 		SignerSocket:            getenv("ORCH_SIGNER_SOCKET", "./orch-state/signer.sock"),
+		SignerKeyPath:           os.Getenv("ORCH_SIGNER_KEY_PATH"),
+		SignerLegacyKeyPath:     os.Getenv("ORCH_SIGNER_LEGACY_KEY_PATH"),
+		ClientIPHeader:          os.Getenv("ORCH_CLIENT_IP_HEADER"),
 		PublicURL:               getenv("ORCH_PUBLIC_URL", "https://127.0.0.1:9091"),
 		EgressProbeURL:          os.Getenv("ORCH_EGRESS_PROBE_URL"),
 		AdminSecret:             os.Getenv("ORCH_ADMIN_SECRET"),
@@ -363,6 +390,9 @@ func readConfig() orchConfig {
 }
 
 func runServe(cfg orchConfig) error {
+	if err := setClientIPHeaderMode(cfg.ClientIPHeader); err != nil {
+		return err
+	}
 	st, err := openOrchStore(cfg)
 	if err != nil {
 		return err
@@ -414,6 +444,7 @@ func runServe(cfg orchConfig) error {
 	mux.HandleFunc("/d/v1/handshake/start", s.handleHandshakeStart)
 	mux.HandleFunc("/d/v1/enroll", s.handleNoise(s.handleDeviceEnroll))
 	mux.HandleFunc("/admin/v1/login", s.handleAdminLogin)
+	mux.HandleFunc("/admin/v1/logout", s.handleAdminLogout)
 	mux.HandleFunc("/admin/v1/password/change", s.handleAdminPasswordChange)
 	mux.HandleFunc("/admin/v1/password/force-set", s.handleAdminPasswordForceSet)
 	mux.HandleFunc("/admin/v1/totp/enroll", s.handleAdminTOTPEnroll)
@@ -457,7 +488,7 @@ func runServe(cfg orchConfig) error {
 func newOrchestratorHTTPServer(addr string, handler http.Handler) *http.Server {
 	return &http.Server{
 		Addr:              addr,
-		Handler:           handler,
+		Handler:           withSecurityHeaders(withRequestBodyLimits(handler)),
 		TLSConfig:         &tls.Config{MinVersion: tls.VersionTLS12},
 		ReadHeaderTimeout: 15 * time.Second,
 		IdleTimeout:       120 * time.Second,
@@ -473,9 +504,10 @@ func (s *server) handleHandshakeStart(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	stored := false
+	ip := clientIP(r)
 	defer func() {
 		if !stored {
-			s.sessionCount.Add(-1)
+			s.releasePendingHandshake(ip)
 		}
 	}()
 	var req startRequest
@@ -509,7 +541,7 @@ func (s *server) handleHandshakeStart(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	sid := randID()
-	s.sessions.Store(sid, noiseSession{hs: hs, createdAt: time.Now()})
+	s.sessions.Store(sid, noiseSession{hs: hs, createdAt: time.Now(), pendingKey: ip})
 	stored = true
 	writeJSON(w, startResponse{OK: true, SID: sid, Message: base64.StdEncoding.EncodeToString(msg2)})
 }
@@ -535,16 +567,65 @@ func (s *server) reserveHandshakeStart(r *http.Request) (bool, string) {
 	}
 	rate.Count++
 	s.handshakeRates[key] = rate
+	if s.handshakePending == nil {
+		s.handshakePending = map[string]int{}
+	}
+	prefix := pendingPrefixKey(clientIP(r))
+	if s.handshakePending[key] >= maxPendingHandshakesPerKey || s.handshakePending[prefix] >= maxPendingHandshakesPerPrefix {
+		s.handshakeMu.Unlock()
+		return false, "too many pending handshakes from this network"
+	}
+	s.handshakePending[key]++
+	s.handshakePending[prefix]++
 	s.handshakeMu.Unlock()
 	if s.sessionCount.Add(1) > maxNoiseSessions {
-		s.sessionCount.Add(-1)
+		s.releasePendingHandshake(clientIP(r))
 		return false, "too many pending handshakes"
 	}
 	return true, ""
 }
 
+// releasePendingHandshake returns the global and per-source slots taken by
+// reserveHandshakeStart for a handshake from ip.
+func (s *server) releasePendingHandshake(ip string) {
+	s.sessionCount.Add(-1)
+	key := rateLimitKey(ip)
+	prefix := pendingPrefixKey(ip)
+	s.handshakeMu.Lock()
+	defer s.handshakeMu.Unlock()
+	for _, k := range []string{key, prefix} {
+		if s.handshakePending[k] <= 1 {
+			delete(s.handshakePending, k)
+		} else {
+			s.handshakePending[k]--
+		}
+	}
+}
+
+// pendingPrefixKey aggregates addresses one level wider than rateLimitKey:
+// IPv4 /24 and IPv6 /48.
+func pendingPrefixKey(ip string) string {
+	addr, err := netip.ParseAddr(strings.TrimSpace(ip))
+	if err != nil {
+		return "prefix:" + strings.TrimSpace(ip)
+	}
+	addr = addr.Unmap()
+	bits := 48
+	if addr.Is4() {
+		bits = 24
+	}
+	prefix, err := addr.Prefix(bits)
+	if err != nil {
+		return "prefix:" + addr.String()
+	}
+	return "prefix:" + prefix.String()
+}
+
 func (s *server) pruneHandshakeRatesLocked(now time.Time) {
-	if !s.handshakePrune.IsZero() && now.After(s.handshakePrune) && now.Sub(s.handshakePrune) < handshakeRatePruneEvery {
+	if !s.handshakePrune.IsZero() && now.Before(s.handshakePrune.Add(handshakeRatePruneEvery)) {
+		if now.Before(s.handshakePrune) {
+			s.handshakePrune = now
+		}
 		return
 	}
 	s.handshakePrune = now
@@ -583,11 +664,12 @@ func (s *server) runNoiseSessionJanitor(ctx context.Context) {
 				sess, ok := value.(noiseSession)
 				if !ok || sess.createdAt.Before(cutoff) {
 					if _, loaded := s.sessions.LoadAndDelete(key); loaded {
-						s.sessionCount.Add(-1)
+						s.releasePendingHandshake(sess.pendingKey)
 					}
 				}
 				return true
 			})
+			s.pruneExpiredAdminSessions(time.Now().UTC())
 		}
 	}
 }
@@ -611,8 +693,8 @@ func (s *server) handleNoiseContext(fn func(context.Context, []byte, []byte) (an
 			writeJSON(w, noiseEnvelopeResponse{OK: false, Error: "noise session expired"})
 			return
 		}
-		s.sessionCount.Add(-1)
 		sess := v.(noiseSession)
+		s.releasePendingHandshake(sess.pendingKey)
 		if time.Since(sess.createdAt) > noiseSessionTTL {
 			writeJSON(w, noiseEnvelopeResponse{OK: false, Error: "noise session expired"})
 			return
@@ -813,7 +895,7 @@ func (s *server) handlePull(peer []byte, raw []byte) (any, error) {
 	if err != nil {
 		return nil, err
 	}
-	update, err := s.loadUpdateArtifact()
+	update, err := s.updateArtifactForPull(rec, req.HaveSeq)
 	if err != nil {
 		return nil, err
 	}
@@ -869,11 +951,10 @@ func (s *server) handleAck(peer []byte, raw []byte) (any, error) {
 	if probe == "" {
 		log.Printf("worker %s egress probe unavailable; observed=%q", rec.ID, req.EgressIPObserved)
 	}
-	_ = s.store.setProbe(rec.ID, probe)
-	if err := s.store.updateAck(rec.ID, req.AppliedVersion, req.EgressIPObserved, req.SelfDescribe); err != nil {
+	if err := s.store.updateAckWithProbe(rec.ID, req.AppliedVersion, req.EgressIPObserved, req.SelfDescribe, &probe); err != nil {
 		return nil, err
 	}
-	quotaBlocks, err := s.store.applyDeviceUsageAndBlocks(rec.ID, req.Usage, time.Now().UTC())
+	quotaBlocks, err := s.store.applyReportedDeviceUsage(rec.ID, req.Usage, time.Now().UTC())
 	if err != nil {
 		return nil, err
 	}
@@ -1568,10 +1649,26 @@ func rejectForbiddenKeys(raw []byte) error {
 	return walk(value, "")
 }
 
+const egressProbeCacheTTL = time.Minute
+
 func (s *server) probeEgressIP(rec workerRecord) string {
 	if s.cfg.EgressProbeURL == "" {
 		return stringFromMap(rec.SelfDescribe, "egress_ip")
 	}
+	// ORCH_EGRESS_PROBE_URL is one URL for the whole orchestrator (meant for a
+	// co-located worker), so the answer is the same for every ack: cache it
+	// instead of blocking each ack on a synchronous HTTP call.
+	s.egressProbeMu.Lock()
+	defer s.egressProbeMu.Unlock()
+	if !s.egressProbeAt.IsZero() && time.Since(s.egressProbeAt) < egressProbeCacheTTL {
+		return s.egressProbeValue
+	}
+	s.egressProbeValue = s.fetchEgressProbe()
+	s.egressProbeAt = time.Now()
+	return s.egressProbeValue
+}
+
+func (s *server) fetchEgressProbe() string {
 	client := http.Client{Timeout: 3 * time.Second}
 	resp, err := client.Get(s.cfg.EgressProbeURL)
 	if err != nil {
@@ -1908,7 +2005,7 @@ func (s *server) handleAdminLogin(w http.ResponseWriter, r *http.Request) {
 	limiter.recordSuccess(ip)
 	s.auditEvent(auditEntry{Event: "admin_login", IP: ip, Result: "ok"})
 	if mustChange {
-		s.createAdminSession(w, true)
+		s.createAdminSession(w, r, true)
 		return
 	}
 	if approver := s.currentAuthApprover(); approver != nil && approver.enabled() {
@@ -1928,10 +2025,10 @@ func (s *server) handleAdminLogin(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	s.createAdminSession(w, false)
+	s.createAdminSession(w, r, false)
 }
 
-func (s *server) createAdminSession(w http.ResponseWriter, mustChange bool) {
+func (s *server) createAdminSession(w http.ResponseWriter, r *http.Request, mustChange bool) {
 	token := randID() + randID() + randID()
 	csrf := randID() + randID()
 	expires := time.Now().UTC().Add(12 * time.Hour)
@@ -1941,6 +2038,7 @@ func (s *server) createAdminSession(w http.ResponseWriter, mustChange bool) {
 		Value:    token,
 		Path:     "/",
 		HttpOnly: true,
+		Secure:   s.cfg.TLS || r.TLS != nil,
 		SameSite: http.SameSiteLaxMode,
 		Expires:  expires,
 	})
@@ -1951,6 +2049,52 @@ func (s *server) createAdminSession(w http.ResponseWriter, mustChange bool) {
 		"expires_at":    expires.Format(time.RFC3339),
 		"must_change":   mustChange,
 	})
+}
+
+// revokeAdminSessions ends every admin session, e.g. after a password change,
+// so a stolen session cannot outlive the credential it was issued for.
+func (s *server) revokeAdminSessions() {
+	s.adminSessions.Range(func(key, _ any) bool {
+		s.adminSessions.Delete(key)
+		return true
+	})
+}
+
+func (s *server) pruneExpiredAdminSessions(now time.Time) {
+	s.adminSessions.Range(func(key, value any) bool {
+		if session, ok := value.(adminSession); !ok || now.After(session.ExpiresAt) {
+			s.adminSessions.Delete(key)
+		}
+		return true
+	})
+}
+
+func (s *server) handleAdminLogout(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	token, source, session, ok := s.lookupAdminSession(r)
+	if ok && source == "cookie" && !csrfTokenMatches(session.CSRFToken, r.Header.Get("x-csrf-token")) {
+		http.Error(w, "csrf token required", http.StatusForbidden)
+		return
+	}
+	if token != "" {
+		s.adminSessions.Delete(token)
+	}
+	http.SetCookie(w, &http.Cookie{
+		Name:     "tw_admin_session",
+		Value:    "",
+		Path:     "/",
+		HttpOnly: true,
+		Secure:   s.cfg.TLS || r.TLS != nil,
+		SameSite: http.SameSiteLaxMode,
+		MaxAge:   -1,
+	})
+	if ok {
+		s.auditEvent(auditEntry{Event: "admin_logout", IP: clientIP(r), Result: "ok"})
+	}
+	writeJSON(w, map[string]any{"ok": true})
 }
 
 func (s *server) handleAdminTOTPEnroll(w http.ResponseWriter, r *http.Request) {
@@ -2006,10 +2150,28 @@ func (s *server) handleAdminTOTPDisable(w http.ResponseWriter, r *http.Request) 
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
+	var req struct {
+		Code string `json:"code"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil && !errors.Is(err, io.EOF) {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	// Turning 2FA off must prove possession of the second factor, otherwise a
+	// stolen session could strip it with a single request.
+	if enabled, ok, err := s.store.verifyAdminTOTP(req.Code, time.Now().UTC()); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	} else if enabled && !ok {
+		s.auditEvent(auditEntry{Event: "admin_totp_disable", IP: clientIP(r), Result: "failed", Fields: map[string]string{"reason": "bad_totp"}})
+		http.Error(w, "valid totp code required", http.StatusForbidden)
+		return
+	}
 	if err := s.store.disableAdminTOTP(); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
+	s.revokeAdminSessions()
 	s.auditEvent(auditEntry{Event: "admin_totp_disable", IP: clientIP(r), Result: "ok"})
 	writeJSON(w, map[string]any{"ok": true})
 }
@@ -2111,7 +2273,7 @@ func (s *server) handleAdminPasswordChange(w http.ResponseWriter, r *http.Reques
 	}
 	log.Printf("admin password changed at=%s remote=%s", time.Now().UTC().Format(time.RFC3339), r.RemoteAddr)
 	s.auditEvent(auditEntry{Event: "admin_password_change", IP: ip, Result: "ok"})
-	s.adminSessions.Delete(token)
+	s.revokeAdminSessions()
 	if approver := s.currentAuthApprover(); approver != nil && approver.enabled() {
 		approved, err := approver.requestLoginApproval(r.Context(), loginApprovalRequest{
 			RemoteAddr: ip,
@@ -2127,7 +2289,7 @@ func (s *server) handleAdminPasswordChange(w http.ResponseWriter, r *http.Reques
 			return
 		}
 	}
-	s.createAdminSession(w, false)
+	s.createAdminSession(w, r, false)
 }
 
 func csrfTokenMatches(expected, provided string) bool {
@@ -2155,6 +2317,8 @@ func (s *server) handleAdminPasswordForceSet(w http.ResponseWriter, r *http.Requ
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
+	s.revokeAdminSessions()
+	s.auditEvent(auditEntry{Event: "admin_password_force_set", IP: clientIP(r), Result: "ok"})
 	writeJSON(w, map[string]any{"ok": true, "status": "admin_password_set"})
 }
 
@@ -2351,6 +2515,16 @@ func (s *server) runWorkerJanitor(ctx context.Context) {
 				log.Printf("worker stale janitor failed: %v", err)
 			} else if n > 0 {
 				log.Printf("worker stale janitor marked inactive count=%d", n)
+			}
+			// Expiry-based blocks need no usage report, so they are swept here
+			// instead of scanning every device on every worker ack.
+			if _, err := s.store.pruneDeadTokens(time.Now().UTC()); err != nil {
+				log.Printf("token prune failed: %v", err)
+			}
+			if blocked, err := s.store.applyDeviceUsageAndBlocks("", nil, time.Now().UTC()); err != nil {
+				log.Printf("device expiry janitor failed: %v", err)
+			} else if blocked > 0 {
+				log.Printf("device expiry janitor blocked count=%d", blocked)
 			}
 		}
 	}
@@ -3461,49 +3635,64 @@ func parseFormInt64(r *http.Request, key string) int64 {
 	return parsed
 }
 
+// storeAPKRelease publishes one release. Publishes are serialized, the seq is
+// checked against the current release before anything touches disk, and files
+// are staged in a private directory that is renamed into place, so a racing or
+// stale publish can never overwrite the manifest of the live release.
 func (s *server) storeAPKRelease(manifest apkReleaseRecord, manifestJSON, minisig string, apk multipart.File, _ *multipart.FileHeader) (apkReleaseRecord, error) {
-	releaseDir := filepath.Join(s.cfg.StateDir, "apk", "releases", fmt.Sprintf("%d", manifest.Seq))
-	if err := os.MkdirAll(releaseDir, 0o700); err != nil {
+	s.apkPublishMu.Lock()
+	defer s.apkPublishMu.Unlock()
+	if current, ok, err := s.store.currentAPKRelease(); err != nil {
+		return apkReleaseRecord{}, err
+	} else if ok && manifest.Seq <= current.Seq {
+		return apkReleaseRecord{}, fmt.Errorf("apk release rollback: seq=%d current=%d", manifest.Seq, current.Seq)
+	}
+	releasesDir := filepath.Join(s.cfg.StateDir, "apk", "releases")
+	if err := os.MkdirAll(releasesDir, 0o700); err != nil {
 		return apkReleaseRecord{}, err
 	}
-	tmpPath := filepath.Join(releaseDir, manifest.APKName+".tmp")
-	out, err := os.OpenFile(tmpPath, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
+	stagingDir, err := os.MkdirTemp(releasesDir, ".staging-")
+	if err != nil {
+		return apkReleaseRecord{}, err
+	}
+	defer os.RemoveAll(stagingDir)
+	out, err := os.OpenFile(filepath.Join(stagingDir, manifest.APKName), os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
 	if err != nil {
 		return apkReleaseRecord{}, err
 	}
 	digest := sha256.New()
 	size, copyErr := io.Copy(out, io.TeeReader(apk, digest))
+	syncErr := out.Sync()
 	closeErr := out.Close()
-	if copyErr != nil {
-		_ = os.Remove(tmpPath)
-		return apkReleaseRecord{}, copyErr
-	}
-	if closeErr != nil {
-		_ = os.Remove(tmpPath)
-		return apkReleaseRecord{}, closeErr
+	for _, err := range []error{copyErr, syncErr, closeErr} {
+		if err != nil {
+			return apkReleaseRecord{}, err
+		}
 	}
 	actualSHA := hex.EncodeToString(digest.Sum(nil))
 	if size != manifest.APKSize || !actualSHAEquals(actualSHA, manifest.APKSHA256) {
-		_ = os.Remove(tmpPath)
 		return apkReleaseRecord{}, fmt.Errorf("apk mismatch sha=%s size=%d", actualSHA, size)
 	}
-	apkPath := filepath.Join(releaseDir, manifest.APKName)
-	if err := os.Rename(tmpPath, apkPath); err != nil {
-		_ = os.Remove(tmpPath)
+	if err := os.WriteFile(filepath.Join(stagingDir, "update-manifest.json"), []byte(strings.TrimSpace(manifestJSON)), 0o600); err != nil {
 		return apkReleaseRecord{}, err
 	}
-	manifestPath := filepath.Join(releaseDir, "update-manifest.json")
-	minisigPath := filepath.Join(releaseDir, "update-manifest.json.minisig")
-	if err := os.WriteFile(manifestPath, []byte(strings.TrimSpace(manifestJSON)), 0o600); err != nil {
+	if err := os.WriteFile(filepath.Join(stagingDir, "update-manifest.json.minisig"), []byte(strings.TrimSpace(minisig)), 0o600); err != nil {
 		return apkReleaseRecord{}, err
 	}
-	if err := os.WriteFile(minisigPath, []byte(strings.TrimSpace(minisig)), 0o600); err != nil {
+	releaseDir := filepath.Join(releasesDir, fmt.Sprintf("%d", manifest.Seq))
+	// A directory for this seq can only be a leftover of a failed publish:
+	// the seq is newer than the live release, so nothing references it.
+	if err := os.RemoveAll(releaseDir); err != nil {
 		return apkReleaseRecord{}, err
 	}
-	manifest.APKPath = apkPath
-	manifest.ManifestPath = manifestPath
-	manifest.MinisigPath = minisigPath
+	if err := os.Rename(stagingDir, releaseDir); err != nil {
+		return apkReleaseRecord{}, err
+	}
+	manifest.APKPath = filepath.Join(releaseDir, manifest.APKName)
+	manifest.ManifestPath = filepath.Join(releaseDir, "update-manifest.json")
+	manifest.MinisigPath = filepath.Join(releaseDir, "update-manifest.json.minisig")
 	if err := s.store.setAPKRelease(manifest); err != nil {
+		_ = os.RemoveAll(releaseDir)
 		return apkReleaseRecord{}, err
 	}
 	if err := s.pruneOldAPKReleases(s.cfg.APKKeepReleases, manifest.Seq); err != nil {
@@ -3512,11 +3701,36 @@ func (s *server) storeAPKRelease(manifest apkReleaseRecord, manifestJSON, minisi
 	return manifest, nil
 }
 
-func (s *server) loadUpdateArtifact() (*updateArtifact, error) {
-	rec, ok, err := s.store.currentAPKRelease()
+// updateArtifactForPull returns the APK update only when the worker has not
+// yet acknowledged the current release (or reports no applied state), so
+// config-only bumps do not re-ship the whole APK to every worker.
+func (s *server) updateArtifactForPull(worker workerRecord, haveSeq int64) (*updateArtifact, error) {
+	rel, ok, err := s.store.currentAPKRelease()
 	if err != nil || !ok {
 		return nil, err
 	}
+	if haveSeq > 0 && worker.APKAppliedSeq == rel.Seq {
+		return nil, nil
+	}
+	update, err := readUpdateArtifact(rel)
+	if err != nil {
+		return nil, err
+	}
+	if err := s.store.markWorkerAPKSent(worker.ID, rel.Seq, worker.DesiredSeq); err != nil {
+		return nil, err
+	}
+	return update, nil
+}
+
+func (s *server) loadUpdateArtifact() (*updateArtifact, error) {
+	rel, ok, err := s.store.currentAPKRelease()
+	if err != nil || !ok {
+		return nil, err
+	}
+	return readUpdateArtifact(rel)
+}
+
+func readUpdateArtifact(rec apkReleaseRecord) (*updateArtifact, error) {
 	manifestJSON, err := os.ReadFile(rec.ManifestPath)
 	if err != nil {
 		return nil, err
