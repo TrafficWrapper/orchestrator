@@ -131,8 +131,7 @@ AWG остаётся fallback path, когда REALITY unhealthy.
   degraded-воркере. Лимиты устройства для воркера содержат
   `download_mbps`/`upload_mbps` (целые Мбит/с с округлением вверх, максимум
   100000; воркер ограничивает только AWG), вычисленные из текстового лимита
-  (`20mbit`, `1gbit`). Маршруты AWG-профилей наследуют `endpoint_v6` и
-  туннельный `dns` воркера.
+  (`20mbit`, `1gbit`).
 
 ## Distributor and Updates
 

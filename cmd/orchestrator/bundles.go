@@ -202,7 +202,6 @@ func (s *server) clientWorkerPayloadForClient(rec workerRecord, clientVersion st
 			if route, ok := clientRoutePayload("awg", profile.Params, expected, configURL); ok {
 				route["profile"] = profile.Name
 				route["awg_profile"] = profile.Name
-				inheritAWGWorkerFields(route, rec.SelfDescribe["awg"])
 				routes = append(routes, route)
 			}
 		} else if route, ok := clientRoutePayload("awg", rec.SelfDescribe["awg"], expected, configURL); ok {
