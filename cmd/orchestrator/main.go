@@ -816,7 +816,7 @@ func (s *server) handlePull(peer []byte, raw []byte) (any, error) {
 	if err != nil {
 		return nil, err
 	}
-	update, err := s.loadUpdateArtifact()
+	update, err := s.updateArtifactForPull(rec, req.HaveSeq)
 	if err != nil {
 		return nil, err
 	}
@@ -3515,11 +3515,36 @@ func (s *server) storeAPKRelease(manifest apkReleaseRecord, manifestJSON, minisi
 	return manifest, nil
 }
 
-func (s *server) loadUpdateArtifact() (*updateArtifact, error) {
-	rec, ok, err := s.store.currentAPKRelease()
+// updateArtifactForPull returns the APK update only when the worker has not
+// yet acknowledged the current release (or reports no applied state), so
+// config-only bumps do not re-ship the whole APK to every worker.
+func (s *server) updateArtifactForPull(worker workerRecord, haveSeq int64) (*updateArtifact, error) {
+	rel, ok, err := s.store.currentAPKRelease()
 	if err != nil || !ok {
 		return nil, err
 	}
+	if haveSeq > 0 && worker.APKAppliedSeq == rel.Seq {
+		return nil, nil
+	}
+	update, err := readUpdateArtifact(rel)
+	if err != nil {
+		return nil, err
+	}
+	if err := s.store.markWorkerAPKSent(worker.ID, rel.Seq, worker.DesiredSeq); err != nil {
+		return nil, err
+	}
+	return update, nil
+}
+
+func (s *server) loadUpdateArtifact() (*updateArtifact, error) {
+	rel, ok, err := s.store.currentAPKRelease()
+	if err != nil || !ok {
+		return nil, err
+	}
+	return readUpdateArtifact(rel)
+}
+
+func readUpdateArtifact(rec apkReleaseRecord) (*updateArtifact, error) {
 	manifestJSON, err := os.ReadFile(rec.ManifestPath)
 	if err != nil {
 		return nil, err

@@ -78,6 +78,12 @@ type workerRecord struct {
 	ConfigPriority   *int            `json:"config_priority,omitempty"`
 	ConfigWeight     *int            `json:"config_weight,omitempty"`
 	ProtocolEnabled  map[string]bool `json:"protocol_enabled,omitempty"`
+	// APK delivery tracking: the release seq last shipped in a pull, the
+	// worker config seq it shipped with, and the release seq the worker has
+	// acknowledged applying. Lets pulls skip re-sending an unchanged APK.
+	APKSentSeq    int64 `json:"apk_sent_seq,omitempty"`
+	APKSentAtSeq  int64 `json:"apk_sent_at_seq,omitempty"`
+	APKAppliedSeq int64 `json:"apk_applied_seq,omitempty"`
 }
 
 type adminTOTPRecord struct {
@@ -1591,6 +1597,9 @@ func (s *orchStore) updateAck(id string, applied int64, observed string, self ma
 		now := time.Now().UTC()
 		rec.AppliedSeq = applied
 		rec.LastAckAt = &now
+		if rec.APKSentSeq > 0 && applied >= rec.APKSentAtSeq {
+			rec.APKAppliedSeq = rec.APKSentSeq
+		}
 		rec.EgressIPObserved = observed
 		if len(self) > 0 {
 			rec.SelfDescribe = self
@@ -1682,6 +1691,8 @@ func (s *orchStore) updateWorkerHeartbeat(id string, haveSeq int64, self map[str
 }
 
 func forceWorkerResync(rec *workerRecord, haveSeq int64) {
+	// A resync may follow lost worker state; ship the APK again with it.
+	rec.APKAppliedSeq = 0
 	target := rec.DesiredSeq
 	if rec.AppliedSeq > target {
 		target = rec.AppliedSeq
@@ -1703,6 +1714,14 @@ func forceWorkerResync(rec *workerRecord, haveSeq int64) {
 		target = 1
 	}
 	rec.DesiredSeq = target
+}
+
+func (s *orchStore) markWorkerAPKSent(id string, apkSeq, atSeq int64) error {
+	return s.updateWorker(id, func(rec *workerRecord) error {
+		rec.APKSentSeq = apkSeq
+		rec.APKSentAtSeq = atSeq
+		return nil
+	})
 }
 
 func (s *orchStore) updateWorker(id string, fn func(*workerRecord) error) error {
