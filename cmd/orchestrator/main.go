@@ -82,6 +82,7 @@ type server struct {
 	discoveryRates   map[string]discoveryRequestRate
 	adminSessions    sync.Map
 	botMu            sync.Mutex
+	apkPublishMu     sync.Mutex
 	authApprover     authApprover
 	bot              *telegramBot
 	botCancel        context.CancelFunc
@@ -3468,49 +3469,64 @@ func parseFormInt64(r *http.Request, key string) int64 {
 	return parsed
 }
 
+// storeAPKRelease publishes one release. Publishes are serialized, the seq is
+// checked against the current release before anything touches disk, and files
+// are staged in a private directory that is renamed into place, so a racing or
+// stale publish can never overwrite the manifest of the live release.
 func (s *server) storeAPKRelease(manifest apkReleaseRecord, manifestJSON, minisig string, apk multipart.File, _ *multipart.FileHeader) (apkReleaseRecord, error) {
-	releaseDir := filepath.Join(s.cfg.StateDir, "apk", "releases", fmt.Sprintf("%d", manifest.Seq))
-	if err := os.MkdirAll(releaseDir, 0o700); err != nil {
+	s.apkPublishMu.Lock()
+	defer s.apkPublishMu.Unlock()
+	if current, ok, err := s.store.currentAPKRelease(); err != nil {
+		return apkReleaseRecord{}, err
+	} else if ok && manifest.Seq <= current.Seq {
+		return apkReleaseRecord{}, fmt.Errorf("apk release rollback: seq=%d current=%d", manifest.Seq, current.Seq)
+	}
+	releasesDir := filepath.Join(s.cfg.StateDir, "apk", "releases")
+	if err := os.MkdirAll(releasesDir, 0o700); err != nil {
 		return apkReleaseRecord{}, err
 	}
-	tmpPath := filepath.Join(releaseDir, manifest.APKName+".tmp")
-	out, err := os.OpenFile(tmpPath, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
+	stagingDir, err := os.MkdirTemp(releasesDir, ".staging-")
+	if err != nil {
+		return apkReleaseRecord{}, err
+	}
+	defer os.RemoveAll(stagingDir)
+	out, err := os.OpenFile(filepath.Join(stagingDir, manifest.APKName), os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
 	if err != nil {
 		return apkReleaseRecord{}, err
 	}
 	digest := sha256.New()
 	size, copyErr := io.Copy(out, io.TeeReader(apk, digest))
+	syncErr := out.Sync()
 	closeErr := out.Close()
-	if copyErr != nil {
-		_ = os.Remove(tmpPath)
-		return apkReleaseRecord{}, copyErr
-	}
-	if closeErr != nil {
-		_ = os.Remove(tmpPath)
-		return apkReleaseRecord{}, closeErr
+	for _, err := range []error{copyErr, syncErr, closeErr} {
+		if err != nil {
+			return apkReleaseRecord{}, err
+		}
 	}
 	actualSHA := hex.EncodeToString(digest.Sum(nil))
 	if size != manifest.APKSize || !actualSHAEquals(actualSHA, manifest.APKSHA256) {
-		_ = os.Remove(tmpPath)
 		return apkReleaseRecord{}, fmt.Errorf("apk mismatch sha=%s size=%d", actualSHA, size)
 	}
-	apkPath := filepath.Join(releaseDir, manifest.APKName)
-	if err := os.Rename(tmpPath, apkPath); err != nil {
-		_ = os.Remove(tmpPath)
+	if err := os.WriteFile(filepath.Join(stagingDir, "update-manifest.json"), []byte(strings.TrimSpace(manifestJSON)), 0o600); err != nil {
 		return apkReleaseRecord{}, err
 	}
-	manifestPath := filepath.Join(releaseDir, "update-manifest.json")
-	minisigPath := filepath.Join(releaseDir, "update-manifest.json.minisig")
-	if err := os.WriteFile(manifestPath, []byte(strings.TrimSpace(manifestJSON)), 0o600); err != nil {
+	if err := os.WriteFile(filepath.Join(stagingDir, "update-manifest.json.minisig"), []byte(strings.TrimSpace(minisig)), 0o600); err != nil {
 		return apkReleaseRecord{}, err
 	}
-	if err := os.WriteFile(minisigPath, []byte(strings.TrimSpace(minisig)), 0o600); err != nil {
+	releaseDir := filepath.Join(releasesDir, fmt.Sprintf("%d", manifest.Seq))
+	// A directory for this seq can only be a leftover of a failed publish:
+	// the seq is newer than the live release, so nothing references it.
+	if err := os.RemoveAll(releaseDir); err != nil {
 		return apkReleaseRecord{}, err
 	}
-	manifest.APKPath = apkPath
-	manifest.ManifestPath = manifestPath
-	manifest.MinisigPath = minisigPath
+	if err := os.Rename(stagingDir, releaseDir); err != nil {
+		return apkReleaseRecord{}, err
+	}
+	manifest.APKPath = filepath.Join(releaseDir, manifest.APKName)
+	manifest.ManifestPath = filepath.Join(releaseDir, "update-manifest.json")
+	manifest.MinisigPath = filepath.Join(releaseDir, "update-manifest.json.minisig")
 	if err := s.store.setAPKRelease(manifest); err != nil {
+		_ = os.RemoveAll(releaseDir)
 		return apkReleaseRecord{}, err
 	}
 	if err := s.pruneOldAPKReleases(s.cfg.APKKeepReleases, manifest.Seq); err != nil {
