@@ -34,6 +34,9 @@ func runServe(cfg orchConfig) error {
 	if err := setClientIPHeaderMode(cfg.ClientIPHeader); err != nil {
 		return err
 	}
+	if publicURLIsLoopback(cfg.PublicURL) {
+		log.Printf("WARNING: ORCH_PUBLIC_URL=%s is a loopback address; bootstrap payloads will point devices at it. Set it to the orchestrator's reachable URL.", cfg.PublicURL)
+	}
 	st, err := openOrchStore(cfg)
 	if err != nil {
 		return err

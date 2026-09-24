@@ -185,7 +185,7 @@ unset ORCH_NEW_ADMIN_PASSWORD
 | --- | --- | --- | --- | --- |
 | `ORCH_LISTEN` | HTTP(S) listen address. | Опц. | `:9091` | Оставьте default для host-network Compose или задайте `127.0.0.1:9091` за reverse proxy. |
 | `ORCH_STATE_DIR` | Local state directory для bbolt DB, generated keys, APK artifacts и bot/admin secrets. | Опц. | `./orch-state` | В Compose используется `/orch-state`, смонтированный из `./orch-state`. |
-| `ORCH_SIGNER_SOCKET` | Unix socket для config signer sidecar. | Опц. | `./orch-state/signer.sock` | В Compose используется `/run/tw-signer/signer.sock` из `./signer-run`. |
+| `ORCH_SIGNER_SOCKET` | Unix socket для config signer sidecar. | Опц. | `$ORCH_STATE_DIR/signer.sock` | В Compose используется `/run/tw-signer/signer.sock` из `./signer-run`. |
 | `ORCH_SIGNER_KEY_PATH` | Путь к config-signing key для команды `signer`. | Опц. | `$ORCH_STATE_DIR/orch-config.key` | В Compose `/signer-state/orch-config.key` из `./signer-state`; этот каталог монтируется только в signer. |
 | `ORCH_SIGNER_LEGACY_KEY_PATH` | Источник одноразовой миграции: ключ отсюда переносится в `ORCH_SIGNER_KEY_PATH` и удаляется. | Опц. | empty | В Compose `/orch-state/orch-config.key`, чтобы старые установки сохранили закреплённый ключ. |
 | `ORCH_CLIENT_IP_HEADER` | Из какого заголовка proxy брать IP клиента, если peer — loopback: `x-real-ip`, `x-forwarded-for`, `none` или `auto`. | Опц. | `auto` | Укажите заголовок, который перезаписывает ваш reverse proxy; см. Production TLS. |
@@ -196,7 +196,7 @@ unset ORCH_NEW_ADMIN_PASSWORD
 | `ORCH_ADMIN_SESSION_TOKEN` | Optional bearer session token для local CLI admin requests при запущенном сервере. | Опц. | empty | Получите из `/admin/v1/login`; не кладите в shell history или git. |
 | `ORCH_UPDATE_PUBKEY` | Public minisign key для APK update manifests. | Опц. | empty | Для управляемого update-канала задайте свой offline `update.pub` до первого старта. Empty разрешает seed-on-first-run сгенерировать demo key в local state. |
 | `ORCH_DNS_SERVERS` | Optional comma-separated DNS servers, попадают в client configs. | Опц. | empty | Пример: `1.1.1.1,1.0.0.1`. Empty оставляет built-in in-tunnel defaults клиента. |
-| `ORCH_TLS` | Включает built-in self-signed TLS listener, если не `0`. | Опц. | `1` | `0` только для local dev за доверенным транспортом. |
+| `ORCH_TLS` | Включает built-in self-signed TLS listener. Принимает `1/0`, `true/false`, `yes/no`, `on/off`; другие значения — ошибка старта. | Опц. | `1` | `0` только для local dev за доверенным транспортом. |
 | `SEED_APK_PATH` | Путь к APK для seed-on-first-run. | Опц. | `./seed/app.apk` | Compose монтирует `./seed` и ставит `/seed/app.apk`. |
 | `SEED_APK_VERSION_CODE` | Version code в generated seed update manifest. | Опц. | `1` | Должен совпадать с seed APK version code. |
 | `SEED_APK_VERSION_NAME` | Version name в generated seed update manifest. | Опц. | `seed` | Например `0.1.0`. |

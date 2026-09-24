@@ -187,7 +187,7 @@ provided Compose file:
 | --- | --- | --- | --- | --- |
 | `ORCH_LISTEN` | HTTP(S) listen address. | Optional | `:9091` | Keep the default for host-network Compose, or set `127.0.0.1:9091` behind a reverse proxy. |
 | `ORCH_STATE_DIR` | Local state directory for bbolt DB, generated keys, APK artifacts and bot/admin secrets. | Optional | `./orch-state` | Compose uses `/orch-state` mounted from `./orch-state`. |
-| `ORCH_SIGNER_SOCKET` | Unix socket used by the config signer sidecar. | Optional | `./orch-state/signer.sock` | Compose uses `/run/tw-signer/signer.sock` mounted from `./signer-run`. |
+| `ORCH_SIGNER_SOCKET` | Unix socket used by the config signer sidecar. | Optional | `$ORCH_STATE_DIR/signer.sock` | Compose uses `/run/tw-signer/signer.sock` mounted from `./signer-run`. |
 | `ORCH_SIGNER_KEY_PATH` | Config-signing key path read by the `signer` command. | Optional | `$ORCH_STATE_DIR/orch-config.key` | Compose uses `/signer-state/orch-config.key` from `./signer-state`, which only the signer container mounts. |
 | `ORCH_SIGNER_LEGACY_KEY_PATH` | One-time migration source: a key found here is moved to `ORCH_SIGNER_KEY_PATH` and deleted. | Optional | empty | Compose uses `/orch-state/orch-config.key` so older deployments keep their pinned key. |
 | `ORCH_CLIENT_IP_HEADER` | Which proxy header carries the client IP when the peer is loopback: `x-real-ip`, `x-forwarded-for`, `none`, or `auto`. | Optional | `auto` | Set it to the header your reverse proxy overwrites; see Production TLS. |
@@ -198,7 +198,7 @@ provided Compose file:
 | `ORCH_ADMIN_SESSION_TOKEN` | Optional bearer session token used by local CLI admin requests while the server is running. | Optional | empty | Get it from `/admin/v1/login`; do not put it in shell history or git. |
 | `ORCH_UPDATE_PUBKEY` | Update minisign public key for APK update manifests. | Optional | empty | For a managed update channel, set this from your offline `update.pub` before the first start. Leaving it empty lets seed-on-first-run generate a demo key in local state. |
 | `ORCH_DNS_SERVERS` | Optional comma-separated DNS servers embedded into client configs. | Optional | empty | Example: `1.1.1.1,1.0.0.1`. Empty lets clients use their built-in in-tunnel defaults. |
-| `ORCH_TLS` | Enables the built-in self-signed TLS listener unless set to `0`. | Optional | `1` | Use `0` only for local dev behind trusted transport. |
+| `ORCH_TLS` | Enables the built-in self-signed TLS listener. Accepts `1/0`, `true/false`, `yes/no`, `on/off`; anything else fails startup. | Optional | `1` | Use `0` only for local dev behind trusted transport. |
 | `SEED_APK_PATH` | APK path used by seed-on-first-run. | Optional | `./seed/app.apk` | Compose mounts `./seed` and defaults to `/seed/app.apk`. |
 | `SEED_APK_VERSION_CODE` | Version code written into the generated seed update manifest. | Optional | `1` | Match the seed APK version code. |
 | `SEED_APK_VERSION_NAME` | Version name written into the generated seed update manifest. | Optional | `seed` | Example: `0.1.0`. |

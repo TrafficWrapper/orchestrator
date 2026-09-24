@@ -5,7 +5,12 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"net"
+	"net/url"
 	"os"
+	"path/filepath"
+	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -128,7 +133,10 @@ func runMain() error {
 	if len(os.Args) > 1 {
 		cmd = os.Args[1]
 	}
-	cfg := readConfig()
+	cfg, err := readConfig()
+	if err != nil {
+		return fmt.Errorf("invalid configuration: %w", err)
+	}
 	switch cmd {
 	case "serve":
 		return runServe(cfg)
@@ -186,25 +194,90 @@ func runMain() error {
 	}
 }
 
-func readConfig() orchConfig {
-	return orchConfig{
-		StateDir:                getenv("ORCH_STATE_DIR", "./orch-state"),
+// readConfig loads the environment strictly: malformed numbers, booleans or
+// URLs fail startup instead of silently falling back to defaults.
+func readConfig() (orchConfig, error) {
+	env := &envReader{}
+	stateDir := getenv("ORCH_STATE_DIR", "./orch-state")
+	cfg := orchConfig{
+		StateDir:                stateDir,
 		Listen:                  getenv("ORCH_LISTEN", ":9091"),
-		SignerSocket:            getenv("ORCH_SIGNER_SOCKET", "./orch-state/signer.sock"),
+		SignerSocket:            getenv("ORCH_SIGNER_SOCKET", filepath.Join(stateDir, "signer.sock")),
 		SignerKeyPath:           os.Getenv("ORCH_SIGNER_KEY_PATH"),
 		SignerLegacyKeyPath:     os.Getenv("ORCH_SIGNER_LEGACY_KEY_PATH"),
 		ClientIPHeader:          os.Getenv("ORCH_CLIENT_IP_HEADER"),
-		PublicURL:               getenv("ORCH_PUBLIC_URL", "https://127.0.0.1:9091"),
-		EgressProbeURL:          os.Getenv("ORCH_EGRESS_PROBE_URL"),
+		PublicURL:               env.url("ORCH_PUBLIC_URL", "https://127.0.0.1:9091", true),
+		EgressProbeURL:          env.url("ORCH_EGRESS_PROBE_URL", "", false),
 		AdminSecret:             os.Getenv("ORCH_ADMIN_SECRET"),
 		UpdatePublicKey:         os.Getenv("ORCH_UPDATE_PUBKEY"),
 		DNSServers:              splitCSV(os.Getenv("ORCH_DNS_SERVERS")),
 		DiscoveryNextSinks:      splitCSV(os.Getenv("ORCH_DISCOVERY_NEXT_SINKS")),
 		DiscoveryRescuePointers: splitCSV(os.Getenv("ORCH_DISCOVERY_RESCUE_POINTERS")),
 		SeedAPKPath:             getenv("SEED_APK_PATH", "./seed/app.apk"),
-		SeedVersionCode:         getenvInt64("SEED_APK_VERSION_CODE", 1),
+		SeedVersionCode:         env.int64("SEED_APK_VERSION_CODE", 1, 1),
 		SeedVersionName:         getenv("SEED_APK_VERSION_NAME", "seed"),
-		APKKeepReleases:         getenvInt("ORCH_APK_KEEP_RELEASES", 5),
-		TLS:                     getenv("ORCH_TLS", "1") != "0",
+		APKKeepReleases:         int(env.int64("ORCH_APK_KEEP_RELEASES", 5, 1)),
+		TLS:                     env.bool("ORCH_TLS", true),
 	}
+	return cfg, errors.Join(env.errs...)
+}
+
+// envReader parses typed environment values and collects every error so a
+// misconfiguration is reported in full at startup.
+type envReader struct {
+	errs []error
+}
+
+func (e *envReader) bool(key string, fallback bool) bool {
+	value := strings.ToLower(strings.TrimSpace(os.Getenv(key)))
+	switch value {
+	case "":
+		return fallback
+	case "1", "true", "yes", "on":
+		return true
+	case "0", "false", "no", "off":
+		return false
+	}
+	e.errs = append(e.errs, fmt.Errorf("%s=%q: want a boolean (1/0, true/false, yes/no, on/off)", key, value))
+	return fallback
+}
+
+func (e *envReader) int64(key string, fallback, min int64) int64 {
+	value := strings.TrimSpace(os.Getenv(key))
+	if value == "" {
+		return fallback
+	}
+	parsed, err := strconv.ParseInt(value, 10, 64)
+	if err != nil || parsed < min {
+		e.errs = append(e.errs, fmt.Errorf("%s=%q: want an integer >= %d", key, value, min))
+		return fallback
+	}
+	return parsed
+}
+
+func (e *envReader) url(key, fallback string, required bool) string {
+	value := getenv(key, fallback)
+	if value == "" && !required {
+		return ""
+	}
+	u, err := url.Parse(value)
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+		e.errs = append(e.errs, fmt.Errorf("%s=%q: want an absolute http(s) URL", key, value))
+	}
+	return value
+}
+
+// publicURLIsLoopback reports whether devices would be handed a bootstrap
+// URL they cannot reach (the default ORCH_PUBLIC_URL).
+func publicURLIsLoopback(raw string) bool {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return false
+	}
+	host := u.Hostname()
+	if host == "localhost" {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }
