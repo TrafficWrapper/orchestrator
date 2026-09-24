@@ -588,6 +588,9 @@ func discoveryHash(value string) string {
 }
 
 func discoveryAWGEndpoint(rec workerRecord) (map[string]any, bool) {
+	if !workerProtocolEnabled(rec, "awg") {
+		return nil, false
+	}
 	params, ok := rec.SelfDescribe["awg"].(map[string]any)
 	if !ok {
 		return nil, false
@@ -611,6 +614,9 @@ func discoveryAWGEndpoint(rec workerRecord) (map[string]any, bool) {
 }
 
 func discoveryRealityEndpoint(rec workerRecord) (map[string]any, bool) {
+	if !workerProtocolEnabled(rec, "reality") {
+		return nil, false
+	}
 	params, ok := rec.SelfDescribe["reality"].(map[string]any)
 	if !ok || len(params) == 0 {
 		return nil, false

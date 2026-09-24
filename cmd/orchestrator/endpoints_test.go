@@ -688,3 +688,30 @@ func discoverySeqFromText(t *testing.T, jsonText string) int64 {
 	}
 	return root.Seq
 }
+
+func TestDiscoveryEndpointsSkipDisabledProtocols(t *testing.T) {
+	rec := workerRecord{
+		SelfDescribe: map[string]any{
+			"awg": map[string]any{
+				"endpoint":   "worker.example:51821",
+				"public_key": "awg-server-pub",
+				"awg_preset": map[string]any{"jc": 4},
+			},
+			"reality": map[string]any{"address": "worker.example", "port": 443},
+		},
+		ProtocolEnabled: map[string]bool{"awg": false},
+	}
+	if _, ok := discoveryAWGEndpoint(rec); ok {
+		t.Fatal("disabled awg must not be published in discovery")
+	}
+	if _, ok := discoveryRealityEndpoint(rec); !ok {
+		t.Fatal("enabled reality must stay in discovery")
+	}
+	rec.ProtocolEnabled = map[string]bool{"reality": false}
+	if _, ok := discoveryRealityEndpoint(rec); ok {
+		t.Fatal("disabled reality must not be published in discovery")
+	}
+	if _, ok := discoveryAWGEndpoint(rec); !ok {
+		t.Fatal("enabled awg must stay in discovery")
+	}
+}
