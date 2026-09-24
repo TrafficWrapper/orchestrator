@@ -736,6 +736,7 @@ func (s *orchStore) consumeBootstrapToken(secret string, device deviceRecord, pr
 	err = s.db.Update(func(tx *bolt.Tx) error {
 		tb := tx.Bucket(bucketTokens)
 		db := tx.Bucket(bucketDevices)
+		ipIndex := s.newDeviceIPIndex(tx)
 		// Re-check inside the write tx: a concurrent enroll of the same
 		// identity would otherwise overwrite the first device record (new
 		// PSK/IP) and burn both tokens. Aborting here keeps this token.
@@ -770,7 +771,7 @@ func (s *orchStore) consumeBootstrapToken(secret string, device deviceRecord, pr
 			device.RealityUUID = uuidV4()
 		}
 		if device.InternalIP == "" {
-			ip, err := s.allocateDeviceIP(tx, baseAWGSubnet(profiles))
+			ip, err := ipIndex.allocate("awg", baseAWGSubnet(profiles))
 			if err != nil {
 				return err
 			}
@@ -786,7 +787,7 @@ func (s *orchStore) consumeBootstrapToken(secret string, device deviceRecord, pr
 		if device.ConfigSeq < 1 {
 			device.ConfigSeq = 1
 		}
-		if err := s.ensureDeviceAWGProfilesTx(tx, &device, profiles, device.AWGPublicKey); err != nil {
+		if err := s.ensureDeviceAWGProfilesTx(tx, ipIndex, &device, profiles, device.AWGPublicKey); err != nil {
 			return err
 		}
 		sealed, err := s.sealJSON(bucketDevices, []byte(device.ID), device)
@@ -933,6 +934,39 @@ func tokenRecordConsumable(rec tokenRecord, now time.Time, workerStaticPub strin
 
 func (s *orchStore) ensureDeviceAWGProfiles(id string, profiles []awgProfile, awgPublic string) (deviceRecord, error) {
 	var out deviceRecord
+	// Re-enrollments usually find every profile provisioned already; check
+	// read-only first so they do not cost a write transaction (fsync).
+	unchanged := false
+	if err := s.db.View(func(tx *bolt.Tx) error {
+		raw := tx.Bucket(bucketDevices).Get([]byte(id))
+		if raw == nil {
+			return errors.New("device not found")
+		}
+		var rec deviceRecord
+		if err := s.openJSON(bucketDevices, []byte(id), raw, &rec); err != nil {
+			return err
+		}
+		before, _ := json.Marshal(rec)
+		probe := rec
+		probe.AWGProfiles = make(map[string]deviceAWGProfile, len(rec.AWGProfiles))
+		for k, v := range rec.AWGProfiles {
+			probe.AWGProfiles[k] = v
+		}
+		if err := s.ensureDeviceAWGProfilesTx(tx, s.newDeviceIPIndex(tx), &probe, profiles, awgPublic); err != nil {
+			return err
+		}
+		after, _ := json.Marshal(probe)
+		if string(before) == string(after) {
+			unchanged = true
+			out = rec
+		}
+		return nil
+	}); err != nil {
+		return deviceRecord{}, err
+	}
+	if unchanged {
+		return out, nil
+	}
 	err := s.db.Update(func(tx *bolt.Tx) error {
 		b := tx.Bucket(bucketDevices)
 		raw := b.Get([]byte(id))
@@ -944,7 +978,7 @@ func (s *orchStore) ensureDeviceAWGProfiles(id string, profiles []awgProfile, aw
 			return err
 		}
 		before, _ := json.Marshal(rec.AWGProfiles)
-		if err := s.ensureDeviceAWGProfilesTx(tx, &rec, profiles, awgPublic); err != nil {
+		if err := s.ensureDeviceAWGProfilesTx(tx, s.newDeviceIPIndex(tx), &rec, profiles, awgPublic); err != nil {
 			return err
 		}
 		after, _ := json.Marshal(rec.AWGProfiles)
@@ -968,7 +1002,7 @@ func (s *orchStore) ensureDeviceAWGProfiles(id string, profiles []awgProfile, aw
 	return out, err
 }
 
-func (s *orchStore) ensureDeviceAWGProfilesTx(tx *bolt.Tx, device *deviceRecord, profiles []awgProfile, awgPublic string) error {
+func (s *orchStore) ensureDeviceAWGProfilesTx(tx *bolt.Tx, ipIndex *deviceIPIndex, device *deviceRecord, profiles []awgProfile, awgPublic string) error {
 	awgPublic = strings.TrimSpace(awgPublic)
 	if awgPublic == "" {
 		awgPublic = strings.TrimSpace(device.AWGPublicKey)
@@ -1009,7 +1043,7 @@ func (s *orchStore) ensureDeviceAWGProfilesTx(tx *bolt.Tx, device *deviceRecord,
 			return fmt.Errorf("device awg public key mismatch for profile %s", name)
 		}
 		if strings.TrimSpace(creds.InternalIP) == "" {
-			ip, err := s.allocateDeviceIPForProfile(tx, name, profile.Subnet)
+			ip, err := ipIndex.allocate(name, profile.Subnet)
 			if err != nil {
 				return err
 			}
@@ -2355,41 +2389,84 @@ func (s *orchStore) bumpWorkerSeqsTx(tx *bolt.Tx) error {
 }
 
 func (s *orchStore) allocateDeviceIP(tx *bolt.Tx, cidr string) (string, error) {
-	return s.allocateDeviceIPFrom(tx, cidr, func(rec deviceRecord) string { return rec.InternalIP })
+	return s.newDeviceIPIndex(tx).allocate("awg", cidr)
 }
 
 // deviceIPPoolReserved is the number of low host addresses kept for the
 // worker gateway and infrastructure.
 const deviceIPPoolReserved = 10
 
-// allocateDeviceIPFrom returns the first free /32 in cidr (IPv4), skipping the
-// reserved low addresses and the broadcast address. usedIP extracts the
-// address a device already holds in this pool.
-func (s *orchStore) allocateDeviceIPFrom(tx *bolt.Tx, cidr string, usedIP func(deviceRecord) string) (string, error) {
+// deviceIPIndex holds the addresses devices already use per AWG profile pool
+// ("awg" is the base pool), built with one pass over the devices bucket on
+// first use and updated by each allocation, so an enrollment that fills
+// several profile pools decrypts every device once instead of once per pool.
+type deviceIPIndex struct {
+	store *orchStore
+	tx    *bolt.Tx
+	used  map[string]map[netip.Addr]struct{}
+}
+
+func (s *orchStore) newDeviceIPIndex(tx *bolt.Tx) *deviceIPIndex {
+	return &deviceIPIndex{store: s, tx: tx}
+}
+
+func (x *deviceIPIndex) load() error {
+	if x.used != nil {
+		return nil
+	}
+	used := map[string]map[netip.Addr]struct{}{}
+	add := func(pool, value string) {
+		addr, err := netip.ParseAddr(strings.TrimSuffix(strings.TrimSpace(value), "/32"))
+		if err != nil {
+			return
+		}
+		if used[pool] == nil {
+			used[pool] = map[netip.Addr]struct{}{}
+		}
+		used[pool][addr] = struct{}{}
+	}
+	if err := x.tx.Bucket(bucketDevices).ForEach(func(k, raw []byte) error {
+		var rec deviceRecord
+		if err := x.store.openJSON(bucketDevices, k, raw, &rec); err != nil {
+			return err
+		}
+		add("awg", rec.InternalIP)
+		for name, creds := range rec.AWGProfiles {
+			if pool := normalizeAWGProfileName(name); pool != "" && pool != "awg" {
+				add(pool, creds.InternalIP)
+			}
+		}
+		return nil
+	}); err != nil {
+		return err
+	}
+	x.used = used
+	return nil
+}
+
+// allocate returns the first free /32 in cidr (IPv4) for the profile pool,
+// skipping the reserved low addresses, the broadcast address and the
+// worker's gateway/smoke addresses, and records it as used.
+func (x *deviceIPIndex) allocate(profileName, cidr string) (string, error) {
+	pool := normalizeAWGProfileName(profileName)
+	if pool == "" {
+		pool = "awg"
+	}
+	if err := x.load(); err != nil {
+		return "", err
+	}
 	prefix, err := netip.ParsePrefix(strings.TrimSpace(cidr))
 	if err != nil || !prefix.Addr().Is4() {
 		prefix = netip.MustParsePrefix("10.13.13.0/24")
 	}
-	used := map[netip.Addr]struct{}{}
 	// Workers derive the gateway and smoke-test peer as the configured
 	// (unmasked) address +1 and +2; never hand those out to devices.
+	reserved := map[netip.Addr]struct{}{}
 	for a, i := prefix.Addr(), 0; i < 3 && a.IsValid(); a, i = a.Next(), i+1 {
-		used[a] = struct{}{}
+		reserved[a] = struct{}{}
 	}
 	prefix = prefix.Masked()
-	if err := tx.Bucket(bucketDevices).ForEach(func(k, raw []byte) error {
-		var rec deviceRecord
-		if err := s.openJSON(bucketDevices, k, raw, &rec); err != nil {
-			return err
-		}
-		addrText := strings.TrimSuffix(strings.TrimSpace(usedIP(rec)), "/32")
-		if addr, err := netip.ParseAddr(addrText); err == nil {
-			used[addr] = struct{}{}
-		}
-		return nil
-	}); err != nil {
-		return "", err
-	}
+	used := x.used[pool]
 	next := prefix.Addr()
 	for i := 0; i < deviceIPPoolReserved; i++ {
 		next = next.Next()
@@ -2398,22 +2475,23 @@ func (s *orchStore) allocateDeviceIPFrom(tx *bolt.Tx, cidr string, usedIP func(d
 		if after := next.Next(); !after.IsValid() || !prefix.Contains(after) {
 			break // broadcast address
 		}
+		if _, ok := reserved[next]; ok {
+			continue
+		}
 		if _, ok := used[next]; ok {
 			continue
 		}
+		if x.used[pool] == nil {
+			x.used[pool] = map[netip.Addr]struct{}{}
+		}
+		x.used[pool][next] = struct{}{}
 		return next.String() + "/32", nil
 	}
 	return "", errors.New("device IP pool exhausted")
 }
 
 func (s *orchStore) allocateDeviceIPForProfile(tx *bolt.Tx, profileName, cidr string) (string, error) {
-	profileName = normalizeAWGProfileName(profileName)
-	if profileName == "" || profileName == "awg" {
-		return s.allocateDeviceIP(tx, cidr)
-	}
-	return s.allocateDeviceIPFrom(tx, cidr, func(rec deviceRecord) string {
-		return rec.AWGProfiles[profileName].InternalIP
-	})
+	return s.newDeviceIPIndex(tx).allocate(profileName, cidr)
 }
 
 func randomBase64Key() (string, error) {
