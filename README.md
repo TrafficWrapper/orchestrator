@@ -101,7 +101,7 @@ section explain each step and production differences.
 
 - Linux host with Docker and Docker Compose.
 - A reachable HTTPS URL for devices and workers.
-- Go 1.23+ only if you build locally outside Docker.
+- Go 1.26+ only if you build locally outside Docker.
 - Minimum for running: 1 CPU and 1 GB RAM. Add swap on 1 GB servers; builds and
   image pulls are more reliable with 2 GB+ RAM.
 

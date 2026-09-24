@@ -101,7 +101,7 @@ TrafficWrapper разделён на три репозитория:
 
 - Linux host с Docker и Docker Compose.
 - HTTPS URL, доступный устройствам и workers.
-- Go 1.23+ только для локальной сборки вне Docker.
+- Go 1.26+ только для локальной сборки вне Docker.
 - Минимум для запуска: 1 CPU и 1 GB RAM. На серверах с 1 GB добавьте swap;
   сборки и pull Docker images стабильнее с 2 GB+ RAM.
 
