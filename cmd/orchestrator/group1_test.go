@@ -6,6 +6,8 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -37,5 +39,44 @@ func TestDeniedApprovalKeepsOldPasswordAndSessions(t *testing.T) {
 	}
 	if _, ok := s.adminSessions.Load("tok"); !ok {
 		t.Fatal("denied approval must not end existing sessions")
+	}
+}
+
+type blockingTelegramAPI struct {
+	mockTelegramAPI
+	active *atomic.Int32
+}
+
+func (b *blockingTelegramAPI) getUpdates(ctx context.Context, _ int64, _ int) ([]telegramUpdate, error) {
+	b.active.Add(1)
+	defer b.active.Add(-1)
+	<-ctx.Done()
+	return nil, ctx.Err()
+}
+
+func TestConcurrentBotRestartsLeaveOnePoller(t *testing.T) {
+	s := newTestServer(t)
+	if err := s.store.setBotSettings("123:token", 42); err != nil {
+		t.Fatal(err)
+	}
+	var active atomic.Int32
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	s.rootCtx = ctx
+	if err := s.startOptionalBot(ctx, func(string) telegramAPI { return &blockingTelegramAPI{active: &active} }); err != nil {
+		t.Fatal(err)
+	}
+	var wg sync.WaitGroup
+	for i := 0; i < 16; i++ {
+		wg.Add(1)
+		go func() { defer wg.Done(); _ = s.restartOptionalBot(s.baseContext()) }()
+	}
+	wg.Wait()
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) && active.Load() != 1 {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if got := active.Load(); got != 1 {
+		t.Fatalf("pollers=%d after concurrent restarts, want 1", got)
 	}
 }

@@ -75,6 +75,11 @@ type server struct {
 	bot                 *telegramBot
 	botCancel           context.CancelFunc
 	botFactory          telegramClientFactory
+	// botRestartMu serializes whole bot restarts so two concurrent restarts
+	// cannot both start a poller (Telegram answers the second with 409).
+	botRestartMu sync.Mutex
+	// rootCtx is cancelled on shutdown; long-lived goroutines derive from it.
+	rootCtx context.Context
 }
 
 const (

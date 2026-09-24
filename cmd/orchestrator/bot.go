@@ -199,6 +199,8 @@ func (s *server) startOptionalBot(ctx context.Context, factory telegramClientFac
 }
 
 func (s *server) restartOptionalBot(ctx context.Context) error {
+	s.botRestartMu.Lock()
+	defer s.botRestartMu.Unlock()
 	s.botMu.Lock()
 	if s.botCancel != nil {
 		s.botCancel()
@@ -228,6 +230,14 @@ func (s *server) restartOptionalBot(ctx context.Context) error {
 	go bot.run(botCtx)
 	log.Printf("telegram bot enabled owner_id=%d", settings.OwnerID)
 	return nil
+}
+
+// baseContext is the server's lifetime context (Background in tests).
+func (s *server) baseContext() context.Context {
+	if s.rootCtx != nil {
+		return s.rootCtx
+	}
+	return context.Background()
 }
 
 func (s *server) currentAuthApprover() authApprover {

@@ -14,9 +14,13 @@ import (
 	"fmt"
 	"log"
 	"math/big"
+	"net"
 	"net/http"
 	"os"
+	"os/signal"
 	"path/filepath"
+	"sync"
+	"syscall"
 	"time"
 
 	"github.com/flynn/noise"
@@ -25,6 +29,8 @@ import (
 )
 
 func runServe(cfg orchConfig) error {
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
 	if err := setClientIPHeaderMode(cfg.ClientIPHeader); err != nil {
 		return err
 	}
@@ -53,18 +59,22 @@ func runServe(cfg orchConfig) error {
 		return err
 	}
 	defer audit.Close()
-	s := &server{cfg: cfg, store: st, signer: signerClient{socket: cfg.SignerSocket}, static: static, loginLimiter: newLoginLimiter(), audit: audit}
+	s := &server{cfg: cfg, store: st, signer: signerClient{socket: cfg.SignerSocket}, static: static, loginLimiter: newLoginLimiter(), audit: audit, rootCtx: ctx}
 	if _, err := s.signer.publicKey(); err != nil {
 		return fmt.Errorf("signer unavailable: %w", err)
 	}
 	if err := s.seedUpdateAPKIfPresent(updatePrivate); err != nil {
 		return err
 	}
-	if err := s.startOptionalBot(context.Background(), newTelegramHTTPClient); err != nil {
+	if err := s.startOptionalBot(ctx, newTelegramHTTPClient); err != nil {
 		return err
 	}
-	go s.runNoiseSessionJanitor(context.Background())
-	go s.runWorkerJanitor(context.Background())
+	var background sync.WaitGroup
+	background.Add(2)
+	go func() { defer background.Done(); s.runNoiseSessionJanitor(ctx) }()
+	go func() { defer background.Done(); s.runWorkerJanitor(ctx) }()
+	// Deferred in reverse: wait for janitors before audit/store close.
+	defer background.Wait()
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write([]byte("ok\n")) })
 	mux.HandleFunc("/discovery/endpoints.json", s.handleDiscoveryEndpointsJSON)
@@ -110,15 +120,38 @@ func runServe(cfg orchConfig) error {
 	addr := cfg.Listen
 	log.Printf("orchestrator serve listen=%s tls=%t public_key=%s", addr, cfg.TLS, protocol.KeyToBase64(static.Public))
 	httpServer := newOrchestratorHTTPServer(addr, mux)
-	if cfg.TLS {
-		cert, key, err := loadOrCreateTLS(cfg)
-		if err != nil {
-			return err
+	// Handlers (notably the nudge long-poll) see the shutdown via r.Context().
+	httpServer.BaseContext = func(net.Listener) context.Context { return ctx }
+	serveErr := make(chan error, 1)
+	go func() {
+		if cfg.TLS {
+			cert, key, err := loadOrCreateTLS(cfg)
+			if err != nil {
+				serveErr <- err
+				return
+			}
+			serveErr <- httpServer.ListenAndServeTLS(cert, key)
+			return
 		}
-		return httpServer.ListenAndServeTLS(cert, key)
+		serveErr <- httpServer.ListenAndServe()
+	}()
+	select {
+	case err := <-serveErr:
+		stop()
+		return err
+	case <-ctx.Done():
 	}
-	return httpServer.ListenAndServe()
+	log.Printf("orchestrator shutting down")
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
+	defer cancel()
+	if err := httpServer.Shutdown(shutdownCtx); err != nil {
+		log.Printf("http shutdown: %v", err)
+	}
+	return nil
 }
+
+// shutdownTimeout bounds how long in-flight requests may finish on SIGTERM.
+const shutdownTimeout = 20 * time.Second
 
 func newOrchestratorHTTPServer(addr string, handler http.Handler) *http.Server {
 	return &http.Server{

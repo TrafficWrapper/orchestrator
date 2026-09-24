@@ -1,7 +1,6 @@
 package main
 
 import (
-	"context"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -61,7 +60,7 @@ func (s *server) handleAdminBotSetToken(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	if s.hasBotFactory() {
-		if err := s.restartOptionalBot(context.Background()); err != nil {
+		if err := s.restartOptionalBot(s.baseContext()); err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
