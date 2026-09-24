@@ -16,6 +16,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -43,6 +44,12 @@ type orchStore struct {
 	aead                    cipher.AEAD
 	tokenLookupKey          []byte
 	discoveryWorkerRevision atomic.Uint64
+
+	// approvedCache holds decrypted approved devices for the committed DB
+	// state identified by approvedCacheTx (see approvedDevices).
+	approvedCacheMu sync.Mutex
+	approvedCacheTx int
+	approvedCache   []deviceRecord
 }
 
 type tokenRecord struct {
@@ -1503,21 +1510,49 @@ func (s *orchStore) telemetrySnapshots() (map[string]telemetrySnapshotRecord, er
 	return out, err
 }
 
+// approvedDevices returns approved, fully provisioned devices. Every worker
+// pull needs this list, and after a seq bump all workers pull at once, so the
+// decrypted result is cached per committed DB state: a read transaction's ID
+// is the ID of the last committed write, and the list is built inside that
+// same transaction, so a cache hit can never return data older than the DB.
+// Callers must treat the returned records as read-only.
 func (s *orchStore) approvedDevices() ([]deviceRecord, error) {
-	devices, err := s.devices()
-	if err != nil {
-		return nil, err
-	}
-	out := make([]deviceRecord, 0, len(devices))
-	for _, device := range devices {
-		if device.Status == "approved" &&
-			strings.TrimSpace(device.RealityUUID) != "" &&
-			strings.TrimSpace(device.AWGPublicKey) != "" &&
-			strings.TrimSpace(device.InternalIP) != "" {
-			out = append(out, device)
+	var out []deviceRecord
+	err := s.db.View(func(tx *bolt.Tx) error {
+		rev := tx.ID()
+		s.approvedCacheMu.Lock()
+		if s.approvedCache != nil && s.approvedCacheTx == rev {
+			out = append([]deviceRecord(nil), s.approvedCache...)
+			s.approvedCacheMu.Unlock()
+			return nil
 		}
-	}
-	return out, nil
+		s.approvedCacheMu.Unlock()
+		fresh := []deviceRecord{}
+		if err := tx.Bucket(bucketDevices).ForEach(func(k, raw []byte) error {
+			var device deviceRecord
+			if err := s.openJSON(bucketDevices, k, raw, &device); err != nil {
+				return err
+			}
+			if device.Status == "approved" &&
+				strings.TrimSpace(device.RealityUUID) != "" &&
+				strings.TrimSpace(device.AWGPublicKey) != "" &&
+				strings.TrimSpace(device.InternalIP) != "" {
+				fresh = append(fresh, device)
+			}
+			return nil
+		}); err != nil {
+			return err
+		}
+		s.approvedCacheMu.Lock()
+		if rev >= s.approvedCacheTx {
+			s.approvedCacheTx = rev
+			s.approvedCache = fresh
+		}
+		s.approvedCacheMu.Unlock()
+		out = append([]deviceRecord(nil), fresh...)
+		return nil
+	})
+	return out, err
 }
 
 func (s *orchStore) revokeDevice(id string) error {
