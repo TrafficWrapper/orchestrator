@@ -193,21 +193,14 @@ func (s *server) handleAck(peer []byte, raw []byte) (any, error) {
 	if probe == "" {
 		log.Printf("worker %s egress probe unavailable; observed=%q", rec.ID, req.EgressIPObserved)
 	}
-	if err := s.store.updateAckWithProbe(rec.ID, req.AppliedVersion, req.EgressIPObserved, req.SelfDescribe, &probe); err != nil {
-		return nil, err
-	}
-	quotaBlocks, err := s.store.applyReportedDeviceUsage(rec.ID, req.Usage, time.Now().UTC())
+	desiredSeq, quotaBlocks, err := s.store.recordAck(rec.ID, req.AppliedVersion, req.EgressIPObserved, req.SelfDescribe, &probe, req.Usage, time.Now().UTC())
 	if err != nil {
 		return nil, err
 	}
 	if quotaBlocks > 0 {
 		log.Printf("quota enforcement blocked devices count=%d worker=%s", quotaBlocks, rec.ID)
 	}
-	updated, err := s.store.worker(rec.ID)
-	if err != nil {
-		return nil, err
-	}
-	return ackResponse{OK: true, DesiredSeq: updated.DesiredSeq, AppliedSeq: req.AppliedVersion, EgressIPProbe: probe, EgressMatch: egressMatch, QuotaBlocks: quotaBlocks}, nil
+	return ackResponse{OK: true, DesiredSeq: desiredSeq, AppliedSeq: req.AppliedVersion, EgressIPProbe: probe, EgressMatch: egressMatch, QuotaBlocks: quotaBlocks}, nil
 }
 
 const egressProbeCacheTTL = time.Minute
@@ -219,14 +212,24 @@ func (s *server) probeEgressIP(rec workerRecord) string {
 	// ORCH_EGRESS_PROBE_URL is one URL for the whole orchestrator (meant for a
 	// co-located worker), so the answer is the same for every ack: cache it
 	// instead of blocking each ack on a synchronous HTTP call.
+	// One refresh at a time and never under the lock: concurrent acks get the
+	// previous value instead of queueing behind a slow HTTP call.
 	s.egressProbeMu.Lock()
-	defer s.egressProbeMu.Unlock()
-	if !s.egressProbeAt.IsZero() && time.Since(s.egressProbeAt) < egressProbeCacheTTL {
-		return s.egressProbeValue
+	value := s.egressProbeValue
+	fresh := !s.egressProbeAt.IsZero() && time.Since(s.egressProbeAt) < egressProbeCacheTTL
+	if fresh || s.egressProbeFetching {
+		s.egressProbeMu.Unlock()
+		return value
 	}
-	s.egressProbeValue = s.fetchEgressProbe()
+	s.egressProbeFetching = true
+	s.egressProbeMu.Unlock()
+	value = s.fetchEgressProbe()
+	s.egressProbeMu.Lock()
+	s.egressProbeValue = value
 	s.egressProbeAt = time.Now()
-	return s.egressProbeValue
+	s.egressProbeFetching = false
+	s.egressProbeMu.Unlock()
+	return value
 }
 
 func (s *server) fetchEgressProbe() string {

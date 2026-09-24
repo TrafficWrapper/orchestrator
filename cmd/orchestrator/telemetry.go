@@ -66,10 +66,7 @@ func (s *server) handleWorkerTelemetry(peer []byte, raw []byte) (any, error) {
 	if err != nil {
 		return map[string]any{"ok": false, "error": err.Error()}, nil
 	}
-	if err := s.store.setTelemetrySnapshot(snapshot); err != nil {
-		return nil, err
-	}
-	if _, err := s.store.updateDeviceClientVersionFromTelemetry(device.ID, snapshot.ClientVersion); err != nil {
+	if err := s.store.recordTelemetry(snapshot); err != nil {
 		return nil, err
 	}
 	return map[string]any{"ok": true}, nil

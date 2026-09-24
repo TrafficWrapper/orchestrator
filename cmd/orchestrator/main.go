@@ -71,6 +71,7 @@ type server struct {
 	egressProbeMu       sync.Mutex
 	egressProbeValue    string
 	egressProbeAt       time.Time
+	egressProbeFetching bool
 	authApprover        authApprover
 	bot                 *telegramBot
 	botCancel           context.CancelFunc
