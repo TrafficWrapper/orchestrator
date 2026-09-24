@@ -544,7 +544,10 @@ func (s *server) reserveHandshakeStart(r *http.Request) (bool, string) {
 }
 
 func (s *server) pruneHandshakeRatesLocked(now time.Time) {
-	if !s.handshakePrune.IsZero() && now.After(s.handshakePrune) && now.Sub(s.handshakePrune) < handshakeRatePruneEvery {
+	if !s.handshakePrune.IsZero() && now.Before(s.handshakePrune.Add(handshakeRatePruneEvery)) {
+		if now.Before(s.handshakePrune) {
+			s.handshakePrune = now
+		}
 		return
 	}
 	s.handshakePrune = now

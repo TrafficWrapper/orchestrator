@@ -119,7 +119,11 @@ func (l *loginLimiter) clock() time.Time {
 }
 
 func (l *loginLimiter) pruneLocked(now time.Time) {
-	if !l.lastPrune.IsZero() && now.After(l.lastPrune) && now.Sub(l.lastPrune) < adminLoginPruneEvery {
+	if !l.lastPrune.IsZero() && now.Before(l.lastPrune.Add(adminLoginPruneEvery)) {
+		if now.Before(l.lastPrune) {
+			// Clock stepped backwards: rebase instead of pruning on every call.
+			l.lastPrune = now
+		}
 		return
 	}
 	l.lastPrune = now
