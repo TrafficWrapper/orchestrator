@@ -551,7 +551,7 @@
   {{range .Workers}}
     <tr>
       <td><code>{{short .ID 12}}</code><br><span class="muted">{{dash .LastSeen}}</span></td>
-      <td>{{if .Enabled}}<span class="ok">enabled</span>{{else}}<span class="bad">disabled</span>{{end}}<br><span class="muted">{{.Status}}</span></td>
+      <td>{{if .Enabled}}<span class="ok">enabled</span>{{else}}<span class="bad">disabled</span>{{end}}<br><span class="muted">{{.Status}}</span>{{if .SelfCheck}}<br>{{if .Degraded}}<span class="bad">{{.SelfCheck}}</span>{{else}}<span class="ok">self-check {{.SelfCheck}}</span>{{end}}{{end}}</td>
       <td>
         {{if .ConfigSyncOK}}<span class="ok">{{.ConfigSyncText}}</span>{{else}}<span class="bad">{{.ConfigSyncText}}</span>{{end}}<br>
         <span class="muted">last ack: {{dash .LastSeen}}</span>

@@ -51,10 +51,10 @@ func TestRecordAckReturnsSeqAfterQuotaBump(t *testing.T) {
 	putQuotaDevice(t, s, deviceRecord{ID: "q-dev", Status: "approved", AWGPublicKey: "k", RealityUUID: "u", InternalIP: "10.13.13.10/32", Limits: deviceLimits{TrafficQuotaBytes: 10}, CreatedAt: time.Now().UTC(), ConfigSeq: 1})
 	rec, _ := s.store.worker(w.ID)
 	now := time.Now().UTC()
-	if _, _, err := s.store.recordAck(w.ID, rec.DesiredSeq, "", nil, nil, []deviceUsage{{DeviceID: "q-dev"}}, now); err != nil {
+	if _, _, err := s.store.recordAck(w.ID, rec.DesiredSeq, "ok", "", nil, nil, []deviceUsage{{DeviceID: "q-dev"}}, now); err != nil {
 		t.Fatal(err)
 	}
-	desired, blocked, err := s.store.recordAck(w.ID, rec.DesiredSeq, "", nil, nil, []deviceUsage{{DeviceID: "q-dev", RxBytes: 20}}, now)
+	desired, blocked, err := s.store.recordAck(w.ID, rec.DesiredSeq, "ok", "", nil, nil, []deviceUsage{{DeviceID: "q-dev", RxBytes: 20}}, now)
 	if err != nil || blocked != 1 {
 		t.Fatalf("blocked=%d err=%v", blocked, err)
 	}

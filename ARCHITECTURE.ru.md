@@ -100,6 +100,35 @@ REALITY/AWG credentials, запускает local SOCKS front-end и автом�
 worker x route candidates. Active route выбирается по observed health и policy;
 AWG остаётся fallback path, когда REALITY unhealthy.
 
+## REALITY Vision, когорты short ID и ротация AWG
+
+- **Vision (на устройство).** Приложение передаёт в `/d/v1/enroll`
+  `capabilities: ["reality_vision"]`; оркестратор сохраняет для устройства
+  `reality_flow = "xtls-rprx-vision"`, возвращает его в ответе enroll и
+  отправляет воркерам в `desired_state.approved_devices[].reality_flow`.
+  Повторный enroll без capability его снимает. Общий клиентский бандл flow не
+  содержит: приложение должно применять `reality_flow` из ответа enroll к TCP
+  REALITY маршрутам (XHTTP flow не использует), иначе Xray отвергнет клиента.
+- **Когорты short ID.** Воркеры публикуют `reality.cohort_short_ids`; REALITY
+  маршруты бандла несут этот список (и в `params`), отозванные слоты заменены на
+  `""`, позиции не сдвигаются. Приложение берёт слот
+  `uint32be(sha256(device_id)[0:4]) % len(list)`, а при пустом слоте —
+  `short_id`. `POST /admin/v1/workers/short-id {id, short_id, revoked}`
+  заполняет `desired_state.revoked_short_ids`. В списке устройств админки виден
+  слот `reality_cohort`.
+- **Fallback-профили.** При `ORCH_REALITY_FALLBACK_PROFILES=1` XHTTP-профили из
+  `reality_profiles` добавляются доп. REALITY маршрутами сразу после основного
+  маршрута воркера (без flow). По умолчанию выключено: приложение заполняет
+  только два REALITY слота, и fallback вытесняет REALITY второго воркера.
+- **Ротация диалекта AWG.** `POST /admin/v1/workers/awg-drain {id, profile,
+  draining}` перестаёт отдавать клиентам AWG-профиль (учётные данные для всех
+  профилей у устройств остаются), клиенты переходят на другой профиль воркера,
+  после чего старый можно удалить.
+- **Здоровье и лимиты.** `self_check` из ack (`ok` / `degraded: ...`) и
+  `health` из self-describe видны в админке/API; бот присылает алерт о
+  degraded-воркере. Лимиты устройства для воркера содержат `rate_mbps
+  {upload, download}`, вычисленный из текстового лимита (`20mbit`, `1gbit`).
+
 ## Distributor and Updates
 
 Workers открывают nginx distributor только внутри tunnel по `/tw/`. Он отдаёт

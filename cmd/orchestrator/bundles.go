@@ -34,7 +34,9 @@ func (s *server) buildBundles(rec workerRecord) (signedConfig, signedConfig, err
 			"awg":              map[string]any{"enabled": !rec.Disabled && workerProtocolEnabled(rec, "awg"), "public": rec.SelfDescribe["awg"]},
 			"egress_policy":    "direct",
 			"approved_devices": approvedDevicePayloads(approvedDevices),
-			"client_artifacts": map[string]any{"config_json_path": "/tw/config.json", "version_json_path": "/tw/version.json"},
+			// Short IDs (cohorts) the worker must stop accepting.
+			"revoked_short_ids": append([]string{}, rec.RevokedShortIDs...),
+			"client_artifacts":  map[string]any{"config_json_path": "/tw/config.json", "version_json_path": "/tw/version.json"},
 		},
 	}
 	workerJSON, err := canonicalJSON(workerPayload)
@@ -77,7 +79,7 @@ func (s *server) buildClientBundleForClient(minSeq int64, clientVersion string) 
 		if !workerFreshForClients(rec, issued) {
 			continue
 		}
-		item, ok := clientWorkerPayloadForClient(rec, clientVersion)
+		item, ok := s.clientWorkerPayloadForClient(rec, clientVersion)
 		if ok {
 			items = append(items, item)
 		}
@@ -174,17 +176,28 @@ func (s *server) storeClientBundle(key string, issued time.Time, signed signedCo
 	s.clientBundleCache[key] = clientBundleCacheEntry{signed: signed, issued: issued}
 }
 
-func clientWorkerPayloadForClient(rec workerRecord, clientVersion string) (map[string]any, bool) {
+func (s *server) clientWorkerPayloadForClient(rec workerRecord, clientVersion string) (map[string]any, bool) {
 	expected := workerEgressIP(rec)
 	configURL := stringFromMap(rec.SelfDescribe, "distributor_url")
 	routes := make([]any, 0, 2)
 	if workerProtocolEnabled(rec, "reality") {
 		if route, ok := clientRoutePayloadForClient("reality", rec.SelfDescribe["reality"], expected, configURL, clientVersion); ok {
+			// Cohort short IDs with revoked slots blanked; the app picks
+			// realityCohortIndex(device_id) and falls back to short_id.
+			if cohorts := clientCohortShortIDs(rec); cohorts != nil {
+				if params, ok := route["params"].(map[string]any); ok {
+					params["cohort_short_ids"] = cohorts
+				}
+				route["cohort_short_ids"] = cohorts
+			}
 			routes = append(routes, route)
+			if s.cfg.RealityFallbackProfiles {
+				routes = append(routes, realityFallbackRoutes(rec, route, expected, configURL, clientVersion)...)
+			}
 		}
 	}
 	if workerProtocolEnabled(rec, "awg") {
-		if profile, ok := selectAWGProfileForClient(awgProfilesFromWorker(rec), clientVersion); ok {
+		if profile, ok := selectAWGProfileForClient(awgProfilesForClients(rec), clientVersion); ok {
 			if route, ok := clientRoutePayload("awg", profile.Params, expected, configURL); ok {
 				route["profile"] = profile.Name
 				route["awg_profile"] = profile.Name
@@ -344,8 +357,11 @@ func approvedDevicePayloads(devices []deviceRecord) []any {
 		if len(device.AWGProfiles) > 0 {
 			payload["awg_profiles"] = device.AWGProfiles
 		}
+		if device.RealityFlow != "" {
+			payload["reality_flow"] = device.RealityFlow
+		}
 		if !deviceLimitsEmpty(device.Limits) {
-			payload["limits"] = device.Limits
+			payload["limits"] = deviceLimitsPayload(device.Limits)
 			if device.Limits.ExpiresAt != nil && strings.TrimSpace(*device.Limits.ExpiresAt) != "" {
 				payload["expires_at"] = strings.TrimSpace(*device.Limits.ExpiresAt)
 			}

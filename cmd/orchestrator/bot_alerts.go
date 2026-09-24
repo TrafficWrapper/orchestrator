@@ -191,6 +191,17 @@ func botWorkerProblemEntry(worker workerRecord, now time.Time) (botProblemEntry,
 		down = true
 	}
 	if !down {
+		// Reachable but its camouflage/REALITY self-check fails: clients
+		// may be getting blocked or fingerprinted.
+		if degraded, checks := workerDegraded(worker); degraded {
+			return botProblemEntry{
+				Scope:  "worker",
+				ID:     id,
+				Kind:   "worker_degraded",
+				Label:  firstNotBlank(stringFromMap(worker.SelfDescribe, "label"), shortString(id, 12), id),
+				Detail: "self_check=" + firstNotBlank(checks, "degraded"),
+			}, true
+		}
 		return botProblemEntry{}, false
 	}
 	detail := "status=" + firstNotBlank(worker.Status, "-")
@@ -321,6 +332,8 @@ func botProblemIssueText(entry botProblemEntry) string {
 		return fmt.Sprintf("Device %s quota near limit: %s", entry.Label, dashText(entry.Detail))
 	case "worker_down":
 		return fmt.Sprintf("Worker %s down: %s", entry.Label, dashText(entry.Detail))
+	case "worker_degraded":
+		return fmt.Sprintf("Worker %s degraded: %s", entry.Label, dashText(entry.Detail))
 	default:
 		return fmt.Sprintf("%s %s: %s", entry.Scope, entry.Label, entry.Kind)
 	}
@@ -334,6 +347,8 @@ func botProblemRecoveredText(entry botProblemEntry) string {
 		return "Device " + entry.Label + " quota recovered"
 	case "worker_down":
 		return "Worker " + entry.Label + " recovered"
+	case "worker_degraded":
+		return "Worker " + entry.Label + " self-check ok"
 	default:
 		return entry.Label + " recovered"
 	}

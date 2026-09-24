@@ -20,20 +20,27 @@ type deviceEnrollRequest struct {
 	EnrollmentNonce string `json:"enrollment_nonce,omitempty"`
 	ClientVersion   string `json:"client_version,omitempty"`
 	AWGPublicKey    string `json:"awg_public_key,omitempty"`
+	// Capabilities the app supports, e.g. "reality_vision". Absent in older
+	// apps, which therefore keep the flow-less REALITY account.
+	Capabilities []string `json:"capabilities,omitempty"`
 }
 
 type deviceEnrollResponse struct {
-	OK              bool                        `json:"ok"`
-	Error           string                      `json:"error,omitempty"`
-	DeviceID        string                      `json:"device_id,omitempty"`
-	Status          string                      `json:"status,omitempty"`
-	RealityUUID     string                      `json:"reality_uuid,omitempty"`
-	InternalIP      string                      `json:"internal_ip,omitempty"`
-	PSK2            string                      `json:"psk2,omitempty"`
-	AWGProfiles     map[string]deviceAWGProfile `json:"awg_profiles,omitempty"`
-	ServerAWGPublic string                      `json:"server_awg_public,omitempty"`
-	SignerPublicKey string                      `json:"signer_public_key,omitempty"`
-	ClientBundle    signedConfig                `json:"client_bundle,omitempty"`
+	OK          bool                        `json:"ok"`
+	Error       string                      `json:"error,omitempty"`
+	DeviceID    string                      `json:"device_id,omitempty"`
+	Status      string                      `json:"status,omitempty"`
+	RealityUUID string                      `json:"reality_uuid,omitempty"`
+	InternalIP  string                      `json:"internal_ip,omitempty"`
+	PSK2        string                      `json:"psk2,omitempty"`
+	AWGProfiles map[string]deviceAWGProfile `json:"awg_profiles,omitempty"`
+	// RealityFlow is the flow of this device's REALITY account on every
+	// worker ("" or xtls-rprx-vision); the app must use exactly this value
+	// on TCP REALITY routes (XHTTP routes never carry a flow).
+	RealityFlow     string       `json:"reality_flow,omitempty"`
+	ServerAWGPublic string       `json:"server_awg_public,omitempty"`
+	SignerPublicKey string       `json:"signer_public_key,omitempty"`
+	ClientBundle    signedConfig `json:"client_bundle,omitempty"`
 }
 
 type bootstrapPayload struct {
@@ -96,6 +103,17 @@ func (s *server) handleDeviceEnroll(peer []byte, raw []byte) (any, error) {
 		if err != nil {
 			return nil, err
 		}
+		// Re-enrollment re-negotiates Vision: an upgraded app turns it on, a
+		// reinstalled older app (no capabilities) turns it back off.
+		if flow := deviceRealityFlow(req.Capabilities); flow != existing.RealityFlow {
+			existing, err = s.store.updateDevice(existing.ID, true, func(rec *deviceRecord) error {
+				rec.RealityFlow = flow
+				return nil
+			})
+			if err != nil {
+				return nil, err
+			}
+		}
 		bundle, err := s.buildClientBundleForClient(0, existing.ClientVersion)
 		if err != nil {
 			return nil, err
@@ -112,6 +130,7 @@ func (s *server) handleDeviceEnroll(peer []byte, raw []byte) (any, error) {
 			InternalIP:      existing.InternalIP,
 			PSK2:            existing.PSK2,
 			AWGProfiles:     existing.AWGProfiles,
+			RealityFlow:     existing.RealityFlow,
 			ServerAWGPublic: serverAWGPublic,
 			SignerPublicKey: pub,
 			ClientBundle:    bundle,
@@ -129,6 +148,7 @@ func (s *server) handleDeviceEnroll(peer []byte, raw []byte) (any, error) {
 		EnrollmentNonce: strings.TrimSpace(req.EnrollmentNonce),
 		ClientVersion:   strings.TrimSpace(req.ClientVersion),
 		AWGPublicKey:    awgPublic,
+		RealityFlow:     deviceRealityFlow(req.Capabilities),
 	}
 	_, stored, err := s.store.consumeBootstrapToken(req.BootstrapToken, device, awgProfiles)
 	if err != nil {
@@ -150,6 +170,7 @@ func (s *server) handleDeviceEnroll(peer []byte, raw []byte) (any, error) {
 		InternalIP:      stored.InternalIP,
 		PSK2:            stored.PSK2,
 		AWGProfiles:     stored.AWGProfiles,
+		RealityFlow:     stored.RealityFlow,
 		ServerAWGPublic: serverAWGPublic,
 		SignerPublicKey: pub,
 		ClientBundle:    bundle,

@@ -207,7 +207,7 @@ func (s *server) handleAck(peer []byte, raw []byte) (any, error) {
 	if probe == "" {
 		log.Printf("worker %s egress probe unavailable; observed=%q", rec.ID, req.EgressIPObserved)
 	}
-	desiredSeq, quotaBlocks, err := s.store.recordAck(rec.ID, req.AppliedVersion, req.EgressIPObserved, req.SelfDescribe, &probe, req.Usage, time.Now().UTC())
+	desiredSeq, quotaBlocks, err := s.store.recordAck(rec.ID, req.AppliedVersion, req.SelfCheck, req.EgressIPObserved, req.SelfDescribe, &probe, req.Usage, time.Now().UTC())
 	if err != nil {
 		return nil, err
 	}

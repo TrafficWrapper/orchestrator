@@ -98,6 +98,36 @@ REALITY/AWG credentials, starts a local SOCKS front-end, and automatically probe
 worker x route candidates. The active route is chosen by observed health and
 policy; AWG remains a fallback path when REALITY is unhealthy.
 
+## REALITY Vision, Short ID Cohorts and AWG Rotation
+
+- **Vision (per device).** The app lists `capabilities: ["reality_vision"]` in
+  `/d/v1/enroll`; the orchestrator then stores `reality_flow =
+  "xtls-rprx-vision"` for the device, returns it in the enroll response and
+  sends it to workers in `desired_state.approved_devices[].reality_flow`.
+  Re-enrolling without the capability clears it. The shared client bundle never
+  carries a flow: the app must apply the enroll-response `reality_flow` to TCP
+  REALITY routes (XHTTP routes never use a flow), because Xray rejects a client
+  whose flow differs from its account.
+- **Short ID cohorts.** Workers publish `reality.cohort_short_ids`; client
+  bundle REALITY routes carry the list (also in `params`) with revoked slots
+  blanked (`""`) so positions never shift. The app uses slot
+  `uint32be(sha256(device_id)[0:4]) % len(list)`, falling back to `short_id`
+  when the slot is blank. `POST /admin/v1/workers/short-id
+  {id, short_id, revoked}` fills `desired_state.revoked_short_ids`. The admin
+  device list shows each device's `reality_cohort` slot.
+- **Fallback profiles.** With `ORCH_REALITY_FALLBACK_PROFILES=1`, XHTTP
+  entries of `reality_profiles` are added as extra REALITY routes right after a
+  worker's primary route (flow-less). Off by default: the app fills only two
+  REALITY slots, so fallbacks displace a second worker's REALITY route.
+- **AWG dialect rotation.** `POST /admin/v1/workers/awg-drain {id, profile,
+  draining}` stops offering an AWG profile to clients (devices keep
+  credentials for every profile), so they move to the worker's other profile
+  before the old one is removed.
+- **Health and limits.** Ack `self_check` (`ok` / `degraded: ...`) and
+  self-describe `health` are shown in the admin UI/API; the Telegram bot alerts
+  on degraded workers. Device limits sent to workers include `rate_mbps
+  {upload, download}` derived from the rate limit text (`20mbit`, `1gbit`).
+
 ## Distributor and Updates
 
 Workers expose the nginx distributor only inside the tunnel at `/tw/`. It serves

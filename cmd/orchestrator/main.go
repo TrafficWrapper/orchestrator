@@ -26,6 +26,7 @@ type orchConfig struct {
 	SignerKeyPath           string
 	SignerLegacyKeyPath     string
 	ClientIPHeader          string
+	RealityFallbackProfiles bool
 	PublicURL               string
 	EgressProbeURL          string
 	AdminSecret             string
@@ -225,6 +226,7 @@ func readConfig() (orchConfig, error) {
 		SeedVersionName:         getenv("SEED_APK_VERSION_NAME", "seed"),
 		APKKeepReleases:         int(env.int64("ORCH_APK_KEEP_RELEASES", 5, 0)),
 		TLS:                     env.bool("ORCH_TLS", true),
+		RealityFallbackProfiles: env.bool("ORCH_REALITY_FALLBACK_PROFILES", false),
 	}
 	return cfg, errors.Join(env.errs...)
 }
