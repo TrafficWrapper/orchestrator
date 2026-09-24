@@ -185,7 +185,10 @@ unset ORCH_NEW_ADMIN_PASSWORD
 | --- | --- | --- | --- | --- |
 | `ORCH_LISTEN` | HTTP(S) listen address. | Опц. | `:9091` | Оставьте default для host-network Compose или задайте `127.0.0.1:9091` за reverse proxy. |
 | `ORCH_STATE_DIR` | Local state directory для bbolt DB, generated keys, APK artifacts и bot/admin secrets. | Опц. | `./orch-state` | В Compose используется `/orch-state`, смонтированный из `./orch-state`. |
-| `ORCH_SIGNER_SOCKET` | Unix socket для config signer sidecar. | Опц. | `./orch-state/signer.sock` | В Compose используется `/orch-state/signer.sock`. |
+| `ORCH_SIGNER_SOCKET` | Unix socket для config signer sidecar. | Опц. | `./orch-state/signer.sock` | В Compose используется `/run/tw-signer/signer.sock` из `./signer-run`. |
+| `ORCH_SIGNER_KEY_PATH` | Путь к config-signing key для команды `signer`. | Опц. | `$ORCH_STATE_DIR/orch-config.key` | В Compose `/signer-state/orch-config.key` из `./signer-state`; этот каталог монтируется только в signer. |
+| `ORCH_SIGNER_LEGACY_KEY_PATH` | Источник одноразовой миграции: ключ отсюда переносится в `ORCH_SIGNER_KEY_PATH` и удаляется. | Опц. | empty | В Compose `/orch-state/orch-config.key`, чтобы старые установки сохранили закреплённый ключ. |
+| `ORCH_UID` / `ORCH_GID` | Непривилегированные uid/gid, на которые entrypoint переключается после исправления владельца state-каталогов. | Опц. | `10001` | Оставьте default, если политика хоста не требует другого uid. |
 | `ORCH_PUBLIC_URL` | Public URL, попадает в bootstrap payloads и используется workers/devices. | Обяз. для реального deploy | `https://127.0.0.1:9091` | `https://orch.example.com` или LAN URL для dev. |
 | `ORCH_EGRESS_PROBE_URL` | Optional worker egress probe URL. | Опц. | empty | Обычно `http://127.0.0.1:9090/self-describe` в local dev. |
 | `ORCH_ADMIN_SECRET` | Optional seed для first-run admin password. Лучше использовать generated initial password или safe CLI input. | Опц. | empty | Если нужен, передавайте через secret manager/env, не коммитьте. |
@@ -198,7 +201,11 @@ unset ORCH_NEW_ADMIN_PASSWORD
 | `SEED_APK_VERSION_NAME` | Version name в generated seed update manifest. | Опц. | `seed` | Например `0.1.0`. |
 
 Config-signing key генерируется и хранится signer-процессом в
-`ORCH_STATE_DIR`; orchestrator обращается к нему через `ORCH_SIGNER_SOCKET`.
+`ORCH_SIGNER_KEY_PATH`; orchestrator обращается к нему через `ORCH_SIGNER_SOCKET`.
+В Compose ключ лежит в `./signer-state`, который не монтируется в
+смотрящий в интернет контейнер orchestrator; делайте бэкап этого каталога вместе
+с `./orch-state`. Контейнеры стартуют от root только чтобы поправить владельца
+state-каталогов, затем работают от uid `10001`.
 Для APK updates задайте `ORCH_UPDATE_PUBKEY` от своего offline minisign update
 key, если планируете публиковать будущие обновления. Seed-on-first-run может
 сгенерировать update key в local state для первого demo APK, но дальнейшая

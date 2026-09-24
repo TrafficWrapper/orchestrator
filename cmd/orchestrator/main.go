@@ -43,6 +43,8 @@ type orchConfig struct {
 	StateDir                string
 	Listen                  string
 	SignerSocket            string
+	SignerKeyPath           string
+	SignerLegacyKeyPath     string
 	PublicURL               string
 	EgressProbeURL          string
 	AdminSecret             string
@@ -347,6 +349,8 @@ func readConfig() orchConfig {
 		StateDir:                getenv("ORCH_STATE_DIR", "./orch-state"),
 		Listen:                  getenv("ORCH_LISTEN", ":9091"),
 		SignerSocket:            getenv("ORCH_SIGNER_SOCKET", "./orch-state/signer.sock"),
+		SignerKeyPath:           os.Getenv("ORCH_SIGNER_KEY_PATH"),
+		SignerLegacyKeyPath:     os.Getenv("ORCH_SIGNER_LEGACY_KEY_PATH"),
 		PublicURL:               getenv("ORCH_PUBLIC_URL", "https://127.0.0.1:9091"),
 		EgressProbeURL:          os.Getenv("ORCH_EGRESS_PROBE_URL"),
 		AdminSecret:             os.Getenv("ORCH_ADMIN_SECRET"),

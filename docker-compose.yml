@@ -5,9 +5,16 @@ services:
       dockerfile: Dockerfile
     command: ["signer"]
     environment:
-      ORCH_STATE_DIR: /orch-state
-      ORCH_SIGNER_SOCKET: /orch-state/signer.sock
+      ORCH_STATE_DIR: /signer-state
+      ORCH_SIGNER_KEY_PATH: /signer-state/orch-config.key
+      # One-time migration of a key created by older releases inside the
+      # shared orchestrator state; it is moved out and deleted there.
+      ORCH_SIGNER_LEGACY_KEY_PATH: /orch-state/orch-config.key
+      ORCH_SIGNER_SOCKET: /run/tw-signer/signer.sock
+    network_mode: none
     volumes:
+      - ./signer-state:/signer-state
+      - ./signer-run:/run/tw-signer
       - ./orch-state:/orch-state
     restart: unless-stopped
 
@@ -20,7 +27,7 @@ services:
       - signer
     environment:
       ORCH_STATE_DIR: /orch-state
-      ORCH_SIGNER_SOCKET: /orch-state/signer.sock
+      ORCH_SIGNER_SOCKET: /run/tw-signer/signer.sock
       ORCH_LISTEN: ${ORCH_LISTEN:-:9091}
       ORCH_TLS: ${ORCH_TLS:-1}
       ORCH_PUBLIC_URL: ${ORCH_PUBLIC_URL:-https://127.0.0.1:9091}
@@ -32,5 +39,6 @@ services:
     network_mode: host
     volumes:
       - ./orch-state:/orch-state
+      - ./signer-run:/run/tw-signer
       - ./seed:/seed:ro
     restart: unless-stopped

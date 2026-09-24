@@ -39,7 +39,10 @@ func runSigner(cfg orchConfig) error {
 	if err := os.MkdirAll(cfg.StateDir, 0o700); err != nil {
 		return err
 	}
-	keyPath := filepath.Join(cfg.StateDir, "orch-config.key")
+	keyPath := signerKeyPath(cfg)
+	if err := migrateLegacySignerKey(keyPath, cfg.SignerLegacyKeyPath); err != nil {
+		return err
+	}
 	pub, priv, err := loadOrCreateMinisignKey(keyPath)
 	if err != nil {
 		return err
@@ -48,8 +51,12 @@ func runSigner(cfg orchConfig) error {
 	if err := os.MkdirAll(filepath.Dir(cfg.SignerSocket), 0o700); err != nil {
 		return err
 	}
-	l, err := net.Listen("unix", cfg.SignerSocket)
-	if err != nil {
+	var l net.Listener
+	if err := withUmask(0o177, func() error {
+		var err error
+		l, err = net.Listen("unix", cfg.SignerSocket)
+		return err
+	}); err != nil {
 		return err
 	}
 	defer l.Close()
@@ -64,6 +71,83 @@ func runSigner(cfg orchConfig) error {
 		}
 		go handleSignerConn(c, pub, priv)
 	}
+}
+
+func signerKeyPath(cfg orchConfig) string {
+	if p := strings.TrimSpace(cfg.SignerKeyPath); p != "" {
+		return p
+	}
+	return filepath.Join(cfg.StateDir, "orch-config.key")
+}
+
+// migrateLegacySignerKey moves a config-signing key from the shared
+// orchestrator state directory into the signer-only key path, keeping the
+// pinned public key stable. The legacy copy is removed so the internet-facing
+// orchestrator process can no longer read it.
+func migrateLegacySignerKey(keyPath, legacyPath string) error {
+	legacyPath = strings.TrimSpace(legacyPath)
+	if legacyPath == "" || filepath.Clean(legacyPath) == filepath.Clean(keyPath) {
+		return nil
+	}
+	legacy, err := os.ReadFile(legacyPath)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if _, err := os.Stat(keyPath); err == nil {
+		current, err := os.ReadFile(keyPath)
+		if err != nil {
+			return err
+		}
+		if string(current) != string(legacy) {
+			return fmt.Errorf("signer key exists at both %s and legacy %s with different contents; remove the one that is not pinned by workers/clients", keyPath, legacyPath)
+		}
+		return os.Remove(legacyPath)
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(keyPath), 0o700); err != nil {
+		return err
+	}
+	if err := writeFileAtomic(keyPath, legacy, 0o600); err != nil {
+		return err
+	}
+	fmt.Printf("signer=migrated key from=%s to=%s\n", legacyPath, keyPath)
+	return os.Remove(legacyPath)
+}
+
+func writeFileAtomic(path string, data []byte, perm os.FileMode) error {
+	tmp, err := os.CreateTemp(filepath.Dir(path), "."+filepath.Base(path)+".tmp-*")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	defer os.Remove(tmpName)
+	if err := tmp.Chmod(perm); err != nil {
+		tmp.Close()
+		return err
+	}
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(tmpName, path); err != nil {
+		return err
+	}
+	if dir, err := os.Open(filepath.Dir(path)); err == nil {
+		_ = dir.Sync()
+		_ = dir.Close()
+	}
+	return nil
 }
 
 func handleSignerConn(c net.Conn, pub minisign.PublicKey, priv minisign.PrivateKey) {

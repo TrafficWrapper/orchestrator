@@ -187,7 +187,10 @@ provided Compose file:
 | --- | --- | --- | --- | --- |
 | `ORCH_LISTEN` | HTTP(S) listen address. | Optional | `:9091` | Keep the default for host-network Compose, or set `127.0.0.1:9091` behind a reverse proxy. |
 | `ORCH_STATE_DIR` | Local state directory for bbolt DB, generated keys, APK artifacts and bot/admin secrets. | Optional | `./orch-state` | Compose uses `/orch-state` mounted from `./orch-state`. |
-| `ORCH_SIGNER_SOCKET` | Unix socket used by the config signer sidecar. | Optional | `./orch-state/signer.sock` | Compose uses `/orch-state/signer.sock`. |
+| `ORCH_SIGNER_SOCKET` | Unix socket used by the config signer sidecar. | Optional | `./orch-state/signer.sock` | Compose uses `/run/tw-signer/signer.sock` mounted from `./signer-run`. |
+| `ORCH_SIGNER_KEY_PATH` | Config-signing key path read by the `signer` command. | Optional | `$ORCH_STATE_DIR/orch-config.key` | Compose uses `/signer-state/orch-config.key` from `./signer-state`, which only the signer container mounts. |
+| `ORCH_SIGNER_LEGACY_KEY_PATH` | One-time migration source: a key found here is moved to `ORCH_SIGNER_KEY_PATH` and deleted. | Optional | empty | Compose uses `/orch-state/orch-config.key` so older deployments keep their pinned key. |
+| `ORCH_UID` / `ORCH_GID` | Unprivileged uid/gid the container entrypoint drops to after fixing state-directory ownership. | Optional | `10001` | Keep the default unless host policy requires a specific uid. |
 | `ORCH_PUBLIC_URL` | Public URL embedded into bootstrap payloads and used by workers/devices. | Required for real deployments | `https://127.0.0.1:9091` | `https://orch.example.com` or your LAN URL for dev. |
 | `ORCH_EGRESS_PROBE_URL` | Optional worker egress probe URL. | Optional | empty | Usually `http://127.0.0.1:9090/self-describe` in local dev. |
 | `ORCH_ADMIN_SECRET` | Optional first-run admin password seed. Prefer the generated initial password or safe CLI input. | Optional | empty | If used, pass via a secret manager/env, never commit it. |
@@ -199,8 +202,12 @@ provided Compose file:
 | `SEED_APK_VERSION_CODE` | Version code written into the generated seed update manifest. | Optional | `1` | Match the seed APK version code. |
 | `SEED_APK_VERSION_NAME` | Version name written into the generated seed update manifest. | Optional | `seed` | Example: `0.1.0`. |
 
-The config-signing key is generated and held by the signer process in
-`ORCH_STATE_DIR`; the orchestrator talks to it through `ORCH_SIGNER_SOCKET`.
+The config-signing key is generated and held by the signer process at
+`ORCH_SIGNER_KEY_PATH`; the orchestrator talks to it through `ORCH_SIGNER_SOCKET`.
+In Compose the key lives in `./signer-state`, which the internet-facing
+orchestrator container does not mount; back that directory up together with
+`./orch-state`. Containers start as root only long enough to fix state-directory
+ownership, then run as uid `10001`.
 For APK updates, provide `ORCH_UPDATE_PUBKEY` from your own offline minisign
 update key if you plan to publish future updates. Seed-on-first-run can generate
 an update key in local state for a first demo APK, but later APK publishing must

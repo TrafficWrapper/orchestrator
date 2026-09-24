@@ -19,6 +19,19 @@ Back up each root separately. Store private material offline or in
 owner-controlled secret storage. Do not commit `.env`, `orch-state/`,
 `worker-state/`, release keystores, or minisign private keys.
 
+## Upgrading to the isolated signer layout
+
+Releases that ship `docker-compose.yml` with `./signer-state` move the
+config-signing key out of `./orch-state` automatically on the first signer
+start (`ORCH_SIGNER_LEGACY_KEY_PATH`); the public key workers and clients pin
+does not change. Before upgrading, back up `./orch-state`. After the first
+start, confirm `./signer-state/orch-config.key` exists and
+`./orch-state/orch-config.key` is gone, then include `./signer-state` in
+backups. If the signer refuses to start because keys exist in both places with
+different contents, keep the one whose public key matches deployed configs.
+Containers now run as uid `10001`; the entrypoint re-owns the state
+directories, but a seed APK under `./seed` must be world-readable.
+
 ## Rotate the config-signing key
 
 The config-signing key is held by the signer process and reached through
