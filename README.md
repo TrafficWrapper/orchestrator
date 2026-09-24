@@ -190,6 +190,7 @@ provided Compose file:
 | `ORCH_SIGNER_SOCKET` | Unix socket used by the config signer sidecar. | Optional | `./orch-state/signer.sock` | Compose uses `/run/tw-signer/signer.sock` mounted from `./signer-run`. |
 | `ORCH_SIGNER_KEY_PATH` | Config-signing key path read by the `signer` command. | Optional | `$ORCH_STATE_DIR/orch-config.key` | Compose uses `/signer-state/orch-config.key` from `./signer-state`, which only the signer container mounts. |
 | `ORCH_SIGNER_LEGACY_KEY_PATH` | One-time migration source: a key found here is moved to `ORCH_SIGNER_KEY_PATH` and deleted. | Optional | empty | Compose uses `/orch-state/orch-config.key` so older deployments keep their pinned key. |
+| `ORCH_CLIENT_IP_HEADER` | Which proxy header carries the client IP when the peer is loopback: `x-real-ip`, `x-forwarded-for`, `none`, or `auto`. | Optional | `auto` | Set it to the header your reverse proxy overwrites; see Production TLS. |
 | `ORCH_UID` / `ORCH_GID` | Unprivileged uid/gid the container entrypoint drops to after fixing state-directory ownership. | Optional | `10001` | Keep the default unless host policy requires a specific uid. |
 | `ORCH_PUBLIC_URL` | Public URL embedded into bootstrap payloads and used by workers/devices. | Required for real deployments | `https://127.0.0.1:9091` | `https://orch.example.com` or your LAN URL for dev. |
 | `ORCH_EGRESS_PROBE_URL` | Optional worker egress probe URL. | Optional | empty | Usually `http://127.0.0.1:9090/self-describe` in local dev. |
@@ -232,6 +233,10 @@ Recommended setup:
 Configure the proxy to pass the real peer IP with `X-Real-IP $remote_addr` or
 to overwrite `X-Forwarded-For` with `$remote_addr`. Do not leave append-only
 `X-Forwarded-For` defaults as the only signal for rate-limited endpoints.
+Then set `ORCH_CLIENT_IP_HEADER` to the header your proxy overwrites
+(`x-real-ip` or `x-forwarded-for`). In the default `auto` mode a proxy that sets
+only one of them lets clients forge the other and spoof their IP for login rate
+limits, audit entries and Telegram login approvals.
 
 For tests with the default self-signed listener, workers must set
 `ORCH_INSECURE_TLS=1`. Do not use that setting for production.

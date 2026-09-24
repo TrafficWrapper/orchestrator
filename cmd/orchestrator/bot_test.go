@@ -655,3 +655,19 @@ func postLogin(t *testing.T, url, secret string) loginTestResult {
 	body, _ := io.ReadAll(resp.Body)
 	return loginTestResult{StatusCode: resp.StatusCode, Body: string(body)}
 }
+
+func TestTelegramTransportErrorsRedactToken(t *testing.T) {
+	token := "123456:SECRET-token"
+	client := &telegramHTTPClient{
+		apiURL: "http://127.0.0.1:1",
+		token:  token,
+		client: &http.Client{Timeout: time.Second},
+	}
+	_, err := client.getUpdates(context.Background(), 0, 0)
+	if err == nil {
+		t.Fatal("expected a transport error")
+	}
+	if strings.Contains(err.Error(), token) || strings.Contains(err.Error(), "SECRET") {
+		t.Fatalf("bot token leaked in error: %v", err)
+	}
+}

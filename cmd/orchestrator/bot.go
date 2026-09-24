@@ -12,6 +12,7 @@ import (
 	"math"
 	"mime/multipart"
 	"net/http"
+	neturl "net/url"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -1042,7 +1043,7 @@ func (c *telegramHTTPClient) sendDocument(ctx context.Context, chatID int64, pat
 		return err
 	}
 	req.Header.Set("Content-Type", writer.FormDataContentType())
-	resp, err := c.client.Do(req)
+	resp, err := c.do(req)
 	if err != nil {
 		return err
 	}
@@ -1058,6 +1059,34 @@ func (c *telegramHTTPClient) sendDocument(ctx context.Context, chatID int64, pat
 		return errors.New(firstNotBlank(env.Error, "telegram sendDocument failed"))
 	}
 	return nil
+}
+
+// do sends a Bot API request. The bot token is part of the request URL and
+// net/http embeds that URL in transport errors, so it is redacted before the
+// error can reach logs.
+func (c *telegramHTTPClient) do(req *http.Request) (*http.Response, error) {
+	resp, err := c.client.Do(req)
+	if err != nil {
+		err = redactTelegramToken(err, c.token)
+	}
+	return resp, err
+}
+
+func redactTelegramToken(err error, token string) error {
+	if err == nil || strings.TrimSpace(token) == "" {
+		return err
+	}
+	var urlErr *neturl.Error
+	if errors.As(err, &urlErr) {
+		urlErr.URL = strings.ReplaceAll(urlErr.URL, token, "<redacted>")
+		if !strings.Contains(err.Error(), token) {
+			return err
+		}
+	}
+	if strings.Contains(err.Error(), token) {
+		return errors.New(strings.ReplaceAll(err.Error(), token, "<redacted>"))
+	}
+	return err
 }
 
 func (c *telegramHTTPClient) answerCallback(ctx context.Context, callbackID, text string) error {
@@ -1089,7 +1118,7 @@ func (c *telegramHTTPClient) call(ctx context.Context, method string, payload an
 		return err
 	}
 	req.Header.Set("Content-Type", "application/json")
-	resp, err := c.client.Do(req)
+	resp, err := c.do(req)
 	if err != nil {
 		return err
 	}

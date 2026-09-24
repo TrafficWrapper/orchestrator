@@ -35,3 +35,35 @@ func TestClientIPTrustsForwardedOnlyFromLoopbackProxy(t *testing.T) {
 		t.Fatalf("clientIP invalid XFF fallback = %q", got)
 	}
 }
+
+func TestClientIPHeaderModesIgnoreUntrustedHeader(t *testing.T) {
+	t.Cleanup(func() { _ = setClientIPHeaderMode("") })
+	req := httptest.NewRequest("POST", "https://orch.example/admin/v1/login", nil)
+	req.RemoteAddr = "127.0.0.1:54432"
+	req.Header.Set("X-Forwarded-For", "198.51.100.10")
+	req.Header.Set("X-Real-IP", "6.6.6.6")
+
+	if err := setClientIPHeaderMode("x-forwarded-for"); err != nil {
+		t.Fatal(err)
+	}
+	if got := clientIP(req); got != "198.51.100.10" {
+		t.Fatalf("x-forwarded-for mode trusted forged X-Real-IP: %q", got)
+	}
+	if err := setClientIPHeaderMode("x-real-ip"); err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Del("X-Real-IP")
+	if got := clientIP(req); got != "127.0.0.1" {
+		t.Fatalf("x-real-ip mode trusted X-Forwarded-For: %q", got)
+	}
+	if err := setClientIPHeaderMode("none"); err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("X-Real-IP", "6.6.6.6")
+	if got := clientIP(req); got != "127.0.0.1" {
+		t.Fatalf("none mode trusted a header: %q", got)
+	}
+	if err := setClientIPHeaderMode("bogus"); err == nil {
+		t.Fatal("unknown mode must be rejected")
+	}
+}

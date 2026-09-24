@@ -1,23 +1,82 @@
 package main
 
 import (
+	"fmt"
+	"log"
 	"net"
 	"net/http"
 	"net/netip"
 	"strings"
+	"sync"
+	"sync/atomic"
 )
+
+// Client IP header modes (ORCH_CLIENT_IP_HEADER). Only a header the local
+// proxy always overwrites is safe to trust: with "auto", a proxy that sets just
+// X-Forwarded-For lets clients forge X-Real-IP, and vice versa.
+const (
+	clientIPHeaderAuto         = "auto"
+	clientIPHeaderRealIP       = "x-real-ip"
+	clientIPHeaderForwardedFor = "x-forwarded-for"
+	clientIPHeaderNone         = "none"
+)
+
+var (
+	clientIPHeaderMode     atomic.Value // string
+	clientIPAutoWarnedOnce sync.Once
+)
+
+func setClientIPHeaderMode(mode string) error {
+	mode = strings.ToLower(strings.TrimSpace(mode))
+	switch mode {
+	case "":
+		mode = clientIPHeaderAuto
+	case clientIPHeaderAuto, clientIPHeaderRealIP, clientIPHeaderForwardedFor, clientIPHeaderNone:
+	default:
+		return fmt.Errorf("ORCH_CLIENT_IP_HEADER must be one of auto, x-real-ip, x-forwarded-for, none; got %q", mode)
+	}
+	clientIPHeaderMode.Store(mode)
+	return nil
+}
+
+func currentClientIPHeaderMode() string {
+	if mode, ok := clientIPHeaderMode.Load().(string); ok && mode != "" {
+		return mode
+	}
+	return clientIPHeaderAuto
+}
 
 func clientIP(r *http.Request) string {
 	host := remoteIP(r.RemoteAddr)
-	if trustedProxyHost(host) {
-		if realIP := validIPString(r.Header.Get("X-Real-IP")); realIP != "" {
+	if !trustedProxyHost(host) {
+		return host
+	}
+	realIP := validIPString(r.Header.Get("X-Real-IP"))
+	// Assumes a single trusted co-located proxy hop. Appending proxies add
+	// the peer they observed at the right edge of X-Forwarded-For.
+	forwarded := rightmostForwardedIP(r.Header.Get("X-Forwarded-For"))
+	switch currentClientIPHeaderMode() {
+	case clientIPHeaderNone:
+		return host
+	case clientIPHeaderRealIP:
+		if realIP != "" {
 			return realIP
 		}
-		// Assumes a single trusted co-located proxy hop. Appending proxies add
-		// the peer they observed at the right edge of X-Forwarded-For.
-		if forwarded := rightmostForwardedIP(r.Header.Get("X-Forwarded-For")); forwarded != "" {
+		return host
+	case clientIPHeaderForwardedFor:
+		if forwarded != "" {
 			return forwarded
 		}
+		return host
+	}
+	if realIP != "" {
+		clientIPAutoWarnedOnce.Do(func() {
+			log.Printf("client ip: trusting X-Real-IP from a loopback proxy in auto mode; set ORCH_CLIENT_IP_HEADER to the header your proxy overwrites so clients cannot forge the other one")
+		})
+		return realIP
+	}
+	if forwarded != "" {
+		return forwarded
 	}
 	return host
 }
