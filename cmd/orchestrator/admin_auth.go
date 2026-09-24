@@ -346,6 +346,25 @@ func (s *server) handleAdminPasswordChange(w http.ResponseWriter, r *http.Reques
 		http.Error(w, "invalid current admin secret", http.StatusForbidden)
 		return
 	}
+	// Ask for the out-of-band approval before touching the credential: a denial
+	// must leave the old password and sessions intact, not lock the owner out.
+	if approver := s.currentAuthApprover(); approver != nil && approver.enabled() {
+		approved, err := approver.requestLoginApproval(r.Context(), loginApprovalRequest{
+			RemoteAddr: ip,
+			UserAgent:  r.UserAgent(),
+			CreatedAt:  time.Now().UTC(),
+		})
+		if err != nil {
+			s.auditEvent(auditEntry{Event: "admin_password_change", IP: ip, Result: "failed", Fields: map[string]string{"reason": "approval_error"}})
+			http.Error(w, err.Error(), http.StatusForbidden)
+			return
+		}
+		if !approved {
+			s.auditEvent(auditEntry{Event: "admin_password_change", IP: ip, Result: "denied"})
+			http.Error(w, "admin login approval denied", http.StatusForbidden)
+			return
+		}
+	}
 	if err := s.store.setAdminPassword(req.NewSecret); err != nil {
 		s.auditEvent(auditEntry{Event: "admin_password_change", IP: ip, Result: "failed", Fields: map[string]string{"reason": "set_failed"}})
 		http.Error(w, err.Error(), http.StatusBadRequest)
@@ -354,21 +373,6 @@ func (s *server) handleAdminPasswordChange(w http.ResponseWriter, r *http.Reques
 	log.Printf("admin password changed at=%s remote=%s", time.Now().UTC().Format(time.RFC3339), r.RemoteAddr)
 	s.auditEvent(auditEntry{Event: "admin_password_change", IP: ip, Result: "ok"})
 	s.revokeAdminSessions()
-	if approver := s.currentAuthApprover(); approver != nil && approver.enabled() {
-		approved, err := approver.requestLoginApproval(r.Context(), loginApprovalRequest{
-			RemoteAddr: ip,
-			UserAgent:  r.UserAgent(),
-			CreatedAt:  time.Now().UTC(),
-		})
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusForbidden)
-			return
-		}
-		if !approved {
-			http.Error(w, "admin login approval denied", http.StatusForbidden)
-			return
-		}
-	}
 	s.createAdminSession(w, r, false)
 }
 
