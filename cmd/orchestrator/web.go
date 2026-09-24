@@ -61,6 +61,8 @@ type webWorker struct {
 	Weight         int
 	Reality        bool
 	AWG            bool
+	SelfCheck      string
+	Degraded       bool
 }
 
 type webDevice struct {
@@ -275,6 +277,8 @@ func (s *server) webData(templateName, title, path string, session adminSession)
 			AWG:            workerProtocolEnabled(worker, "awg"),
 		}
 		item.APKSyncState = apkSyncState(worker, apkRelease, apkPublished)
+		item.SelfCheck = worker.SelfCheck
+		item.Degraded, _ = workerDegraded(worker)
 		if workerCountsAsActive(worker) {
 			page.WorkerActive++
 		}

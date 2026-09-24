@@ -336,6 +336,9 @@ func (s *server) handleAdminDevices(w http.ResponseWriter, r *http.Request) {
 			"alias":                    device.Alias,
 			"status":                   device.Status,
 			"client_version":           device.ClientVersion, // enroll-time snapshot kept for API compatibility
+			"reality_flow":             device.RealityFlow,
+			"client_capabilities":      device.ClientCapabilities,
+			"reality_cohort":           realityCohortIndex(device.ID, realityCohortSlots),
 			"installed_version":        installedVersion,
 			"installed_version_source": versionSource,
 			"update_available":         updateAvailable,
@@ -433,6 +436,11 @@ func adminWorkerPayload(worker workerRecord) map[string]any {
 		"weight":             effectiveWorkerWeight(worker),
 		"protocols":          map[string]bool{"reality": workerProtocolEnabled(worker, "reality"), "awg": workerProtocolEnabled(worker, "awg")},
 		"self_describe":      worker.SelfDescribe,
+		"self_check":         worker.SelfCheck,
+		"self_check_at":      formatOptionalTime(worker.SelfCheckAt),
+		"health":             worker.SelfDescribe["health"],
+		"revoked_short_ids":  worker.RevokedShortIDs,
+		"draining_awg":       worker.DrainingAWGProfiles,
 		"static_public_key8": shortString(worker.StaticPublicKey, 8),
 	}
 }

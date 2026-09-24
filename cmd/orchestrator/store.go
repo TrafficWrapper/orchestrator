@@ -106,6 +106,15 @@ type workerRecord struct {
 	APKSentSeq    int64 `json:"apk_sent_seq,omitempty"`
 	APKSentAtSeq  int64 `json:"apk_sent_at_seq,omitempty"`
 	APKAppliedSeq int64 `json:"apk_applied_seq,omitempty"`
+	// SelfCheck is the worker's last reported self-check ("ok" or
+	// "degraded: camouflage,reality"), from ack.
+	SelfCheck   string     `json:"self_check,omitempty"`
+	SelfCheckAt *time.Time `json:"self_check_at,omitempty"`
+	// RevokedShortIDs are REALITY short IDs (cohorts) the worker must stop
+	// accepting; DrainingAWGProfiles are AWG profiles no longer handed to
+	// clients (dialect rotation).
+	RevokedShortIDs     []string `json:"revoked_short_ids,omitempty"`
+	DrainingAWGProfiles []string `json:"draining_awg_profiles,omitempty"`
 }
 
 type adminTOTPRecord struct {
@@ -119,31 +128,36 @@ type adminTOTPRecord struct {
 }
 
 type deviceRecord struct {
-	ID              string                        `json:"id"`
-	Alias           string                        `json:"alias,omitempty"`
-	Status          string                        `json:"status"`
-	NoisePublicKey  string                        `json:"noise_public_key"`
-	IdentityPubKey  string                        `json:"identity_pubkey"`
-	IdentityKeyType string                        `json:"identity_key_type,omitempty"`
-	AndroidID       string                        `json:"android_id,omitempty"`
-	Model           string                        `json:"model,omitempty"`
-	EnrollmentNonce string                        `json:"enrollment_nonce,omitempty"`
-	ClientVersion   string                        `json:"client_version,omitempty"`
-	AWGPublicKey    string                        `json:"awg_public_key,omitempty"`
-	RealityUUID     string                        `json:"reality_uuid,omitempty"`
-	InternalIP      string                        `json:"internal_ip,omitempty"`
-	PSK2            string                        `json:"psk2,omitempty"`
-	AWGProfiles     map[string]deviceAWGProfile   `json:"awg_profiles,omitempty"`
-	BootstrapToken  string                        `json:"bootstrap_token"`
-	Limits          deviceLimits                  `json:"limits,omitempty"`
-	UsageRxBytes    uint64                        `json:"usage_rx_bytes,omitempty"`
-	UsageTxBytes    uint64                        `json:"usage_tx_bytes,omitempty"`
-	UsageCounters   map[string]deviceUsageCounter `json:"usage_counters,omitempty"`
-	UsageUpdatedAt  *time.Time                    `json:"usage_updated_at,omitempty"`
-	BlockedAt       *time.Time                    `json:"blocked_at,omitempty"`
-	BlockedReason   string                        `json:"blocked_reason,omitempty"`
-	CreatedAt       time.Time                     `json:"created_at"`
-	ConfigSeq       int64                         `json:"config_seq"`
+	ID              string `json:"id"`
+	Alias           string `json:"alias,omitempty"`
+	Status          string `json:"status"`
+	NoisePublicKey  string `json:"noise_public_key"`
+	IdentityPubKey  string `json:"identity_pubkey"`
+	IdentityKeyType string `json:"identity_key_type,omitempty"`
+	AndroidID       string `json:"android_id,omitempty"`
+	Model           string `json:"model,omitempty"`
+	EnrollmentNonce string `json:"enrollment_nonce,omitempty"`
+	ClientVersion   string `json:"client_version,omitempty"`
+	// RealityFlow is "" or xtls-rprx-vision, chosen from the capabilities the
+	// app declared at enrollment; workers set it on the device's account.
+	RealityFlow string `json:"reality_flow,omitempty"`
+	// ClientCapabilities is the capability list the app sent at enrollment.
+	ClientCapabilities []string                      `json:"client_capabilities,omitempty"`
+	AWGPublicKey       string                        `json:"awg_public_key,omitempty"`
+	RealityUUID        string                        `json:"reality_uuid,omitempty"`
+	InternalIP         string                        `json:"internal_ip,omitempty"`
+	PSK2               string                        `json:"psk2,omitempty"`
+	AWGProfiles        map[string]deviceAWGProfile   `json:"awg_profiles,omitempty"`
+	BootstrapToken     string                        `json:"bootstrap_token"`
+	Limits             deviceLimits                  `json:"limits,omitempty"`
+	UsageRxBytes       uint64                        `json:"usage_rx_bytes,omitempty"`
+	UsageTxBytes       uint64                        `json:"usage_tx_bytes,omitempty"`
+	UsageCounters      map[string]deviceUsageCounter `json:"usage_counters,omitempty"`
+	UsageUpdatedAt     *time.Time                    `json:"usage_updated_at,omitempty"`
+	BlockedAt          *time.Time                    `json:"blocked_at,omitempty"`
+	BlockedReason      string                        `json:"blocked_reason,omitempty"`
+	CreatedAt          time.Time                     `json:"created_at"`
+	ConfigSeq          int64                         `json:"config_seq"`
 }
 
 type deviceUsageCounter struct {
@@ -1673,6 +1687,12 @@ type workerPolicyPatch struct {
 	Priority  *int
 	Weight    *int
 	Protocols map[string]*bool
+	// ShortID/ShortIDRevoked revoke or restore one REALITY short ID.
+	ShortID        string
+	ShortIDRevoked *bool
+	// AWGProfile/AWGProfileDraining start or stop draining an AWG profile.
+	AWGProfile         string
+	AWGProfileDraining *bool
 }
 
 func (s *orchStore) updateWorkerPolicy(id string, patch workerPolicyPatch) error {
@@ -1704,6 +1724,12 @@ func (s *orchStore) updateWorkerPolicy(id string, patch workerPolicyPatch) error
 				return errors.New("weight must be 0..100")
 			}
 			rec.ConfigWeight = &value
+		}
+		if patch.ShortIDRevoked != nil {
+			rec.RevokedShortIDs = toggleString(rec.RevokedShortIDs, patch.ShortID, *patch.ShortIDRevoked)
+		}
+		if patch.AWGProfileDraining != nil {
+			rec.DrainingAWGProfiles = toggleString(rec.DrainingAWGProfiles, patch.AWGProfile, *patch.AWGProfileDraining)
 		}
 		if len(patch.Protocols) > 0 {
 			if rec.ProtocolEnabled == nil {
@@ -1804,13 +1830,17 @@ func (s *orchStore) workers() ([]workerRecord, error) {
 // recordAck stores a worker ack (and egress probe) together with the usage it
 // reports in one batched write transaction, returning the worker's desired
 // seq and the number of devices newly blocked by quota.
-func (s *orchStore) recordAck(id string, applied int64, observed string, self map[string]any, probe *string, usage []deviceUsage, now time.Time) (int64, int, error) {
+func (s *orchStore) recordAck(id string, applied int64, selfCheck string, observed string, self map[string]any, probe *string, usage []deviceUsage, now time.Time) (int64, int, error) {
 	var desired int64
 	var blocked int
 	var discoveryChanged bool
 	err := s.db.Batch(func(tx *bolt.Tx) error {
 		rec, changed, err := s.mutateWorkerTx(tx, id, func(rec *workerRecord) (bool, error) {
 			applyAck(rec, applied, observed, self, probe)
+			if check := strings.TrimSpace(selfCheck); check != "" {
+				rec.SelfCheck = check
+				rec.SelfCheckAt = &now
+			}
 			return true, nil
 		})
 		if err != nil {

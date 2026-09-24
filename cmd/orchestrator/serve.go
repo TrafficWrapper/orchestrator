@@ -322,6 +322,8 @@ func (s *server) apiRoutes() []apiRoute {
 		{"/admin/v1/workers", s.admin(adminGET, s.handleAdminWorkers)},
 		{"/admin/v1/workers/set-enabled", s.admin(adminPOST, s.handleAdminWorkerSetEnabled)},
 		{"/admin/v1/workers/protocol", s.admin(adminPOST, s.handleAdminWorkerProtocol)},
+		{"/admin/v1/workers/short-id", s.admin(adminPOST, s.handleAdminWorkerShortID)},
+		{"/admin/v1/workers/awg-drain", s.admin(adminPOST, s.handleAdminWorkerAWGDrain)},
 		{"/admin/v1/devices", s.admin(adminGET, s.handleAdminDevices)},
 		{"/admin/v1/config", s.admin(adminGET, s.handleAdminConfig)},
 		{"/admin/v1/config/edit", s.admin(adminPOST, s.handleAdminConfigEdit)},
