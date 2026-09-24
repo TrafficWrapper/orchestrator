@@ -67,7 +67,7 @@ func TestDeviceIPPoolSkipsWorkerGatewayOfUnmaskedSubnet(t *testing.T) {
 				t.Fatalf("allocated worker gateway/smoke address %s", ip)
 			}
 			rec := deviceRecord{ID: ip, Status: "approved", InternalIP: ip, CreatedAt: time.Now()}
-			sealed, _ := s.store.sealJSON(rec)
+			sealed, _ := s.store.sealJSON(bucketDevices, []byte(rec.ID), rec)
 			if err := tx.Bucket(bucketDevices).Put([]byte(rec.ID), sealed); err != nil {
 				return err
 			}

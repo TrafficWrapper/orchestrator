@@ -20,7 +20,7 @@ func allocateN(t *testing.T, s *server, cidr string, n int) ([]string, error) {
 				return err
 			}
 			rec := deviceRecord{ID: fmt.Sprintf("dev-%d", i), Status: "approved", InternalIP: ip, CreatedAt: time.Now().UTC()}
-			sealed, err := s.store.sealJSON(rec)
+			sealed, err := s.store.sealJSON(bucketDevices, []byte(rec.ID), rec)
 			if err != nil {
 				return err
 			}

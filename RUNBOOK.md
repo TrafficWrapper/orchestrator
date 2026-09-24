@@ -32,6 +32,14 @@ different contents, keep the one whose public key matches deployed configs.
 Containers now run as uid `10001`; the entrypoint re-owns the state
 directories, but a seed APK under `./seed` must be world-readable.
 
+## Sealed record format upgrade
+
+Starting with the release that binds sealed records to their keys, the first
+start rewrites every encrypted record in `orchestrator.db` into the new format
+(logged as `store: bound N legacy sealed records`). Older binaries cannot read
+the new format, so back up `./orch-state` before upgrading; rolling back means
+restoring that backup.
+
 ## Rotate the config-signing key
 
 The config-signing key is held by the signer process and reached through

@@ -173,7 +173,7 @@ func TestUpdateDeviceClientVersionFromTelemetry(t *testing.T) {
 
 func insertDeviceRecord(t *testing.T, st *orchStore, rec deviceRecord) {
 	t.Helper()
-	raw, err := st.sealJSON(rec)
+	raw, err := st.sealJSON(bucketDevices, []byte(rec.ID), rec)
 	if err != nil {
 		t.Fatal(err)
 	}
