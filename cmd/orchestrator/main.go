@@ -8,7 +8,6 @@ import (
 	"net"
 	"net/url"
 	"os"
-	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -138,7 +137,12 @@ func runMain() error {
 	}
 	cfg, err := readConfig()
 	if err != nil {
-		return fmt.Errorf("invalid configuration: %w", err)
+		// Only the server refuses to start; signer and offline recovery
+		// commands must keep working despite, say, a bad ORCH_PUBLIC_URL.
+		if cmd == "serve" {
+			return fmt.Errorf("invalid configuration: %w", err)
+		}
+		log.Printf("warning: invalid configuration: %v", err)
 	}
 	switch cmd {
 	case "serve":
@@ -205,7 +209,7 @@ func readConfig() (orchConfig, error) {
 	cfg := orchConfig{
 		StateDir:                stateDir,
 		Listen:                  getenv("ORCH_LISTEN", ":9091"),
-		SignerSocket:            getenv("ORCH_SIGNER_SOCKET", filepath.Join(stateDir, "signer.sock")),
+		SignerSocket:            getenv("ORCH_SIGNER_SOCKET", "./orch-state/signer.sock"),
 		SignerKeyPath:           os.Getenv("ORCH_SIGNER_KEY_PATH"),
 		SignerLegacyKeyPath:     os.Getenv("ORCH_SIGNER_LEGACY_KEY_PATH"),
 		ClientIPHeader:          os.Getenv("ORCH_CLIENT_IP_HEADER"),
@@ -217,9 +221,9 @@ func readConfig() (orchConfig, error) {
 		DiscoveryNextSinks:      splitCSV(os.Getenv("ORCH_DISCOVERY_NEXT_SINKS")),
 		DiscoveryRescuePointers: splitCSV(os.Getenv("ORCH_DISCOVERY_RESCUE_POINTERS")),
 		SeedAPKPath:             getenv("SEED_APK_PATH", "./seed/app.apk"),
-		SeedVersionCode:         env.int64("SEED_APK_VERSION_CODE", 1, 1),
+		SeedVersionCode:         env.int64("SEED_APK_VERSION_CODE", 1, 0),
 		SeedVersionName:         getenv("SEED_APK_VERSION_NAME", "seed"),
-		APKKeepReleases:         int(env.int64("ORCH_APK_KEEP_RELEASES", 5, 1)),
+		APKKeepReleases:         int(env.int64("ORCH_APK_KEEP_RELEASES", 5, 0)),
 		TLS:                     env.bool("ORCH_TLS", true),
 	}
 	return cfg, errors.Join(env.errs...)

@@ -48,7 +48,7 @@ type discoveryRequestRate struct {
 
 func (s *server) handleDiscoveryEndpointsJSON(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
-		writeError(w, "method not allowed", http.StatusMethodNotAllowed)
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
 	bundle, err := s.signedDiscoverySnapshot()
@@ -68,7 +68,7 @@ func (s *server) handleDiscoveryEndpointsJSON(w http.ResponseWriter, r *http.Req
 	if revision != bundle.Revision {
 		bundle = s.cachedDiscoverySnapshot(revision)
 		if bundle == nil {
-			writeError(w, "discovery revision unavailable", http.StatusServiceUnavailable)
+			http.Error(w, "discovery revision unavailable", http.StatusServiceUnavailable)
 			return
 		}
 	}
@@ -79,7 +79,7 @@ func (s *server) handleDiscoveryEndpointsJSON(w http.ResponseWriter, r *http.Req
 
 func (s *server) handleDiscoveryEndpointsMinisig(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
-		writeError(w, "method not allowed", http.StatusMethodNotAllowed)
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
 	requestedRevision := requestedDiscoveryRevision(r)
@@ -89,14 +89,14 @@ func (s *server) handleDiscoveryEndpointsMinisig(w http.ResponseWriter, r *http.
 		time.Now(),
 	)
 	if !revisionMatches {
-		writeError(w, "discovery revision precondition failed", http.StatusPreconditionFailed)
+		http.Error(w, "discovery revision precondition failed", http.StatusPreconditionFailed)
 		return
 	}
 	var bundle *discoveryBundleSnapshot
 	if revision != "" {
 		bundle = s.cachedDiscoverySnapshot(revision)
 		if bundle == nil {
-			writeError(w, "discovery revision unavailable", http.StatusPreconditionFailed)
+			http.Error(w, "discovery revision unavailable", http.StatusPreconditionFailed)
 			return
 		}
 	}
@@ -124,7 +124,7 @@ func (s *server) handleAdminDiscoveryBump(w http.ResponseWriter, r *http.Request
 
 func writeDiscoveryUnavailable(w http.ResponseWriter, err error) {
 	log.Printf("discovery bundle unavailable: %v", err)
-	writeError(w, "discovery temporarily unavailable", http.StatusServiceUnavailable)
+	http.Error(w, "discovery temporarily unavailable", http.StatusServiceUnavailable)
 }
 
 // discoveryBuildErrorTTL caches a failed build (e.g. a missing update key) so
@@ -417,7 +417,7 @@ func writeDiscoveryRateExceeded(w http.ResponseWriter, retryAfter int) {
 		retryAfter = 1
 	}
 	w.Header().Set("Retry-After", strconv.Itoa(retryAfter))
-	writeError(w, "discovery request rate exceeded", http.StatusTooManyRequests)
+	http.Error(w, "discovery request rate exceeded", http.StatusTooManyRequests)
 }
 
 func (s *server) discoveryPublicKey() string {

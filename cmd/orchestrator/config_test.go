@@ -4,7 +4,6 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
-	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -18,8 +17,8 @@ func TestReadConfigDefaults(t *testing.T) {
 	if !cfg.TLS || cfg.APKKeepReleases != 5 || cfg.SeedVersionCode != 1 {
 		t.Fatalf("defaults: %+v", cfg)
 	}
-	if cfg.SignerSocket != filepath.Join("/var/lib/tw", "signer.sock") {
-		t.Fatalf("signer socket must follow ORCH_STATE_DIR: %s", cfg.SignerSocket)
+	if cfg.SignerSocket != "./orch-state/signer.sock" {
+		t.Fatalf("signer socket default changed: %s", cfg.SignerSocket)
 	}
 }
 

@@ -185,7 +185,7 @@ unset ORCH_NEW_ADMIN_PASSWORD
 | --- | --- | --- | --- | --- |
 | `ORCH_LISTEN` | HTTP(S) listen address. | Опц. | `:9091` | Оставьте default для host-network Compose или задайте `127.0.0.1:9091` за reverse proxy. |
 | `ORCH_STATE_DIR` | Local state directory для bbolt DB, generated keys, APK artifacts и bot/admin secrets. | Опц. | `./orch-state` | В Compose используется `/orch-state`, смонтированный из `./orch-state`. |
-| `ORCH_SIGNER_SOCKET` | Unix socket для config signer sidecar. | Опц. | `$ORCH_STATE_DIR/signer.sock` | В Compose используется `/run/tw-signer/signer.sock` из `./signer-run`. |
+| `ORCH_SIGNER_SOCKET` | Unix socket для config signer sidecar. | Опц. | `./orch-state/signer.sock` | В Compose используется `/run/tw-signer/signer.sock` из `./signer-run`. |
 | `ORCH_SIGNER_KEY_PATH` | Путь к config-signing key для команды `signer`. | Опц. | `$ORCH_STATE_DIR/orch-config.key` | В Compose `/signer-state/orch-config.key` из `./signer-state`; этот каталог монтируется только в signer. |
 | `ORCH_SIGNER_LEGACY_KEY_PATH` | Источник одноразовой миграции: ключ отсюда переносится в `ORCH_SIGNER_KEY_PATH` и удаляется. | Опц. | empty | В Compose `/orch-state/orch-config.key`, чтобы старые установки сохранили закреплённый ключ. |
 | `ORCH_CLIENT_IP_HEADER` | Из какого заголовка proxy брать IP клиента, если peer — loopback: `x-real-ip`, `x-forwarded-for`, `none` или `auto`. | Опц. | `auto` | Укажите заголовок, который перезаписывает ваш reverse proxy; см. Production TLS. |

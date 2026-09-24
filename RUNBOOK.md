@@ -32,6 +32,16 @@ different contents, keep the one whose public key matches deployed configs.
 Containers now run as uid `10001`; the entrypoint re-owns the state
 directories, but a seed APK under `./seed` must be world-readable.
 
+## Stricter configuration parsing
+
+`serve` now refuses to start on malformed environment values and lists them
+all in the log (`invalid configuration: ...`). `ORCH_TLS` accepts
+`1/0`, `true/false`, `yes/no`, `on/off`: previously any value other than `0`
+kept TLS on, so an old `ORCH_TLS=false` now really disables built-in TLS
+(a warning is logged). `ORCH_PUBLIC_URL` must be an absolute http(s) URL.
+Admin API errors are JSON `{"ok":false,"error":"..."}`, missing workers or
+devices answer 404, and a wrong method answers 405 before authentication.
+
 ## Sealed record format upgrade
 
 Starting with the release that binds sealed records to their keys, the first

@@ -187,7 +187,7 @@ provided Compose file:
 | --- | --- | --- | --- | --- |
 | `ORCH_LISTEN` | HTTP(S) listen address. | Optional | `:9091` | Keep the default for host-network Compose, or set `127.0.0.1:9091` behind a reverse proxy. |
 | `ORCH_STATE_DIR` | Local state directory for bbolt DB, generated keys, APK artifacts and bot/admin secrets. | Optional | `./orch-state` | Compose uses `/orch-state` mounted from `./orch-state`. |
-| `ORCH_SIGNER_SOCKET` | Unix socket used by the config signer sidecar. | Optional | `$ORCH_STATE_DIR/signer.sock` | Compose uses `/run/tw-signer/signer.sock` mounted from `./signer-run`. |
+| `ORCH_SIGNER_SOCKET` | Unix socket used by the config signer sidecar. | Optional | `./orch-state/signer.sock` | Compose uses `/run/tw-signer/signer.sock` mounted from `./signer-run`. |
 | `ORCH_SIGNER_KEY_PATH` | Config-signing key path read by the `signer` command. | Optional | `$ORCH_STATE_DIR/orch-config.key` | Compose uses `/signer-state/orch-config.key` from `./signer-state`, which only the signer container mounts. |
 | `ORCH_SIGNER_LEGACY_KEY_PATH` | One-time migration source: a key found here is moved to `ORCH_SIGNER_KEY_PATH` and deleted. | Optional | empty | Compose uses `/orch-state/orch-config.key` so older deployments keep their pinned key. |
 | `ORCH_CLIENT_IP_HEADER` | Which proxy header carries the client IP when the peer is loopback: `x-real-ip`, `x-forwarded-for`, `none`, or `auto`. | Optional | `auto` | Set it to the header your reverse proxy overwrites; see Production TLS. |

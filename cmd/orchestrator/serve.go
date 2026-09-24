@@ -35,6 +35,9 @@ func runServe(cfg orchConfig) error {
 	if err := setClientIPHeaderMode(cfg.ClientIPHeader); err != nil {
 		return err
 	}
+	if !cfg.TLS {
+		log.Printf("WARNING: built-in TLS is disabled (ORCH_TLS=%q); serve plain HTTP only behind a TLS-terminating proxy", os.Getenv("ORCH_TLS"))
+	}
 	if publicURLIsLoopback(cfg.PublicURL) {
 		log.Printf("WARNING: ORCH_PUBLIC_URL=%s is a loopback address; bootstrap payloads will point devices at it. Set it to the orchestrator's reachable URL.", cfg.PublicURL)
 	}
