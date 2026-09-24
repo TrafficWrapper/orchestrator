@@ -115,30 +115,6 @@ func compareClientVersions(a, b string) (cmp int, ok bool) {
 	return 0, true
 }
 
-func minVersionFor(feature string) int {
-	name := strings.ToUpper(strings.TrimSpace(feature))
-	if name == "" {
-		return 0
-	}
-	var b strings.Builder
-	for _, r := range name {
-		if (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') {
-			b.WriteRune(r)
-		} else {
-			b.WriteByte('_')
-		}
-	}
-	value := strings.TrimSpace(os.Getenv("FEATURE_MIN_VERSION_" + b.String()))
-	if value == "" {
-		return 0
-	}
-	parsed, err := strconv.Atoi(value)
-	if err != nil || parsed < 0 {
-		return 0
-	}
-	return parsed
-}
-
 func realityFingerprintDefault() string {
 	if value := strings.TrimSpace(os.Getenv("REALITY_FP_DEFAULT")); value != "" {
 		return clampRealityFingerprint(value)

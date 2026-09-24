@@ -246,12 +246,6 @@ func (s *server) currentAuthApprover() authApprover {
 	return s.authApprover
 }
 
-func (s *server) setAuthApproverForTest(approver authApprover) {
-	s.botMu.Lock()
-	s.authApprover = approver
-	s.botMu.Unlock()
-}
-
 func (s *server) hasBotFactory() bool {
 	s.botMu.Lock()
 	defer s.botMu.Unlock()
@@ -1238,12 +1232,4 @@ func (c *telegramHTTPClient) call(ctx context.Context, method string, payload an
 		return nil
 	}
 	return json.Unmarshal(body, out)
-}
-
-func parseTelegramOwnerID(value string) (int64, error) {
-	id, err := strconv.ParseInt(strings.TrimSpace(value), 10, 64)
-	if err != nil || id <= 0 {
-		return 0, errors.New("owner telegram id must be positive integer")
-	}
-	return id, nil
 }

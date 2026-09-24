@@ -601,14 +601,6 @@ func (s *server) cachedUpdateArtifact(rel apkReleaseRecord) (*updateArtifact, er
 	return update, nil
 }
 
-func (s *server) loadUpdateArtifact() (*updateArtifact, error) {
-	rel, ok, err := s.store.currentAPKRelease()
-	if err != nil || !ok {
-		return nil, err
-	}
-	return readUpdateArtifact(rel)
-}
-
 func readUpdateArtifact(rec apkReleaseRecord) (*updateArtifact, error) {
 	manifestJSON, err := os.ReadFile(rec.ManifestPath)
 	if err != nil {

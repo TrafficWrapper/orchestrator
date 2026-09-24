@@ -174,10 +174,6 @@ func (s *server) storeClientBundle(key string, issued time.Time, signed signedCo
 	s.clientBundleCache[key] = clientBundleCacheEntry{signed: signed, issued: issued}
 }
 
-func clientWorkerPayload(rec workerRecord) (map[string]any, bool) {
-	return clientWorkerPayloadForClient(rec, "")
-}
-
 func clientWorkerPayloadForClient(rec workerRecord, clientVersion string) (map[string]any, bool) {
 	expected := workerEgressIP(rec)
 	configURL := stringFromMap(rec.SelfDescribe, "distributor_url")
@@ -281,10 +277,6 @@ func clientRoutePayloadForClient(routeType string, raw any, expected, configURL,
 	return route, true
 }
 
-func canonicalClientRouteParams(routeType string, params map[string]any) map[string]any {
-	return canonicalClientRouteParamsForClient(routeType, params, "")
-}
-
 func canonicalClientRouteParamsForClient(routeType string, params map[string]any, clientVersion string) map[string]any {
 	out := cloneMap(params)
 	switch normalizeProtocolName(routeType) {
@@ -361,14 +353,6 @@ func approvedDevicePayloads(devices []deviceRecord) []any {
 		out = append(out, payload)
 	}
 	return out
-}
-
-func workerAWGSubnet(workers []workerRecord) string {
-	return baseAWGSubnet(workerAWGProfiles(workers))
-}
-
-func workerAWGPublicKey(workers []workerRecord) string {
-	return workerAWGPublicKeyFromProfiles(workerAWGProfiles(workers))
 }
 
 func workerAWGPublicKeyFromProfiles(profiles []awgProfile) string {

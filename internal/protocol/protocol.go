@@ -5,12 +5,9 @@ import (
 	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/base64"
-	"encoding/binary"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"strconv"
 	"strings"
 
@@ -19,9 +16,8 @@ import (
 )
 
 const (
-	Prologue     = "TrafficWrapper orchestrator worker v1"
-	MaxFrameSize = 1 << 20
-	KeySize      = 32
+	Prologue = "TrafficWrapper orchestrator worker v1"
+	KeySize  = 32
 )
 
 type KeyPairFile struct {
@@ -66,41 +62,6 @@ func DecodeKeyBase64(value string) ([]byte, error) {
 		return nil, fmt.Errorf("expected %d bytes, got %d", KeySize, len(raw))
 	}
 	return raw, nil
-}
-
-func Base64KeyToHex(value string) (string, error) {
-	raw, err := DecodeKeyBase64(value)
-	if err != nil {
-		return "", err
-	}
-	return hex.EncodeToString(raw), nil
-}
-
-func WriteFrame(w io.Writer, payload []byte) error {
-	if len(payload) > MaxFrameSize {
-		return fmt.Errorf("frame too large: %d", len(payload))
-	}
-	var header [4]byte
-	binary.BigEndian.PutUint32(header[:], uint32(len(payload)))
-	if _, err := w.Write(header[:]); err != nil {
-		return err
-	}
-	_, err := w.Write(payload)
-	return err
-}
-
-func ReadFrame(r io.Reader) ([]byte, error) {
-	var header [4]byte
-	if _, err := io.ReadFull(r, header[:]); err != nil {
-		return nil, err
-	}
-	size := binary.BigEndian.Uint32(header[:])
-	if size > MaxFrameSize {
-		return nil, fmt.Errorf("frame too large: %d", size)
-	}
-	payload := make([]byte, size)
-	_, err := io.ReadFull(r, payload)
-	return payload, err
 }
 
 func EncryptJSON(cipher *noise.CipherState, value any) ([]byte, error) {

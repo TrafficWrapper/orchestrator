@@ -52,24 +52,6 @@ func (s *server) adminLoginLimiter() *loginLimiter {
 	return s.loginLimiter
 }
 
-func (l *loginLimiter) isLocked(key string) (time.Time, bool) {
-	if l == nil || strings.TrimSpace(key) == "" {
-		return time.Time{}, false
-	}
-	keys := loginLimiterKeys(key)
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	now := l.clock()
-	l.pruneLocked(now)
-	var until time.Time
-	for _, k := range keys {
-		if state := l.states[k.key]; state.isLocked(now) && state.LockedUntil.After(until) {
-			until = state.LockedUntil
-		}
-	}
-	return until, !until.IsZero()
-}
-
 type loginLimiterKey struct {
 	key   string
 	limit int
@@ -127,11 +109,6 @@ func (l *loginLimiter) reserveAttempt(key string) loginAttemptReservation {
 		}
 	}
 	return loginAttemptReservation{Allowed: true}
-}
-
-func (l *loginLimiter) recordFailure(key string) (time.Time, bool) {
-	reservation := l.reserveAttempt(key)
-	return reservation.LockedUntil, reservation.Locked || reservation.LockedAfterAttempt
 }
 
 func (l *loginLimiter) recordSuccess(key string) {
