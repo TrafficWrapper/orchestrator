@@ -68,6 +68,8 @@ type server struct {
 	adminSessions       sync.Map
 	botMu               sync.Mutex
 	apkPublishMu        sync.Mutex
+	clientBundleMu      sync.Mutex
+	clientBundleCache   map[string]clientBundleCacheEntry
 	updateKeyMu         sync.Mutex
 	updateKeyCache      *updateKeyCacheEntry
 	signerPubMu         sync.Mutex

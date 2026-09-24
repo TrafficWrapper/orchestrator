@@ -1,6 +1,8 @@
 package main
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"strconv"
@@ -103,6 +105,16 @@ func (s *server) buildClientBundleForClient(minSeq int64, clientVersion string) 
 	if len(s.cfg.DNSServers) > 0 {
 		clientPayload["dns_servers"] = append([]string(nil), s.cfg.DNSServers...)
 	}
+	// After a seq bump every worker builds this same bundle. Reuse a recently
+	// signed one when everything but the timestamps is identical, skipping
+	// the forbidden-key re-parse and the signer round trip.
+	contentKey, err := clientBundleContentKey(clientPayload)
+	if err != nil {
+		return signedConfig{}, err
+	}
+	if cached, ok := s.cachedClientBundle(contentKey, issued); ok {
+		return cached, nil
+	}
 	clientJSON, err := canonicalJSON(clientPayload)
 	if err != nil {
 		return signedConfig{}, err
@@ -110,7 +122,56 @@ func (s *server) buildClientBundleForClient(minSeq int64, clientVersion string) 
 	if err := rejectForbiddenKeys([]byte(clientJSON)); err != nil {
 		return signedConfig{}, err
 	}
-	return s.signer.sign(clientJSON)
+	signed, err := s.signer.sign(clientJSON)
+	if err != nil {
+		return signedConfig{}, err
+	}
+	s.storeClientBundle(contentKey, issued, signed)
+	return signed, nil
+}
+
+// clientBundleReuseTTL bounds how stale issued_at may be on a reused bundle
+// (expires_at is 24h after it).
+const clientBundleReuseTTL = time.Minute
+
+type clientBundleCacheEntry struct {
+	signed signedConfig
+	issued time.Time
+}
+
+func clientBundleContentKey(payload map[string]any) (string, error) {
+	content := make(map[string]any, len(payload))
+	for k, v := range payload {
+		if k != "issued_at" && k != "expires_at" {
+			content[k] = v
+		}
+	}
+	raw, err := canonicalJSON(content)
+	if err != nil {
+		return "", err
+	}
+	sum := sha256.Sum256([]byte(raw))
+	return hex.EncodeToString(sum[:]), nil
+}
+
+func (s *server) cachedClientBundle(key string, now time.Time) (signedConfig, bool) {
+	s.clientBundleMu.Lock()
+	defer s.clientBundleMu.Unlock()
+	entry, ok := s.clientBundleCache[key]
+	if !ok || now.Sub(entry.issued) >= clientBundleReuseTTL || now.Before(entry.issued) {
+		return signedConfig{}, false
+	}
+	return entry.signed, true
+}
+
+func (s *server) storeClientBundle(key string, issued time.Time, signed signedConfig) {
+	s.clientBundleMu.Lock()
+	defer s.clientBundleMu.Unlock()
+	// Keys differ per client-version gate and worker set; keep it small.
+	if s.clientBundleCache == nil || len(s.clientBundleCache) >= 16 {
+		s.clientBundleCache = map[string]clientBundleCacheEntry{}
+	}
+	s.clientBundleCache[key] = clientBundleCacheEntry{signed: signed, issued: issued}
 }
 
 func clientWorkerPayload(rec workerRecord) (map[string]any, bool) {
