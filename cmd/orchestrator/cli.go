@@ -387,7 +387,11 @@ var errAdminServerUnreachable = errors.New("orchestrator admin API unreachable")
 // (state/tls.crt, pinned by exact bytes) and otherwise performs normal
 // verification, instead of skipping verification while sending a bearer
 // token to whatever ORCH_ADMIN_URL points at.
-func adminTLSConfig(cfg orchConfig) *tls.Config {
+// adminTLSRoots overrides the system roots for admin API verification
+// (tests only; nil means the system pool).
+var adminTLSRoots *x509.CertPool
+
+func adminTLSConfig(cfg orchConfig, host string) *tls.Config {
 	pinned, _ := os.ReadFile(filepath.Join(cfg.StateDir, "tls.crt"))
 	var pinnedDER []byte
 	if block, _ := pem.Decode(pinned); block != nil {
@@ -410,7 +414,12 @@ func adminTLSConfig(cfg orchConfig) *tls.Config {
 			for _, c := range cs.PeerCertificates[1:] {
 				intermediates.AddCert(c)
 			}
-			_, err := leaf.Verify(x509.VerifyOptions{DNSName: cs.ServerName, Intermediates: intermediates})
+			// Verify against the host we dialed: for an IP host no SNI is sent,
+			// so cs.ServerName is empty and would skip the name check.
+			if strings.TrimSpace(host) == "" {
+				return errors.New("admin URL has no host to verify")
+			}
+			_, err := leaf.Verify(x509.VerifyOptions{DNSName: host, Intermediates: intermediates, Roots: adminTLSRoots})
 			return err
 		},
 	}
@@ -418,12 +427,12 @@ func adminTLSConfig(cfg orchConfig) *tls.Config {
 
 func adminRequest(cfg orchConfig, method, path string, body io.Reader, out io.Writer) error {
 	tr := http.DefaultTransport.(*http.Transport).Clone()
-	tr.TLSClientConfig = adminTLSConfig(cfg)
-	client := http.Client{Transport: tr, Timeout: 15 * time.Second}
 	req, err := http.NewRequest(method, adminBaseURL(cfg)+path, body)
 	if err != nil {
 		return err
 	}
+	tr.TLSClientConfig = adminTLSConfig(cfg, req.URL.Hostname())
+	client := http.Client{Transport: tr, Timeout: 15 * time.Second}
 	if body != nil {
 		req.Header.Set("content-type", "application/json")
 	}

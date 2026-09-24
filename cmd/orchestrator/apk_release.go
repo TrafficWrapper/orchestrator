@@ -525,8 +525,11 @@ const (
 	// one is JSON-encoded, encrypted and base64-encoded again (several times
 	// the APK size in memory), and a release sends every worker to pull.
 	maxConcurrentAPKShipments = 2
-	apkShipmentWait           = 30 * time.Second
 )
+
+// apkShipmentWait is how long a pull waits for a free APK shipment slot (a
+// var so tests can shorten it).
+var apkShipmentWait = 30 * time.Second
 
 // updateArtifactForPull returns the APK update only when the worker has not
 // yet acknowledged the current release (or reports no applied state), so
@@ -544,7 +547,17 @@ func (s *server) updateArtifactForPull(worker workerRecord, haveSeq int64) (*upd
 	}
 	release, acquired := s.acquireAPKShipment(apkShipmentWait)
 	if !acquired {
-		log.Printf("apk shipment slots busy; worker %s pulls without update this time", worker.ID)
+		// The worker would otherwise stay on the old APK until an unrelated
+		// seq bump: bump its own seq so its next nudge pulls again.
+		log.Printf("apk shipment slots busy; worker %s will retry the update", worker.ID)
+		if err := s.store.updateWorker(worker.ID, func(rec *workerRecord) error {
+			if rec.DesiredSeq <= worker.DesiredSeq {
+				rec.DesiredSeq = worker.DesiredSeq + 1
+			}
+			return nil
+		}); err != nil {
+			return nil, nil, err
+		}
 		return nil, nil, nil
 	}
 	update, err := s.cachedUpdateArtifact(rel)

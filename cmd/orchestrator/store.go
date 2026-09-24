@@ -892,6 +892,12 @@ func (s *orchStore) tokenLookup(secret string) string {
 // scanned on each enroll attempt, so dead ones must not pile up forever.
 const tokenRetentionAfterUse = 7 * 24 * time.Hour
 
+func tokenDead(rec tokenRecord, now time.Time) bool {
+	expiredLongAgo := now.Sub(rec.ExpiresAt) > tokenRetentionAfterUse
+	exhaustedLongAgo := rec.MaxUses > 0 && rec.Uses >= rec.MaxUses && now.Sub(rec.CreatedAt) > tokenRetentionAfterUse
+	return expiredLongAgo || exhaustedLongAgo
+}
+
 func (s *orchStore) pruneDeadTokens(now time.Time) (int, error) {
 	var dead [][]byte
 	// Scan read-only: the janitor runs every 30s and an empty write
@@ -902,9 +908,7 @@ func (s *orchStore) pruneDeadTokens(now time.Time) (int, error) {
 			if err := json.Unmarshal(v, &rec); err != nil {
 				return nil
 			}
-			expiredLongAgo := now.Sub(rec.ExpiresAt) > tokenRetentionAfterUse
-			exhaustedLongAgo := rec.MaxUses > 0 && rec.Uses >= rec.MaxUses && now.Sub(rec.CreatedAt) > tokenRetentionAfterUse
-			if expiredLongAgo || exhaustedLongAgo {
+			if tokenDead(rec, now) {
 				dead = append(dead, append([]byte(nil), k...))
 			}
 			return nil
@@ -912,16 +916,24 @@ func (s *orchStore) pruneDeadTokens(now time.Time) (int, error) {
 	}); err != nil || len(dead) == 0 {
 		return 0, err
 	}
+	removed := 0
 	err := s.db.Update(func(tx *bolt.Tx) error {
 		b := tx.Bucket(bucketTokens)
+		removed = 0
 		for _, k := range dead {
+			// Re-check: the id may have been re-created since the scan.
+			var rec tokenRecord
+			if raw := b.Get(k); raw == nil || json.Unmarshal(raw, &rec) != nil || !tokenDead(rec, now) {
+				continue
+			}
+			removed++
 			if err := b.Delete(k); err != nil {
 				return err
 			}
 		}
 		return nil
 	})
-	return len(dead), err
+	return removed, err
 }
 
 func tokenRecordConsumable(rec tokenRecord, now time.Time, workerStaticPub string) bool {
