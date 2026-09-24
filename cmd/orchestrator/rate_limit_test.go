@@ -76,7 +76,8 @@ func TestLoginLimiterStateMapCapsDistinctIPs(t *testing.T) {
 	limiter := newLoginLimiter()
 	limiter.now = func() time.Time { return now }
 	for i := 0; i < maxLoginLimiterStates+128; i++ {
-		limiter.recordFailure(fmt.Sprintf("2001:db8:%x:%x::1", i/0x10000, i%0x10000))
+		// Distinct /48 networks so the per-network cap does not stop growth.
+		limiter.recordFailure(fmt.Sprintf("2001:%x:%x::1", i/0x10000+1, i%0x10000))
 	}
 	limiter.mu.Lock()
 	got := len(limiter.states)
@@ -223,5 +224,33 @@ func TestPendingHandshakesCappedPerNetwork(t *testing.T) {
 	s.releasePendingHandshake("198.51.100.7")
 	if !reserve("198.51.100.7") {
 		t.Fatal("released slot must be reusable")
+	}
+}
+
+func TestLoginLimiterLocksWholeNetworkAfterRotation(t *testing.T) {
+	now := time.Date(2026, 7, 8, 10, 0, 0, 0, time.UTC)
+	limiter := newLoginLimiter()
+	limiter.now = func() time.Time { return now }
+	for i := 0; i < adminLoginPrefixFailureLimit; i++ {
+		// A fresh /64 each time: the per-address limit never trips.
+		limiter.recordFailure(fmt.Sprintf("2001:db8:1:%x::1", i))
+	}
+	if _, locked := limiter.isLocked("2001:db8:1:ffff::1"); !locked {
+		t.Fatal("rotating /64s inside one /48 must lock the /48")
+	}
+	if _, locked := limiter.isLocked("2001:db8:2::1"); locked {
+		t.Fatal("a different /48 must not be locked")
+	}
+}
+
+func TestLoginLimiterEvictionPrefersUnlockedEntries(t *testing.T) {
+	now := time.Now()
+	states := map[string]*loginLimitState{
+		"locked":   {Failures: 5, WindowStart: now, LockedUntil: now.Add(time.Hour)},
+		"unlocked": {Failures: 1, WindowStart: now},
+	}
+	evictOneLoginLimitStateLocked(states, now)
+	if _, ok := states["locked"]; !ok {
+		t.Fatal("eviction removed an active lockout while an unlocked entry existed")
 	}
 }

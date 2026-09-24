@@ -13,6 +13,10 @@ const (
 	adminLoginWindow       = 15 * time.Minute
 	adminLoginPruneEvery   = time.Second
 	maxLoginLimiterStates  = 64 * 1024
+	// adminLoginPrefixFailureLimit caps failures across a whole IPv4 /24 or
+	// IPv6 /48, so rotating addresses inside one network does not multiply
+	// the per-address budget.
+	adminLoginPrefixFailureLimit = 25
 )
 
 type loginLimiter struct {
@@ -52,44 +56,73 @@ func (l *loginLimiter) isLocked(key string) (time.Time, bool) {
 	if l == nil || strings.TrimSpace(key) == "" {
 		return time.Time{}, false
 	}
-	key = rateLimitKey(key)
+	keys := loginLimiterKeys(key)
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	now := l.clock()
 	l.pruneLocked(now)
-	state := l.states[key]
-	if state == nil || state.LockedUntil.IsZero() || !now.Before(state.LockedUntil) {
-		return time.Time{}, false
+	var until time.Time
+	for _, k := range keys {
+		if state := l.states[k.key]; state.isLocked(now) && state.LockedUntil.After(until) {
+			until = state.LockedUntil
+		}
 	}
-	return state.LockedUntil, true
+	return until, !until.IsZero()
+}
+
+type loginLimiterKey struct {
+	key   string
+	limit int
+}
+
+// loginLimiterKeys charges an attempt to the address (IPv4 or IPv6 /64) and
+// to its wider network (IPv4 /24, IPv6 /48).
+func loginLimiterKeys(ip string) []loginLimiterKey {
+	return []loginLimiterKey{
+		{key: rateLimitKey(ip), limit: adminLoginFailureLimit},
+		{key: pendingPrefixKey(ip), limit: adminLoginPrefixFailureLimit},
+	}
 }
 
 func (l *loginLimiter) reserveAttempt(key string) loginAttemptReservation {
 	if l == nil || strings.TrimSpace(key) == "" {
 		return loginAttemptReservation{Allowed: true}
 	}
-	key = rateLimitKey(key)
+	keys := loginLimiterKeys(key)
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	now := l.clock()
 	l.pruneLocked(now)
-	state := l.states[key]
-	if state != nil && state.isLocked(now) {
-		return loginAttemptReservation{Locked: true, LockedUntil: state.LockedUntil}
-	}
-	if state == nil || state.WindowStart.IsZero() || now.Sub(state.WindowStart) > adminLoginWindow {
-		if state == nil && len(l.states) >= maxLoginLimiterStates {
-			evictOneLoginLimitStateLocked(l.states)
+	var lockedUntil time.Time
+	for _, k := range keys {
+		if state := l.states[k.key]; state.isLocked(now) && state.LockedUntil.After(lockedUntil) {
+			lockedUntil = state.LockedUntil
 		}
-		state = &loginLimitState{WindowStart: now}
-		l.states[key] = state
 	}
-	state.Failures++
-	if state.Failures >= adminLoginFailureLimit {
-		state.LockedUntil = now.Add(adminLoginLockoutTTL)
+	if !lockedUntil.IsZero() {
+		return loginAttemptReservation{Locked: true, LockedUntil: lockedUntil}
+	}
+	for _, k := range keys {
+		state := l.states[k.key]
+		if state == nil || state.WindowStart.IsZero() || now.Sub(state.WindowStart) > adminLoginWindow {
+			if state == nil && len(l.states) >= maxLoginLimiterStates {
+				evictOneLoginLimitStateLocked(l.states, now)
+			}
+			state = &loginLimitState{WindowStart: now}
+			l.states[k.key] = state
+		}
+		state.Failures++
+		if state.Failures >= k.limit {
+			state.LockedUntil = now.Add(adminLoginLockoutTTL)
+			if state.LockedUntil.After(lockedUntil) {
+				lockedUntil = state.LockedUntil
+			}
+		}
+	}
+	if !lockedUntil.IsZero() {
 		return loginAttemptReservation{
 			Allowed:            true,
-			LockedUntil:        state.LockedUntil,
+			LockedUntil:        lockedUntil,
 			LockedAfterAttempt: true,
 		}
 	}
@@ -148,10 +181,25 @@ func (s *loginLimitState) expired(now time.Time) bool {
 	return !s.WindowStart.IsZero() && now.Sub(s.WindowStart) > 2*adminLoginWindow
 }
 
-func evictOneLoginLimitStateLocked(states map[string]*loginLimitState) {
-	for key := range states {
-		delete(states, key)
-		return
+// evictOneLoginLimitStateLocked frees a slot, preferring an entry that is
+// not currently locked so a flood of new addresses cannot erase lockouts.
+func evictOneLoginLimitStateLocked(states map[string]*loginLimitState, now time.Time) {
+	fallback := ""
+	checked := 0
+	for key, state := range states {
+		if !state.isLocked(now) {
+			delete(states, key)
+			return
+		}
+		if fallback == "" {
+			fallback = key
+		}
+		if checked++; checked >= 64 {
+			break
+		}
+	}
+	if fallback != "" {
+		delete(states, fallback)
 	}
 }
 
