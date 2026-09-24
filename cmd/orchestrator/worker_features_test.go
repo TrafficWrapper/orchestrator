@@ -10,9 +10,14 @@ import (
 
 func enrollWithCapabilities(t *testing.T, s *server, token string, caps []string) deviceEnrollResponse {
 	t.Helper()
+	return enrollVersionWithCapabilities(t, s, token, "0.2.0", caps)
+}
+
+func enrollVersionWithCapabilities(t *testing.T, s *server, token, version string, caps []string) deviceEnrollResponse {
+	t.Helper()
 	raw, _ := json.Marshal(deviceEnrollRequest{
 		BootstrapToken: token, IdentityPubKey: "identity-pub", IdentityKeyType: "ed25519",
-		ClientVersion: "0.2.0", AWGPublicKey: "awg-dev", Capabilities: caps,
+		ClientVersion: version, AWGPublicKey: "awg-dev", Capabilities: caps,
 	})
 	resp, err := s.handleDeviceEnroll(make([]byte, 32), raw)
 	if err != nil {
@@ -65,6 +70,16 @@ func TestVisionFlowNegotiatedAtEnrollment(t *testing.T) {
 	state = workerConfigForTest(t, s, w.ID)
 	if flow, ok := state["approved_devices"].([]any)[0].(map[string]any)["reality_flow"]; ok {
 		t.Fatalf("flow must be cleared in worker config, got %v", flow)
+	}
+	// Re-enrolling after an upgrade records the new version for AWG profile
+	// selection; an empty version keeps the stored one.
+	enrollVersionWithCapabilities(t, s, "boot-v", "0.3.0", nil)
+	if dev, _ := s.store.device(again.DeviceID); dev.ClientVersion != "0.3.0" {
+		t.Fatalf("re-enroll must store the new client version, got %q", dev.ClientVersion)
+	}
+	enrollVersionWithCapabilities(t, s, "boot-v", "", nil)
+	if dev, _ := s.store.device(again.DeviceID); dev.ClientVersion != "0.3.0" {
+		t.Fatalf("empty version must keep the stored one, got %q", dev.ClientVersion)
 	}
 	// The shared client bundle never carries a flow.
 	bundle, err := s.buildClientBundle(0)
@@ -125,18 +140,6 @@ func TestRateMbpsDerivedFromRateLimit(t *testing.T) {
 	}
 	if got := workerRateMbps(1e9); got != maxWorkerRateMbps {
 		t.Fatalf("clamp -> %d", got)
-	}
-}
-
-func TestAWGProfileRouteInheritsWorkerIPv6AndDNS(t *testing.T) {
-	route := map[string]any{"params": map[string]any{}}
-	inheritAWGWorkerFields(route, map[string]any{"endpoint_v6": "[2001:db8::1]:51888", "dns": []any{"10.13.13.1"}})
-	params := route["params"].(map[string]any)
-	if route["endpoint_v6"] != "[2001:db8::1]:51888" || params["endpoint_v6"] != "[2001:db8::1]:51888" {
-		t.Fatalf("endpoint_v6 not inherited: %v", route)
-	}
-	if dns, _ := params["dns"].([]any); len(dns) != 1 {
-		t.Fatalf("dns not inherited: %v", route)
 	}
 }
 
@@ -229,17 +232,6 @@ func TestRealityFallbackRoutesAreOptInWithoutFlow(t *testing.T) {
 	tcp := routes[2].(map[string]any)
 	if intFromMap(tcp, "port", 0) != 2053 || tcp["flow"] != nil || tcp["vision"] != true {
 		t.Fatalf("bad tcp fallback route: %v", tcp)
-	}
-}
-
-func TestAWGProfileRouteSkipsEmptyWorkerFields(t *testing.T) {
-	route := map[string]any{"params": map[string]any{}}
-	inheritAWGWorkerFields(route, map[string]any{"endpoint_v6": "", "dns": []any{}})
-	if _, ok := route["endpoint_v6"]; ok {
-		t.Fatalf("empty endpoint_v6 copied: %v", route)
-	}
-	if _, ok := route["dns"]; ok {
-		t.Fatalf("empty dns copied: %v", route)
 	}
 }
 

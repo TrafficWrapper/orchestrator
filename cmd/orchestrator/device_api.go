@@ -120,13 +120,19 @@ func (s *server) handleDeviceEnroll(peer []byte, raw []byte) (any, error) {
 		if err != nil {
 			return nil, err
 		}
-		// Re-enrollment re-negotiates Vision: an upgraded app turns it on, a
-		// reinstalled older app (no capabilities) turns it back off.
+		// Re-enrollment after an app upgrade or downgrade re-negotiates Vision
+		// and records the new version, so the returned bundle picks the AWG
+		// profile for the version actually installed.
 		caps := req.capabilities()
-		if flow := deviceRealityFlow(caps); flow != existing.RealityFlow || !slices.Equal(caps, existing.ClientCapabilities) {
+		version := strings.TrimSpace(req.ClientVersion)
+		if version == "" {
+			version = existing.ClientVersion
+		}
+		if flow := deviceRealityFlow(caps); flow != existing.RealityFlow || !slices.Equal(caps, existing.ClientCapabilities) || version != existing.ClientVersion {
 			existing, err = s.store.updateDevice(existing.ID, flow != existing.RealityFlow, func(rec *deviceRecord) error {
 				rec.RealityFlow = flow
 				rec.ClientCapabilities = caps
+				rec.ClientVersion = version
 				return nil
 			})
 			if err != nil {
