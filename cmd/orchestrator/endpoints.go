@@ -3,6 +3,7 @@ package main
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"log"
 	"net/http"
 	"net/netip"
@@ -201,17 +202,17 @@ func (s *server) signedDiscoverySnapshot() (*discoveryBundleSnapshot, error) {
 }
 
 func (s *server) buildDiscoverySnapshot(now time.Time, revision uint64) (*discoveryBundleSnapshot, error) {
-	priv, pubText, err := s.loadServerUpdateSigningKey()
+	jsonText, err := s.discoveryBundleJSON(now)
 	if err != nil {
 		return nil, err
 	}
-	jsonText, err := s.discoveryBundleJSON(now)
+	minisig, pubText, err := s.signDiscoveryFeed(jsonText)
 	if err != nil {
 		return nil, err
 	}
 	return &discoveryBundleSnapshot{
 		JSON:           jsonText,
-		Minisig:        string(minisign.Sign(priv, []byte(jsonText))),
+		Minisig:        minisig,
 		PublicKey:      pubText,
 		Revision:       discoveryHash(jsonText),
 		GeneratedAt:    now,
@@ -430,12 +431,43 @@ func writeDiscoveryRateExceeded(w http.ResponseWriter, retryAfter int) {
 	http.Error(w, "discovery request rate exceeded", http.StatusTooManyRequests)
 }
 
+// discoveryPublicKey is announced in the client bundle as discovery_pubkey.
+// It is the signer's discovery key with ORCH_DISCOVERY_SIGNER=1 (ORC-L20),
+// else the update key as before; switching changes the client bundle and
+// the feed together.
 func (s *server) discoveryPublicKey() string {
+	if s.cfg.DiscoverySigner {
+		ds, ok := s.signer.(discoverySigner)
+		if !ok {
+			return ""
+		}
+		pub, err := ds.discoveryPublicKey()
+		if err != nil {
+			return ""
+		}
+		return strings.TrimSpace(pub)
+	}
 	_, pubText, err := s.loadServerUpdateSigningKey()
 	if err != nil {
 		return ""
 	}
 	return strings.TrimSpace(pubText)
+}
+
+// signDiscoveryFeed signs the feed with the key discoveryPublicKey announces.
+func (s *server) signDiscoveryFeed(jsonText string) (string, string, error) {
+	if s.cfg.DiscoverySigner {
+		ds, ok := s.signer.(discoverySigner)
+		if !ok {
+			return "", "", errors.New("signer has no discovery key")
+		}
+		return ds.signDiscovery(jsonText)
+	}
+	priv, pubText, err := s.loadServerUpdateSigningKey()
+	if err != nil {
+		return "", "", err
+	}
+	return string(minisign.Sign(priv, []byte(jsonText))), pubText, nil
 }
 
 func (s *server) discoveryBundleJSON(now time.Time) (string, error) {
