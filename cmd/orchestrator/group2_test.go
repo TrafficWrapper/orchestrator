@@ -35,12 +35,12 @@ func TestHeartbeatSkipsRedundantWrites(t *testing.T) {
 	if after := lastTxID(t, s); after != before {
 		t.Fatalf("unchanged heartbeat wrote to the DB (tx %d -> %d)", before, after)
 	}
-	changed := map[string]any{"label": "renamed"}
+	changed := map[string]any{"hostname": "renamed"}
 	if err := s.store.updateWorkerHeartbeat(w.ID, rec.DesiredSeq, changed); err != nil {
 		t.Fatal(err)
 	}
 	got, _ := s.store.worker(w.ID)
-	if got.SelfDescribe["label"] != "renamed" {
+	if got.SelfDescribe["hostname"] != "renamed" {
 		t.Fatal("heartbeat with a new self-description must be stored")
 	}
 }

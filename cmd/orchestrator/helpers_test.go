@@ -53,13 +53,13 @@ func addApprovedWorkerWithStatic(t *testing.T, s *server, staticPub string) work
 		"reality": map[string]any{
 			"address":   "203.0.113.5",
 			"port":      8444,
-			"publicKey": "pub",
+			"publicKey": testRealityPublicKey,
 			"shortId":   "sid",
 		},
 		"awg": map[string]any{
 			"endpoint":   "203.0.113.5:51888",
 			"port":       51888,
-			"public_key": "awgpub",
+			"public_key": testAWGPublicKey,
 			"subnet":     "10.13.13.0/24",
 		},
 	})
@@ -547,3 +547,10 @@ func sha256HexBytes(raw []byte) string {
 	sum := sha256.Sum256(raw)
 	return hex.EncodeToString(sum[:])
 }
+
+// Well-formed keys for worker fixtures (32 zero bytes), so self_describe
+// validation stays quiet in tests that are not about it.
+const (
+	testRealityPublicKey = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+	testAWGPublicKey     = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+)

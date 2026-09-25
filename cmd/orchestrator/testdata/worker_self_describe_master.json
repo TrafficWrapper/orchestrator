@@ -1,0 +1,219 @@
+{
+ "agent_url": "http://127.0.0.1:9090",
+ "awg": {
+  "address": "203.0.113.10",
+  "dialect": {
+   "h1": "1234567",
+   "h2": "2345678",
+   "h3": "3456789",
+   "h4": "4567890",
+   "jc": 7,
+   "jmax": 72,
+   "jmin": 8,
+   "s1": 15,
+   "s2": 42,
+   "s3": 0,
+   "s4": 0
+  },
+  "dialect_id": "d-7f3a",
+  "dns": [
+   "10.13.13.1"
+  ],
+  "endpoint": "203.0.113.10:51888",
+  "endpoint_v6": "[2001:db8::10]:51888",
+  "gateway": "10.13.13.1",
+  "interface": "awg0",
+  "listen_port": 51888,
+  "min_version_code": 0,
+  "name": "awg",
+  "port": 51888,
+  "profile": "awg",
+  "public_key": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+  "server_public": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+  "server_public_key": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+  "smoke_peer_config": "/worker-state/smoke/awg-peer.conf",
+  "subnet": "10.13.13.0/24"
+ },
+ "awg_profiles": [
+  {
+   "address": "203.0.113.10",
+   "dialect": {
+    "h1": "1234567",
+    "h2": "2345678",
+    "h3": "3456789",
+    "h4": "4567890",
+    "jc": 7,
+    "jmax": 72,
+    "jmin": 8,
+    "s1": 15,
+    "s2": 42,
+    "s3": 0,
+    "s4": 0
+   },
+   "dialect_id": "d-7f3a",
+   "dns": [
+    "10.13.13.1"
+   ],
+   "endpoint": "203.0.113.10:51888",
+   "endpoint_v6": "[2001:db8::10]:51888",
+   "gateway": "10.13.13.1",
+   "interface": "awg0",
+   "listen_port": 51888,
+   "min_version_code": 0,
+   "name": "awg",
+   "port": 51888,
+   "profile": "awg",
+   "public_key": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+   "server_public": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+   "server_public_key": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+   "smoke_peer_config": "/worker-state/smoke/awg-peer.conf",
+   "subnet": "10.13.13.0/24"
+  },
+  {
+   "address": "203.0.113.10",
+   "dialect": {
+    "h1": "1234567",
+    "h2": "2345678",
+    "h3": "3456789",
+    "h4": "4567890",
+    "jc": 7,
+    "jmax": 72,
+    "jmin": 8,
+    "s1": 15,
+    "s2": 42,
+    "s3": 0,
+    "s4": 0
+   },
+   "dialect_id": "d-7f3a",
+   "dns": [],
+   "endpoint": "203.0.113.10:51999",
+   "endpoint_v6": "[2001:db8::10]:51999",
+   "gateway": "10.14.14.1",
+   "interface": "awg1",
+   "listen_port": 51999,
+   "min_version_code": 131,
+   "name": "awg2",
+   "port": 51999,
+   "profile": "awg2",
+   "public_key": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+   "server_public": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+   "server_public_key": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+   "smoke_peer_config": "/worker-state/smoke/awg-peer.conf",
+   "subnet": "10.14.14.0/24"
+  }
+ ],
+ "capacity": 500,
+ "dialect_id": "d-7f3a",
+ "distributed_apk": {
+  "apk_name": "trafficwrapper-0.1.31.apk",
+  "apk_sha256": "abababababababababababababababababababababababababababababababab",
+  "version_code": 131,
+  "version_name": "0.1.31"
+ },
+ "distributor_url": "http://awg-gw:8080/tw",
+ "egress_ip": "203.0.113.10",
+ "health": {
+  "camouflage": {
+   "cert_matches": true,
+   "checked_at": "2026-09-25T10:00:00Z",
+   "h2": true,
+   "ok": true,
+   "rtt_ms": 41,
+   "target": "www.example.com:443",
+   "tls13": true,
+   "x25519": true
+  },
+  "reality": {
+   "cert_matches": true,
+   "checked_at": "2026-09-25T10:00:00Z",
+   "h2": false,
+   "ok": true,
+   "rtt_ms": 3,
+   "target": "127.0.0.1:443",
+   "tls13": true,
+   "x25519": true
+  }
+ },
+ "hostname": "worker-a",
+ "orch_url": "https://orch.example.net:9091",
+ "orchestrator": {
+  "max_seen_seq": 0,
+  "noise_xk_ready": true,
+  "nudge_ack_ready": true,
+  "pull_ready": true
+ },
+ "protocols": [
+  "REALITY",
+  "AWG"
+ ],
+ "reality": {
+  "address": "203.0.113.10",
+  "cohort_short_ids": [
+   "0000000000000000",
+   "0000000000000001",
+   "0000000000000002",
+   "0000000000000003",
+   "0000000000000004",
+   "0000000000000005",
+   "0000000000000006",
+   "0000000000000007",
+   "0000000000000008",
+   "0000000000000009",
+   "000000000000000a",
+   "000000000000000b",
+   "000000000000000c",
+   "000000000000000d",
+   "000000000000000e",
+   "000000000000000f"
+  ],
+  "dest": "www.example.com:443",
+  "fingerprint": "chrome",
+  "flow": "",
+  "network": "tcp",
+  "port": 443,
+  "publicKey": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+  "public_key": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+  "security": "reality",
+  "serverName": "www.example.com",
+  "server_name": "www.example.com",
+  "shortId": "0123456789abcdef",
+  "short_id": "0123456789abcdef",
+  "spiderX": "/",
+  "transport": "REALITY"
+ },
+ "reality_profiles": [
+  {
+   "address": "203.0.113.10",
+   "address_v6": "2001:db8::10",
+   "flows": [
+    "",
+    "xtls-rprx-vision"
+   ],
+   "name": "reality",
+   "network": "tcp",
+   "port": 443,
+   "public_key": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+   "server_name": "www.example.com",
+   "short_id": "0123456789abcdef"
+  },
+  {
+   "address": "203.0.113.10",
+   "address_v6": "2001:db8::10",
+   "flows": [
+    ""
+   ],
+   "name": "xhttp",
+   "network": "xhttp",
+   "port": 8443,
+   "public_key": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+   "server_name": "www.example.com",
+   "short_id": "0123456789abcdef",
+   "xhttp": {
+    "mode": "auto",
+    "path": "/x"
+   }
+  }
+ ],
+ "schema": "trafficwrapper-worker-p0",
+ "standalone": false
+}

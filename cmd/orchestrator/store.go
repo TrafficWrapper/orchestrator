@@ -16,6 +16,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -84,22 +85,27 @@ type tokenRecord struct {
 }
 
 type workerRecord struct {
-	ID               string          `json:"id"`
-	Status           string          `json:"status"`
-	StaticPublicKey  string          `json:"static_public_key"`
-	SelfDescribe     map[string]any  `json:"self_describe"`
-	CreatedAt        time.Time       `json:"created_at"`
-	ApprovedAt       *time.Time      `json:"approved_at,omitempty"`
-	DesiredSeq       int64           `json:"desired_seq"`
-	AppliedSeq       int64           `json:"applied_seq"`
-	LastAckAt        *time.Time      `json:"last_ack_at,omitempty"`
-	EgressIPObserved string          `json:"egress_ip_observed,omitempty"`
-	EgressIPProbe    string          `json:"egress_ip_probe,omitempty"`
-	LastError        string          `json:"last_error,omitempty"`
-	Disabled         bool            `json:"disabled,omitempty"`
-	ConfigPriority   *int            `json:"config_priority,omitempty"`
-	ConfigWeight     *int            `json:"config_weight,omitempty"`
-	ProtocolEnabled  map[string]bool `json:"protocol_enabled,omitempty"`
+	ID              string         `json:"id"`
+	Status          string         `json:"status"`
+	StaticPublicKey string         `json:"static_public_key"`
+	SelfDescribe    map[string]any `json:"self_describe"`
+	// SelfDescribeIssues lists what sanitization reported on the last
+	// self_describe; SelfDescribeForbidden keeps the worker out of client
+	// bundles until it reports one without secret-looking keys.
+	SelfDescribeIssues    []string        `json:"self_describe_issues,omitempty"`
+	SelfDescribeForbidden bool            `json:"self_describe_forbidden,omitempty"`
+	CreatedAt             time.Time       `json:"created_at"`
+	ApprovedAt            *time.Time      `json:"approved_at,omitempty"`
+	DesiredSeq            int64           `json:"desired_seq"`
+	AppliedSeq            int64           `json:"applied_seq"`
+	LastAckAt             *time.Time      `json:"last_ack_at,omitempty"`
+	EgressIPObserved      string          `json:"egress_ip_observed,omitempty"`
+	EgressIPProbe         string          `json:"egress_ip_probe,omitempty"`
+	LastError             string          `json:"last_error,omitempty"`
+	Disabled              bool            `json:"disabled,omitempty"`
+	ConfigPriority        *int            `json:"config_priority,omitempty"`
+	ConfigWeight          *int            `json:"config_weight,omitempty"`
+	ProtocolEnabled       map[string]bool `json:"protocol_enabled,omitempty"`
 	// APK delivery tracking: the release seq last shipped in a pull, the
 	// worker config seq it shipped with, and the release seq the worker has
 	// acknowledged applying. Lets pulls skip re-sending an unchanged APK.
@@ -1643,15 +1649,23 @@ func (s *orchStore) upsertPendingWorker(staticPub string, self map[string]any) (
 			if err := s.openJSON(bucketWorkers, []byte(id), raw, &rec); err != nil {
 				return err
 			}
+			// A 64-bit ID collision must not let another key overwrite
+			// an existing worker's description.
+			if strings.TrimSpace(rec.StaticPublicKey) != strings.TrimSpace(staticPub) {
+				return errors.New("worker id collision: static key mismatch")
+			}
 			before = workerDiscoveryFingerprint(rec, time.Now().UTC())
-			rec.SelfDescribe = self
+			setWorkerSelfDescribe(&rec, self)
 		} else {
 			rec = workerRecord{
 				ID:              id,
 				Status:          "pending",
 				StaticPublicKey: staticPub,
-				SelfDescribe:    self,
 				CreatedAt:       time.Now().UTC(),
+			}
+			setWorkerSelfDescribe(&rec, self)
+			if len(self) > 0 && rec.SelfDescribe == nil {
+				return errors.New("invalid self_describe: " + selfDescribeIssuesSummary(rec.SelfDescribeIssues))
 			}
 		}
 		sealed, err := s.sealJSON(bucketWorkers, []byte(id), rec)
@@ -1885,9 +1899,7 @@ func applyAck(rec *workerRecord, applied int64, observed string, self map[string
 			rec.APKAppliedSeq = rec.APKSentSeq
 		}
 		rec.EgressIPObserved = observed
-		if len(self) > 0 {
-			rec.SelfDescribe = self
-		}
+		setWorkerSelfDescribe(rec, self)
 		wasInactive := rec.Status == "inactive"
 		if (rec.Status == "approved" || rec.Status == "inactive") && rec.DesiredSeq == applied {
 			rec.Status = "active"
@@ -1991,10 +2003,7 @@ func (s *orchStore) updateWorkerHeartbeat(id string, haveSeq int64, self map[str
 // heartbeatWriteInterval.
 func applyHeartbeat(rec *workerRecord, haveSeq int64, self map[string]any, now time.Time) bool {
 	beforeStatus := rec.Status
-	selfChanged := len(self) > 0 && !reflect.DeepEqual(rec.SelfDescribe, self)
-	if len(self) > 0 {
-		rec.SelfDescribe = self
-	}
+	selfChanged := setWorkerSelfDescribe(rec, self)
 	wasInactive := rec.Status == "inactive"
 	if (rec.Status == "approved" || rec.Status == "inactive") && rec.DesiredSeq <= haveSeq {
 		rec.Status = "active"
@@ -2422,4 +2431,49 @@ func (s *orchStore) openSealed(bucket, key, raw []byte) ([]byte, error) {
 		return nil, errors.New("bad sealed record nonce")
 	}
 	return s.aead.Open(nil, nonce, ciphertext, ad)
+}
+
+// setWorkerSelfDescribe sanitizes a reported self_describe into rec and
+// reports whether anything stored changed. An empty report leaves rec alone;
+// a rejected one (too large) keeps the previous description and records why.
+func setWorkerSelfDescribe(rec *workerRecord, self map[string]any) bool {
+	if len(self) == 0 {
+		return false
+	}
+	clean, report := sanitizeSelfDescribe(self)
+	changed := !slices.Equal(rec.SelfDescribeIssues, report.Issues)
+	rec.SelfDescribeIssues = report.Issues
+	if report.Rejected {
+		return changed
+	}
+	if report.Forbidden != rec.SelfDescribeForbidden {
+		changed = true
+	}
+	rec.SelfDescribeForbidden = report.Forbidden
+	if !reflect.DeepEqual(rec.SelfDescribe, clean) {
+		changed = true
+	}
+	rec.SelfDescribe = clean
+	return changed
+}
+
+// deletePendingWorker removes a worker that was never approved. Approved
+// workers are revoked, not deleted, so their history stays auditable.
+func (s *orchStore) deletePendingWorker(id string) error {
+	id = strings.TrimSpace(id)
+	return s.db.Update(func(tx *bolt.Tx) error {
+		b := tx.Bucket(bucketWorkers)
+		raw := b.Get([]byte(id))
+		if raw == nil {
+			return errNotFound
+		}
+		var rec workerRecord
+		if err := s.openJSON(bucketWorkers, []byte(id), raw, &rec); err != nil {
+			return err
+		}
+		if rec.Status != "pending" {
+			return fmt.Errorf("worker %s is %s, not pending", id, rec.Status)
+		}
+		return b.Delete([]byte(id))
+	})
 }

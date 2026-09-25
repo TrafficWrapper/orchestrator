@@ -212,12 +212,12 @@ func TestRealityFallbackRoutesAreOptInWithoutFlow(t *testing.T) {
 		t.Fatal(err)
 	}
 	rec, _ := s.store.worker(w.ID)
-	item, _ := s.clientWorkerPayloadForClient(rec, "")
+	item, _ := s.clientWorkerPayload(rec, "", false)
 	if n := len(item["routes"].([]any)); n != 1 {
 		t.Fatalf("fallback routes must be off by default, routes=%d", n)
 	}
 	s.cfg.RealityFallbackProfiles = true
-	item, _ = s.clientWorkerPayloadForClient(rec, "")
+	item, _ = s.clientWorkerPayload(rec, "", false)
 	routes := item["routes"].([]any)
 	if len(routes) != 3 {
 		t.Fatalf("want primary + xhttp + tcp fallback, got %d", len(routes))

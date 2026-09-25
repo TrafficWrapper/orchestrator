@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"log"
 	"strconv"
 	"strings"
 	"time"
@@ -65,7 +66,8 @@ func (s *server) buildClientBundleForClient(minSeq int64, clientVersion string) 
 	}
 	issued := time.Now().UTC()
 	seq := minSeq
-	var items []any
+	items := []any{}
+	awgExcluded := awgProfileConflictWorkers(workers)
 	for _, rec := range workers {
 		if rec.Status != "approved" && rec.Status != "active" {
 			continue
@@ -79,10 +81,21 @@ func (s *server) buildClientBundleForClient(minSeq int64, clientVersion string) 
 		if !workerFreshForClients(rec, issued) {
 			continue
 		}
-		item, ok := s.clientWorkerPayloadForClient(rec, clientVersion)
-		if ok {
-			items = append(items, item)
+		// Each worker is validated on its own: one bad self_describe drops
+		// that worker from the bundle, never the bundle for everyone.
+		if rec.SelfDescribeForbidden {
+			log.Printf("client bundle: worker %s excluded: forbidden key in self_describe", rec.ID)
+			continue
 		}
+		item, ok := s.clientWorkerPayload(rec, clientVersion, awgExcluded[rec.ID])
+		if !ok {
+			continue
+		}
+		if path, bad := findForbiddenKey(item); bad {
+			log.Printf("client bundle: worker %s excluded: forbidden config field %s", rec.ID, path)
+			continue
+		}
+		items = append(items, item)
 	}
 	if seq < 1 {
 		seq = 1
@@ -176,7 +189,9 @@ func (s *server) storeClientBundle(key string, issued time.Time, signed signedCo
 	s.clientBundleCache[key] = clientBundleCacheEntry{signed: signed, issued: issued}
 }
 
-func (s *server) clientWorkerPayloadForClient(rec workerRecord, clientVersion string) (map[string]any, bool) {
+// clientWorkerPayload builds one worker's bundle entry. excludeAWG drops its
+// AWG routes (its AWG profile subnets conflict with the fleet's).
+func (s *server) clientWorkerPayload(rec workerRecord, clientVersion string, excludeAWG bool) (map[string]any, bool) {
 	expected := workerEgressIP(rec)
 	configURL := stringFromMap(rec.SelfDescribe, "distributor_url")
 	routes := make([]any, 0, 2)
@@ -197,7 +212,7 @@ func (s *server) clientWorkerPayloadForClient(rec workerRecord, clientVersion st
 			}
 		}
 	}
-	if workerProtocolEnabled(rec, "awg") {
+	if workerProtocolEnabled(rec, "awg") && !excludeAWG {
 		if profile, ok := selectAWGProfileForClient(awgProfilesForClients(rec), clientVersion); ok {
 			if route, ok := clientRoutePayload("awg", profile.Params, expected, configURL); ok {
 				route["profile"] = profile.Name
@@ -208,6 +223,7 @@ func (s *server) clientWorkerPayloadForClient(rec workerRecord, clientVersion st
 			routes = append(routes, route)
 		}
 	}
+	routes = publishableRoutes(rec.ID, routes)
 	if len(routes) == 0 {
 		return nil, false
 	}
@@ -220,18 +236,19 @@ func (s *server) clientWorkerPayloadForClient(rec workerRecord, clientVersion st
 	}, true
 }
 
+// Priority and weight are operator policy; a worker cannot rank itself.
 func effectiveWorkerPriority(rec workerRecord) int {
 	if rec.ConfigPriority != nil {
 		return *rec.ConfigPriority
 	}
-	return intFromMap(rec.SelfDescribe, "priority", 10)
+	return 10
 }
 
 func effectiveWorkerWeight(rec workerRecord) int {
 	if rec.ConfigWeight != nil {
 		return *rec.ConfigWeight
 	}
-	return intFromMap(rec.SelfDescribe, "weight", 100)
+	return 100
 }
 
 func workerProtocolEnabled(rec workerRecord, protocolName string) bool {
@@ -389,30 +406,10 @@ func rejectForbiddenKeys(raw []byte) error {
 	if err := json.Unmarshal(raw, &value); err != nil {
 		return err
 	}
-	forbidden := map[string]struct{}{"private_key": {}, "privatekey": {}, "psk2": {}, "internal_ip": {}, "internalip": {}, "server_private_key": {}}
-	var walk func(any, string) error
-	walk = func(v any, path string) error {
-		switch x := v.(type) {
-		case map[string]any:
-			for k, child := range x {
-				n := strings.ToLower(strings.ReplaceAll(k, "-", "_"))
-				if _, ok := forbidden[n]; ok {
-					return fmt.Errorf("forbidden config field: %s%s", path, k)
-				}
-				if err := walk(child, path+k+"."); err != nil {
-					return err
-				}
-			}
-		case []any:
-			for i, child := range x {
-				if err := walk(child, fmt.Sprintf("%s[%d].", path, i)); err != nil {
-					return err
-				}
-			}
-		}
-		return nil
+	if path, ok := findForbiddenKey(value); ok {
+		return fmt.Errorf("forbidden config field: %s", path)
 	}
-	return walk(value, "")
+	return nil
 }
 
 func workerFreshForClients(rec workerRecord, now time.Time) bool {
@@ -431,4 +428,54 @@ func canonicalJSON(v any) (string, error) {
 		return "", err
 	}
 	return string(raw), nil
+}
+
+// routeParamsNeverPublished are route keys a worker may send but clients must
+// not see: sink URLs outside the tunnel come only from orchestrator fields.
+var routeParamsNeverPublished = []string{"discovery_url", "discovery_urls"}
+
+// publishableRoutes keeps routes old apps can parse (string type and address,
+// int port) and strips keys clients must not take from a worker.
+func publishableRoutes(workerID string, routes []any) []any {
+	out := make([]any, 0, len(routes))
+	for _, raw := range routes {
+		route, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		for _, key := range routeParamsNeverPublished {
+			delete(route, key)
+			if params, ok := route["params"].(map[string]any); ok {
+				delete(params, key)
+			}
+		}
+		routeType, _ := route["type"].(string)
+		address, _ := route["address"].(string)
+		port, portOK := routePort(route["port"])
+		if routeType == "" || strings.TrimSpace(address) == "" || !portOK {
+			log.Printf("client bundle: worker %s %s route skipped: missing address or port", workerID, firstNotBlank(routeType, "unknown"))
+			continue
+		}
+		route["port"] = port
+		out = append(out, route)
+	}
+	return out
+}
+
+func routePort(raw any) (int, bool) {
+	var port int
+	switch v := raw.(type) {
+	case int:
+		port = v
+	case int64:
+		port = int(v)
+	case float64:
+		if v != float64(int(v)) {
+			return 0, false
+		}
+		port = int(v)
+	default:
+		return 0, false
+	}
+	return port, port >= 1 && port <= 65535
 }

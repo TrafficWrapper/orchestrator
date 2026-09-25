@@ -9,6 +9,7 @@ import (
 	"sort"
 	"strings"
 	"time"
+	"unicode"
 )
 
 const (
@@ -113,7 +114,7 @@ func botDeviceProblemEntries(device deviceRecord, telemetry telemetrySnapshotRec
 	if id == "" {
 		return nil
 	}
-	label := firstNotBlank(device.Alias, device.Model, shortString(id, 12), id)
+	label := botEntityLabel(firstNotBlank(device.Alias, device.Model), id)
 	var out []botProblemEntry
 	if entry, ok := botDeviceQuotaProblem(device, label); ok {
 		out = append(out, entry)
@@ -191,6 +192,17 @@ func botWorkerProblemEntry(worker workerRecord, now time.Time) (botProblemEntry,
 		down = true
 	}
 	if !down {
+		selfDescribeEntry := botProblemEntry{
+			Scope: "worker",
+			ID:    id,
+			Kind:  "worker_self_describe",
+			Label: botEntityLabel("", id),
+		}
+		// A forbidden key keeps the worker out of every client bundle.
+		if worker.SelfDescribeForbidden {
+			selfDescribeEntry.Detail = "excluded from client bundles; " + botSafeText(selfDescribeIssuesSummary(worker.SelfDescribeIssues), 200)
+			return selfDescribeEntry, true
+		}
 		// Reachable but its camouflage/REALITY self-check fails: clients
 		// may be getting blocked or fingerprinted.
 		if degraded, checks := workerDegraded(worker); degraded {
@@ -198,9 +210,14 @@ func botWorkerProblemEntry(worker workerRecord, now time.Time) (botProblemEntry,
 				Scope:  "worker",
 				ID:     id,
 				Kind:   "worker_degraded",
-				Label:  firstNotBlank(stringFromMap(worker.SelfDescribe, "label"), shortString(id, 12), id),
-				Detail: "self_check=" + firstNotBlank(checks, "degraded"),
+				Label:  botEntityLabel("", id),
+				Detail: "self_check=" + botSafeText(firstNotBlank(checks, "degraded"), 128),
 			}, true
+		}
+		// Malformed fields are kept (the routes may still work) but flagged.
+		if len(worker.SelfDescribeIssues) > 0 {
+			selfDescribeEntry.Detail = botSafeText(selfDescribeIssuesSummary(worker.SelfDescribeIssues), 200)
+			return selfDescribeEntry, true
 		}
 		return botProblemEntry{}, false
 	}
@@ -212,7 +229,7 @@ func botWorkerProblemEntry(worker workerRecord, now time.Time) (botProblemEntry,
 		Scope:  "worker",
 		ID:     id,
 		Kind:   "worker_down",
-		Label:  firstNotBlank(stringFromMap(worker.SelfDescribe, "label"), shortString(id, 12), id),
+		Label:  botEntityLabel("", id),
 		Detail: detail,
 	}, true
 }
@@ -334,6 +351,8 @@ func botProblemIssueText(entry botProblemEntry) string {
 		return fmt.Sprintf("Worker %s down: %s", entry.Label, dashText(entry.Detail))
 	case "worker_degraded":
 		return fmt.Sprintf("Worker %s degraded: %s", entry.Label, dashText(entry.Detail))
+	case "worker_self_describe":
+		return fmt.Sprintf("Worker %s self_describe rejected: %s", entry.Label, dashText(entry.Detail))
 	default:
 		return fmt.Sprintf("%s %s: %s", entry.Scope, entry.Label, entry.Kind)
 	}
@@ -349,6 +368,8 @@ func botProblemRecoveredText(entry botProblemEntry) string {
 		return "Worker " + entry.Label + " recovered"
 	case "worker_degraded":
 		return "Worker " + entry.Label + " self-check ok"
+	case "worker_self_describe":
+		return "Worker " + entry.Label + " self_describe ok"
 	default:
 		return entry.Label + " recovered"
 	}
@@ -475,4 +496,38 @@ func botProblemStatesEqual(a, b botProblemState) bool {
 	ra, errA := json.Marshal(a)
 	rb, errB := json.Marshal(b)
 	return errA == nil && errB == nil && bytes.Equal(ra, rb)
+}
+
+// botSafeText makes a worker- or device-supplied string safe to show the
+// owner: control and bidi-override characters removed, whitespace collapsed,
+// length capped. It cannot fake extra lines or buttons of an alert.
+func botSafeText(value string, maxRunes int) string {
+	var b strings.Builder
+	space := false
+	for _, r := range value {
+		switch {
+		case r == '\u200e' || r == '\u200f' || r >= '\u202a' && r <= '\u202e' || r >= '\u2066' && r <= '\u2069':
+			continue
+		case unicode.IsSpace(r) || unicode.IsControl(r):
+			space = true
+			continue
+		}
+		if space && b.Len() > 0 {
+			b.WriteByte(' ')
+		}
+		space = false
+		b.WriteRune(r)
+	}
+	return truncateRunes(b.String(), maxRunes)
+}
+
+// botEntityLabel shows an untrusted name next to the ID it belongs to, so a
+// name cannot impersonate another device or worker.
+func botEntityLabel(name, id string) string {
+	short := shortString(id, 12)
+	name = botSafeText(name, 64)
+	if name == "" || name == short || name == id {
+		return short
+	}
+	return name + " [" + short + "]"
 }

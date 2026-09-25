@@ -439,14 +439,19 @@ func (s *server) discoveryBundleJSON(now time.Time) (string, error) {
 		if rec.Status != "approved" && rec.Status != "active" {
 			continue
 		}
-		if rec.Disabled || !workerFreshForClients(rec, now) {
+		if rec.Disabled || rec.SelfDescribeForbidden || !workerFreshForClients(rec, now) {
 			continue
 		}
+		// Validate per worker so one bad worker never takes the feed down.
 		if item, ok := discoveryAWGEndpoint(rec); ok {
-			awg = append(awg, item)
+			if _, bad := findForbiddenKey(item); !bad {
+				awg = append(awg, item)
+			}
 		}
 		if item, ok := discoveryRealityEndpoint(rec); ok {
-			reality = append(reality, item)
+			if _, bad := findForbiddenKey(item); !bad {
+				reality = append(reality, item)
+			}
 		}
 	}
 	endpoints := map[string]any{
