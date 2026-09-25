@@ -50,6 +50,9 @@ type pullResponse struct {
 	WorkerBundle signedConfig    `json:"worker_bundle,omitempty"`
 	ClientBundle signedConfig    `json:"client_bundle,omitempty"`
 	Update       *updateArtifact `json:"update,omitempty"`
+	// DiscoveryBundle is the signed discovery feed the worker serves at
+	// /tw/endpoints.json (X-M7).
+	DiscoveryBundle *discoveryBundle `json:"discovery_bundle,omitempty"`
 	// UpdateRef replaces Update for workers declaring apk_fetch_v1 in this
 	// pull; they fetch the APK over /w/v1/apk/chunk.
 	UpdateRef *updateRef `json:"update_ref,omitempty"`
@@ -186,7 +189,7 @@ func (s *server) handlePull(peer []byte, raw []byte) (any, error) {
 		}
 		return nil, err
 	}
-	return pullResponse{OK: true, Status: rec.Status, WorkerID: rec.ID, DesiredSeq: rec.DesiredSeq, WorkerBundle: wb, ClientBundle: cb, Update: apk.update, UpdateRef: apk.ref, release: apk.release, writeTimeout: apk.writeTimeout, OrchestratorCapabilities: orchestratorCapabilities()}, nil
+	return pullResponse{OK: true, Status: rec.Status, WorkerID: rec.ID, DesiredSeq: rec.DesiredSeq, WorkerBundle: wb, ClientBundle: cb, Update: apk.update, UpdateRef: apk.ref, DiscoveryBundle: s.discoveryBundleForPull(), release: apk.release, writeTimeout: apk.writeTimeout, OrchestratorCapabilities: orchestratorCapabilities()}, nil
 }
 
 // maxAckUsageReports bounds one ack's accounting work; workers split larger

@@ -157,6 +157,26 @@ below what they have seen, so it must never go backwards:
 - Workers that are ahead of their config seq after a restore are moved past
   it automatically on their next pull, nudge or ack.
 
+## Discovery feed exposure
+
+`ORCH_DISCOVERY_PUBLIC` controls the unauthenticated discovery feed
+(`/discovery/endpoints.json`):
+
+- `reduced` (default): AWG entries only (`priority`, `endpoint`,
+  `server_public_key`, `awg_preset`, `egress_ip`, `worker_id`); `reality` is an
+  empty list, so no REALITY keys or short IDs are published.
+- `off`: the public endpoint returns 404. Clients still get the feed through
+  the tunnel, because workers receive it in every pull (`discovery_bundle`)
+  and serve it at `/tw/endpoints.json`. Switch to `off` only after all
+  workers serve that file.
+- `full`: the old format with REALITY entries, opt-in only.
+
+Only `off` fully closes the enumeration exposure. Until then the residual risk
+of `reduced` is accepted: AWG endpoint, `awg_preset` and priority stay public
+because older apps need a complete AWG entry. The feed is re-sent to workers
+whenever its seq changes and at least every 5 hours, well before its 12-hour
+`expires_at`.
+
 ## Worker compromise
 
 1. Revoke the worker: `POST /admin/v1/workers/revoke {"id": ..., "current_secret": ..., "totp_code": ...}`

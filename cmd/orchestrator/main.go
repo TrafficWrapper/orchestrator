@@ -39,6 +39,8 @@ type orchConfig struct {
 	// app package every published APK must carry.
 	APKManifestTTL time.Duration
 	APKPackage     string
+	// DiscoveryPublic is the public discovery mode (ORCH_DISCOVERY_PUBLIC).
+	DiscoveryPublic string
 	// APKInlineMaxBytes caps APKs shipped inside config pull
 	// (ORCH_APK_INLINE_MAX_BYTES); APKMaxBytes caps published APKs.
 	APKInlineMaxBytes       int64
@@ -284,6 +286,11 @@ func readConfig() (orchConfig, error) {
 	if err := validateAPKLimits(cfg); err != nil {
 		env.errs = append(env.errs, err)
 	}
+	mode, err := parseDiscoveryMode(os.Getenv("ORCH_DISCOVERY_PUBLIC"))
+	if err != nil {
+		env.errs = append(env.errs, err)
+	}
+	cfg.DiscoveryPublic = mode
 	return cfg, errors.Join(env.errs...)
 }
 

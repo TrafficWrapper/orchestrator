@@ -188,6 +188,7 @@ unset ORCH_NEW_ADMIN_PASSWORD
 | `ORCH_SIGNER_SOCKET` | Unix socket для config signer sidecar. | Опц. | `./orch-state/signer.sock` | В Compose используется `/run/tw-signer/signer.sock` из `./signer-run`. |
 | `ORCH_SIGNER_KEY_PATH` | Путь к config-signing key для команды `signer`. | Опц. | `$ORCH_STATE_DIR/orch-config.key` | В Compose `/signer-state/orch-config.key` из `./signer-state`; этот каталог монтируется только в signer. |
 | `ORCH_SIGNER_LEGACY_KEY_PATH` | Источник одноразовой миграции: ключ отсюда переносится в `ORCH_SIGNER_KEY_PATH` и удаляется. | Опц. | empty | В Compose `/orch-state/orch-config.key`, чтобы старые установки сохранили закреплённый ключ. |
+| `ORCH_DISCOVERY_PUBLIC` | Режим публичного discovery-фида: `reduced` (только AWG-записи), `off` (фид только через `/tw/endpoints.json` воркеров) или `full` (прежний формат с REALITY). | Опц. | `reduced` | `reduced`, `off`, `full`. |
 | `ORCH_APK_MANIFEST_TTL` | Горизонт `expires_at` манифеста обновления; серверно-подписанный манифест переподписывается под новым seq, когда остаётся меньше трети срока. | Опц. | `2160h` (90 дней) | Go duration, не меньше `24h`. |
 | `ORCH_APK_INLINE_MAX_BYTES` | Наибольший APK, который уходит внутри config pull воркерам без `apk_fetch_v1`. | Опц. | `41943040` (40 MiB) | Байты, не больше `67108864` (64 MiB). |
 | `ORCH_APK_MAX_BYTES` | Наибольший APK, принимаемый к публикации. | Опц. | `209715200` (200 MiB) | Байты, меньше лимита загрузки 256 MiB. |
