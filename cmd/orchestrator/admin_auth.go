@@ -117,7 +117,7 @@ func (s *server) createAdminSession(w http.ResponseWriter, r *http.Request, must
 		Value:    token,
 		Path:     "/",
 		HttpOnly: true,
-		Secure:   s.cfg.TLS || r.TLS != nil,
+		Secure:   s.secureCookies(r),
 		SameSite: http.SameSiteLaxMode,
 		Expires:  expires,
 	})
@@ -166,7 +166,7 @@ func (s *server) handleAdminLogout(w http.ResponseWriter, r *http.Request) {
 		Value:    "",
 		Path:     "/",
 		HttpOnly: true,
-		Secure:   s.cfg.TLS || r.TLS != nil,
+		Secure:   s.secureCookies(r),
 		SameSite: http.SameSiteLaxMode,
 		MaxAge:   -1,
 	})
@@ -384,4 +384,11 @@ func (s *server) handleAdminPasswordForceSet(w http.ResponseWriter, r *http.Requ
 	s.revokeAdminSessions()
 	s.auditEvent(auditEntry{Event: "admin_password_force_set", IP: clientIP(r), Result: "ok"})
 	writeJSON(w, map[string]any{"ok": true, "status": "admin_password_set"})
+}
+
+// secureCookies reports whether the admin session cookie must be Secure:
+// always when TLS terminates here or the public URL is https (TLS on a
+// proxy in front, the recommended production setup; ORC-M10).
+func (s *server) secureCookies(r *http.Request) bool {
+	return s.cfg.TLS || r.TLS != nil || strings.HasPrefix(strings.ToLower(strings.TrimSpace(s.cfg.PublicURL)), "https://")
 }

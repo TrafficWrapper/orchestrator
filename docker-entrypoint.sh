@@ -37,7 +37,10 @@ if [ -n "${ORCH_SIGNER_LEGACY_KEY_PATH:-}" ] && [ -d "$(dirname "$ORCH_SIGNER_LE
 	own_dir "$(dirname "$ORCH_SIGNER_LEGACY_KEY_PATH")"
 fi
 
-# Keep only CAP_NET_BIND_SERVICE so ORCH_LISTEN may still use ports below 1024.
+# Keep only CAP_NET_BIND_SERVICE so ORCH_LISTEN may still use ports below 1024;
+# drop every other capability from the bounding set and forbid regaining
+# privileges through setuid/file capabilities.
 exec setpriv --reuid="$APP_UID" --regid="$APP_GID" --clear-groups \
+	--no-new-privs --bounding-set=-all,+net_bind_service \
 	--inh-caps=-all,+net_bind_service --ambient-caps=-all,+net_bind_service \
 	-- "$BIN" "$@"

@@ -12,6 +12,9 @@ func withSecurityHeaders(next http.Handler) http.Handler {
 		h.Set("Content-Security-Policy", "frame-ancestors 'none'")
 		h.Set("X-Content-Type-Options", "nosniff")
 		h.Set("Referrer-Policy", "no-referrer")
+		if r.TLS != nil {
+			h.Set("Strict-Transport-Security", "max-age=31536000")
+		}
 		next.ServeHTTP(w, r)
 	})
 }
