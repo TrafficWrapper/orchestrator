@@ -16,6 +16,8 @@ import (
 
 func TestDiscoveryHandlersCacheAndInvalidate(t *testing.T) {
 	s := newTestServer(t)
+	// These cover the full feed format (REALITY entries included).
+	s.cfg.DiscoveryPublic = discoveryModeFull
 	writeDiscoverySigningKeyForTest(t, s)
 	addApprovedWorker(t, s)
 
@@ -115,6 +117,7 @@ func TestDiscoveryPairRemainsVerifiableAcrossCacheRebuild(t *testing.T) {
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			s := newTestServer(t)
+			s.cfg.DiscoveryPublic = discoveryModeFull
 			pub := writeDiscoverySigningKeyForTest(t, s)
 			addApprovedWorker(t, s)
 
@@ -392,6 +395,7 @@ func TestSignedDiscoveryBundleUsesUpdateKey(t *testing.T) {
 		t.Fatal(err)
 	}
 	s := newTestServer(t)
+	s.cfg.DiscoveryPublic = discoveryModeFull
 	s.cfg.UpdatePublicKey = mustText(pub)
 	privText, err := priv.MarshalText()
 	if err != nil {
@@ -549,6 +553,8 @@ func TestDiscoverySeqBumpPersistsAboveWorkerFloor(t *testing.T) {
 
 func TestDiscoverySeqIsMonotonicAcrossEndpointChangesAndRestart(t *testing.T) {
 	s := newTestServer(t)
+	// These cover the full feed format (REALITY entries included).
+	s.cfg.DiscoveryPublic = discoveryModeFull
 	addApprovedWorkerWithStatic(t, s, "worker-static-a")
 	now := time.Now().UTC()
 

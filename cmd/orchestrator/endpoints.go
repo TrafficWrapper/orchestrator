@@ -31,12 +31,14 @@ type discoveryBundleSnapshot struct {
 	Revision       string
 	GeneratedAt    time.Time
 	WorkerRevision uint64
+	// Gen is the invalidation generation the build started under; the
+	// snapshot is stale once the generation moves on (ORC-L28).
+	Gen uint64
 }
 
 type discoveryBundleCache struct {
-	Current     *discoveryBundleSnapshot
-	History     []*discoveryBundleSnapshot
-	Invalidated bool
+	Current *discoveryBundleSnapshot
+	History []*discoveryBundleSnapshot
 }
 
 type discoveryRequestRate struct {
@@ -49,6 +51,10 @@ type discoveryRequestRate struct {
 func (s *server) handleDiscoveryEndpointsJSON(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if s.discoveryMode() == discoveryModeOff {
+		http.NotFound(w, r)
 		return
 	}
 	bundle, err := s.signedDiscoverySnapshot()
@@ -80,6 +86,10 @@ func (s *server) handleDiscoveryEndpointsJSON(w http.ResponseWriter, r *http.Req
 func (s *server) handleDiscoveryEndpointsMinisig(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if s.discoveryMode() == discoveryModeOff {
+		http.NotFound(w, r)
 		return
 	}
 	requestedRevision := requestedDiscoveryRevision(r)
@@ -133,7 +143,7 @@ const discoveryBuildErrorTTL = 5 * time.Second
 
 func (s *server) freshDiscoverySnapshotLocked(now time.Time, revision uint64) *discoveryBundleSnapshot {
 	current := s.discoveryCache.Current
-	if current == nil || s.discoveryCache.Invalidated || current.WorkerRevision != revision {
+	if current == nil || current.Gen != s.discoveryInvalidGen.Load() || current.WorkerRevision != revision {
 		return nil
 	}
 	if age := now.Sub(current.GeneratedAt); age < 0 || age >= discoveryBundleCacheTTL {
@@ -169,6 +179,9 @@ func (s *server) signedDiscoverySnapshot() (*discoveryBundleSnapshot, error) {
 		return nil, s.discoveryBuildErr
 	}
 	next, err := s.buildDiscoverySnapshot(now, revision)
+	if next != nil {
+		next.Gen = gen
+	}
 	if err != nil {
 		s.discoveryBuildErr = err
 		s.discoveryBuildErrAt = now
@@ -178,10 +191,10 @@ func (s *server) signedDiscoverySnapshot() (*discoveryBundleSnapshot, error) {
 	s.discoveryBuildErr = nil
 	s.discoveryCacheMu.Lock()
 	s.rememberDiscoverySnapshotLocked(s.discoveryCache.Current)
+	// An invalidation (e.g. a seq bump) that landed while this build ran
+	// leaves next.Gen behind the current generation, so it is not served as
+	// fresh.
 	s.discoveryCache.Current = next
-	// An invalidation (e.g. a seq bump) that landed while this build ran must
-	// survive, or the stale bundle would be served for a full TTL.
-	s.discoveryCache.Invalidated = s.discoveryInvalidGen.Load() != gen
 	s.discoveryCacheMu.Unlock()
 	s.discoveryBuilds.Add(1)
 	return next, nil
@@ -238,9 +251,6 @@ func (s *server) cachedDiscoverySnapshot(revision string) *discoveryBundleSnapsh
 }
 
 func (s *server) invalidateDiscoveryCache() {
-	s.discoveryCacheMu.Lock()
-	s.discoveryCache.Invalidated = true
-	s.discoveryCacheMu.Unlock()
 	s.discoveryInvalidGen.Add(1)
 }
 
@@ -434,7 +444,8 @@ func (s *server) discoveryBundleJSON(now time.Time) (string, error) {
 		return "", err
 	}
 	var awg []any
-	var reality []any
+	reality := []any{}
+	full := s.discoveryMode() == discoveryModeFull
 	for _, rec := range workers {
 		if rec.Status != "approved" && rec.Status != "active" {
 			continue
@@ -445,11 +456,18 @@ func (s *server) discoveryBundleJSON(now time.Time) (string, error) {
 		// Validate per worker so one bad worker never takes the feed down.
 		if item, ok := discoveryAWGEndpoint(rec); ok {
 			if _, bad := findForbiddenKey(item); !bad {
+				item["worker_id"] = rec.ID
 				awg = append(awg, item)
 			}
 		}
+		// REALITY entries (with their short IDs) are published only in
+		// full mode (X-M1); the app core needs just the AWG entry.
+		if !full {
+			continue
+		}
 		if item, ok := discoveryRealityEndpoint(rec); ok {
 			if _, bad := findForbiddenKey(item); !bad {
+				item["worker_id"] = rec.ID
 				reality = append(reality, item)
 			}
 		}

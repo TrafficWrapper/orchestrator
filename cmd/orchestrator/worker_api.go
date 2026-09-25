@@ -50,6 +50,9 @@ type pullResponse struct {
 	WorkerBundle signedConfig    `json:"worker_bundle,omitempty"`
 	ClientBundle signedConfig    `json:"client_bundle,omitempty"`
 	Update       *updateArtifact `json:"update,omitempty"`
+	// DiscoveryBundle is the signed discovery feed the worker serves at
+	// /tw/endpoints.json (X-M7).
+	DiscoveryBundle *discoveryBundle `json:"discovery_bundle,omitempty"`
 	// OrchestratorCapabilities tells the worker which newer formats this
 	// orchestrator accepts (see orchestratorCapabilities).
 	OrchestratorCapabilities []string `json:"orchestrator_capabilities,omitempty"`
@@ -178,7 +181,7 @@ func (s *server) handlePull(peer []byte, raw []byte) (any, error) {
 	if err != nil {
 		return nil, err
 	}
-	return pullResponse{OK: true, Status: rec.Status, WorkerID: rec.ID, DesiredSeq: rec.DesiredSeq, WorkerBundle: wb, ClientBundle: cb, Update: update, release: release, OrchestratorCapabilities: orchestratorCapabilities()}, nil
+	return pullResponse{OK: true, Status: rec.Status, WorkerID: rec.ID, DesiredSeq: rec.DesiredSeq, WorkerBundle: wb, ClientBundle: cb, Update: update, DiscoveryBundle: s.discoveryBundleForPull(), release: release, OrchestratorCapabilities: orchestratorCapabilities()}, nil
 }
 
 // maxAckUsageReports bounds one ack's accounting work; workers split larger

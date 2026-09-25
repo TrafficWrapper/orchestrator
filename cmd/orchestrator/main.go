@@ -37,8 +37,10 @@ type orchConfig struct {
 	AllowUnreadableRecords bool
 	// APKManifestTTL sets update manifest expires_at; APKPackage pins the
 	// app package every published APK must carry.
-	APKManifestTTL          time.Duration
-	APKPackage              string
+	APKManifestTTL time.Duration
+	APKPackage     string
+	// DiscoveryPublic is the public discovery mode (ORCH_DISCOVERY_PUBLIC).
+	DiscoveryPublic         string
 	PublicURL               string
 	EgressProbeURL          string
 	AdminSecret             string
@@ -268,6 +270,11 @@ func readConfig() (orchConfig, error) {
 		APKManifestTTL:          env.duration("ORCH_APK_MANIFEST_TTL", defaultAPKManifestTTL, 24*time.Hour),
 		APKPackage:              strings.TrimSpace(os.Getenv("ORCH_APK_PACKAGE")),
 	}
+	mode, err := parseDiscoveryMode(os.Getenv("ORCH_DISCOVERY_PUBLIC"))
+	if err != nil {
+		env.errs = append(env.errs, err)
+	}
+	cfg.DiscoveryPublic = mode
 	return cfg, errors.Join(env.errs...)
 }
 

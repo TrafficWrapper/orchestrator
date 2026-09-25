@@ -190,6 +190,7 @@ provided Compose file:
 | `ORCH_SIGNER_SOCKET` | Unix socket used by the config signer sidecar. | Optional | `./orch-state/signer.sock` | Compose uses `/run/tw-signer/signer.sock` mounted from `./signer-run`. |
 | `ORCH_SIGNER_KEY_PATH` | Config-signing key path read by the `signer` command. | Optional | `$ORCH_STATE_DIR/orch-config.key` | Compose uses `/signer-state/orch-config.key` from `./signer-state`, which only the signer container mounts. |
 | `ORCH_SIGNER_LEGACY_KEY_PATH` | One-time migration source: a key found here is moved to `ORCH_SIGNER_KEY_PATH` and deleted. | Optional | empty | Compose uses `/orch-state/orch-config.key` so older deployments keep their pinned key. |
+| `ORCH_DISCOVERY_PUBLIC` | Public discovery feed mode: `reduced` (AWG entries only), `off` (feed only through workers' `/tw/endpoints.json`) or `full` (old format with REALITY). | Optional | `reduced` | `reduced`, `off`, `full`. |
 | `ORCH_APK_MANIFEST_TTL` | Update manifest `expires_at` horizon; server-signed manifests are re-signed under a new seq when less than a third is left. | Optional | `2160h` (90 days) | Go duration, at least `24h`. |
 | `ORCH_APK_PACKAGE` | App package every published APK must carry. | Optional | package of the current release | Rejects an APK from another app. |
 | `ORCH_CLIENT_BUNDLE_TTL` | Client bundle `expires_at` horizon; content older than 2/3 of it is republished under a new seq. | Optional | `24h` | Go duration, at least `1h`. |
