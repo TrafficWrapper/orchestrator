@@ -31,6 +31,12 @@ type botProblemState struct {
 	RecoveryPolls map[string]int             `json:"recovery_polls,omitempty"`
 	LastNotified  map[string]time.Time       `json:"last_notified,omitempty"`
 	UpdatedAt     time.Time                  `json:"updated_at"`
+	// sentMono holds this process's send times with their monotonic
+	// reading and monoNow the poll time: cooldowns use them instead of the
+	// persisted wall-clock stamps, so clock steps neither silence nor
+	// repeat alerts (ORC-L36). Not persisted.
+	sentMono map[string]time.Time
+	monoNow  time.Time
 }
 
 type botProblemEntry struct {
@@ -52,7 +58,7 @@ func (b *telegramBot) notifyProblemTransitions(ctx context.Context) {
 	if b == nil || b.client == nil || b.ownerID <= 0 || b.server == nil || b.server.store == nil {
 		return
 	}
-	now := time.Now().UTC()
+	now := time.Now()
 	currentProblems, err := b.server.botProblemSnapshot(now)
 	if err != nil {
 		log.Printf("telegram problem notify snapshot failed: %v", err)
@@ -63,6 +69,12 @@ func (b *telegramBot) notifyProblemTransitions(ctx context.Context) {
 		log.Printf("telegram problem notify state read failed: %v", err)
 		return
 	}
+	b.problemMu.Lock()
+	defer b.problemMu.Unlock()
+	if b.problemSentAt == nil {
+		b.problemSentAt = map[string]time.Time{}
+	}
+	prev.sentMono = b.problemSentAt
 	current := buildBotProblemState(prev, currentProblems, now)
 	notices := botProblemNotices(prev, current, found)
 	if len(notices) > 0 {
@@ -267,6 +279,8 @@ func buildBotProblemState(prev botProblemState, problems map[string]botProblemEn
 		RecoveryPolls: map[string]int{},
 		LastNotified:  copyBotProblemTimeMap(prev.LastNotified),
 		UpdatedAt:     now.UTC(),
+		sentMono:      prev.sentMono,
+		monoNow:       now,
 	}
 	for key, entry := range problems {
 		if strings.TrimSpace(key) == "" {
@@ -417,6 +431,9 @@ func botProblemNoticeOnCooldown(prev, current botProblemState, key string) bool 
 	if botProblemEscalated(prev.Active[key], current.Active[key]) {
 		return false
 	}
+	if at, ok := current.sentMono[key]; ok && !current.monoNow.IsZero() {
+		return current.monoNow.Sub(at) < botProblemRepeatCooldown
+	}
 	last := prev.LastNotified[key]
 	if last.IsZero() {
 		return false
@@ -426,7 +443,13 @@ func botProblemNoticeOnCooldown(prev, current botProblemState, key string) bool 
 		// the recovery is announced or dropped.
 		return true
 	}
-	return current.UpdatedAt.Sub(last.UTC()) < botProblemRepeatCooldown
+	elapsed := current.UpdatedAt.Sub(last.UTC())
+	if elapsed < -botProblemRepeatCooldown {
+		// The stamp is further in the future than a cooldown: the wall
+		// clock was stepped back, so it cannot hold the alert back.
+		return false
+	}
+	return elapsed < botProblemRepeatCooldown
 }
 
 func botProblemEscalated(old, current botProblemEntry) bool {
@@ -463,9 +486,13 @@ func markBotProblemNoticesSent(state *botProblemState, notices []botProblemNotic
 			delete(state.Recovering, notice.Key)
 			delete(state.RecoveryPolls, notice.Key)
 			delete(state.LastNotified, notice.Key)
+			delete(state.sentMono, notice.Key)
 			continue
 		}
 		state.LastNotified[notice.Key] = now.UTC()
+		if state.sentMono != nil && !state.monoNow.IsZero() {
+			state.sentMono[notice.Key] = state.monoNow
+		}
 	}
 }
 
@@ -480,6 +507,7 @@ func cleanupRecoveredBotProblems(state *botProblemState) {
 		delete(state.Recovering, key)
 		delete(state.RecoveryPolls, key)
 		delete(state.LastNotified, key)
+		delete(state.sentMono, key)
 	}
 }
 

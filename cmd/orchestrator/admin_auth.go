@@ -44,7 +44,9 @@ func (s *server) handleAdminLogin(w http.ResponseWriter, r *http.Request) {
 	attempt := limiter.reserveAttempt(ip)
 	if !attempt.Allowed {
 		w.Header().Set("Retry-After", retryAfterSeconds(attempt.LockedUntil, limiter.clock()))
-		s.auditEvent(auditEntry{
+		// Requests during a lockout are unauthenticated and unbounded: one
+		// entry per window and address with a repeat count (ORC-M12).
+		s.auditRepeatedEvent("admin_login|locked|"+rateLimitKey(ip), auditEntry{
 			Event:  "admin_login",
 			IP:     ip,
 			Result: "locked",
@@ -118,7 +120,9 @@ func (s *server) handleAdminLogin(w http.ResponseWriter, r *http.Request) {
 func (s *server) createAdminSession(w http.ResponseWriter, r *http.Request, mustChange bool) {
 	token := randID() + randID() + randID()
 	csrf := randID() + randID()
-	expires := time.Now().UTC().Add(12 * time.Hour)
+	// Keep the monotonic reading (no UTC()) so expiry checks are immune to
+	// wall-clock steps (ORC-L36).
+	expires := time.Now().Add(adminSessionTTL)
 	s.adminSessions.Store(token, adminSession{Token: token, CSRFToken: csrf, ExpiresAt: expires, MustChange: mustChange})
 	http.SetCookie(w, &http.Cookie{
 		Name:     adminSessionCookie,
@@ -127,13 +131,13 @@ func (s *server) createAdminSession(w http.ResponseWriter, r *http.Request, must
 		HttpOnly: true,
 		Secure:   s.secureCookies(r),
 		SameSite: http.SameSiteLaxMode,
-		Expires:  expires,
+		Expires:  expires.UTC(),
 	})
 	writeJSON(w, map[string]any{
 		"ok":            true,
 		"session_token": token,
 		"csrf_token":    csrf,
-		"expires_at":    expires.Format(time.RFC3339),
+		"expires_at":    expires.UTC().Format(time.RFC3339),
 		"must_change":   mustChange,
 	})
 }
@@ -282,6 +286,9 @@ func (s *server) lookupAdminSession(r *http.Request) (string, string, adminSessi
 	return token, source, session, ok
 }
 
+// adminSessionTTL is the lifetime of an admin session.
+const adminSessionTTL = 12 * time.Hour
+
 // adminSessionCookie names the admin session cookie (web UI and API).
 const adminSessionCookie = "tw_admin_session"
 
@@ -295,7 +302,7 @@ func (s *server) sessionByToken(token string) (adminSession, bool) {
 		return adminSession{}, false
 	}
 	session := value.(adminSession)
-	if time.Now().UTC().After(session.ExpiresAt) {
+	if time.Now().After(session.ExpiresAt) {
 		s.adminSessions.Delete(token)
 		return adminSession{}, false
 	}

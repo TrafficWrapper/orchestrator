@@ -19,6 +19,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -35,8 +36,8 @@ func runServe(cfg orchConfig) error {
 	if err := setClientIPHeaderMode(cfg.ClientIPHeader); err != nil {
 		return err
 	}
-	if !cfg.TLS {
-		log.Printf("WARNING: built-in TLS is disabled (ORCH_TLS=%q); serve plain HTTP only behind a TLS-terminating proxy", os.Getenv("ORCH_TLS"))
+	if err := checkPlaintextListener(cfg); err != nil {
+		return err
 	}
 	if publicURLIsLoopback(cfg.PublicURL) {
 		log.Printf("WARNING: ORCH_PUBLIC_URL=%s is a loopback address; bootstrap payloads will point devices at it. Set it to the orchestrator's reachable URL.", cfg.PublicURL)
@@ -61,7 +62,7 @@ func runServe(cfg orchConfig) error {
 	if err != nil {
 		return err
 	}
-	audit, err := openAuditLog(filepath.Join(cfg.StateDir, "audit.log"))
+	audit, err := openAuditLog(filepath.Join(cfg.StateDir, "audit.log"), auditRotation{MaxBytes: cfg.AuditMaxBytes, Keep: cfg.AuditKeep})
 	if err != nil {
 		return err
 	}
@@ -321,13 +322,19 @@ func loadOrCreateTLS(cfg orchConfig) (string, string, error) {
 	keyPath := filepath.Join(cfg.StateDir, "tls.key")
 	if _, err := os.Stat(certPath); err == nil {
 		if _, err := os.Stat(keyPath); err == nil {
+			// An existing certificate is never reissued: bootstrap payloads
+			// pin its key. Only flag a product name in it (P5).
+			if raw, err := os.ReadFile(certPath); err == nil && certificateNamesProduct(raw) {
+				log.Printf("WARNING: %s names the product in its subject or SAN; it is kept. To switch to a neutral self-signed certificate, follow RUNBOOK \"Rotate the orchestrator TLS certificate\" and remove tls.crt/tls.key", certPath)
+			}
 			return certPath, keyPath, nil
 		}
 	}
-	certPEM, keyPEM, err := selfSigned("trafficwrapper-orchestrator")
+	certPEM, keyPEM, err := selfSigned(selfSignedTLSName)
 	if err != nil {
 		return "", "", err
 	}
+	log.Printf("WARNING: generated a self-signed TLS certificate (CN=%s) at %s; clients cannot verify it by name. Use a real certificate for ORCH_PUBLIC_URL in production (README \"Production TLS\")", selfSignedTLSName, certPath)
 	if err := os.WriteFile(certPath, certPEM, 0o600); err != nil {
 		return "", "", err
 	}
@@ -335,6 +342,30 @@ func loadOrCreateTLS(cfg orchConfig) (string, string, error) {
 		return "", "", err
 	}
 	return certPath, keyPath, nil
+}
+
+// selfSignedTLSName is the neutral subject of a generated certificate: it
+// does not identify the product to whoever connects (ORC-L31, P5).
+const selfSignedTLSName = "localhost"
+
+// certificateNamesProduct reports whether a PEM certificate carries the
+// product name in its subject or SAN (certificates of older releases).
+func certificateNamesProduct(certPEM []byte) bool {
+	block, _ := pem.Decode(certPEM)
+	if block == nil {
+		return false
+	}
+	cert, err := x509.ParseCertificate(block.Bytes)
+	if err != nil {
+		return false
+	}
+	names := append([]string{cert.Subject.CommonName}, cert.Subject.Organization...)
+	for _, name := range append(names, cert.DNSNames...) {
+		if strings.Contains(strings.ToLower(name), "trafficwrapper") {
+			return true
+		}
+	}
+	return false
 }
 
 func selfSigned(name string) ([]byte, []byte, error) {
@@ -353,7 +384,7 @@ func selfSigned(name string) ([]byte, []byte, error) {
 		NotAfter:     time.Now().Add(3650 * 24 * time.Hour),
 		KeyUsage:     x509.KeyUsageDigitalSignature,
 		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
-		DNSNames:     []string{"localhost", "trafficwrapper-orchestrator"},
+		DNSNames:     []string{name},
 		IPAddresses:  []net.IP{net.IPv4(127, 0, 0, 1), net.IPv6loopback},
 	}
 	der, err := x509.CreateCertificate(rand.Reader, &tpl, &tpl, &key.PublicKey, key)

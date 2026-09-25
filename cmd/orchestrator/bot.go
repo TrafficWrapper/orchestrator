@@ -77,6 +77,10 @@ type telegramBot struct {
 	pendingRetry map[string]pendingNoticeRetry
 	// apkUploading guards the single background /get_apk upload.
 	apkUploading atomic.Bool
+	// problemSentAt keeps monotonic send times of problem alerts for
+	// their cooldown (problemMu; ORC-L36).
+	problemMu     sync.Mutex
+	problemSentAt map[string]time.Time
 }
 
 type botAuthApprover struct {

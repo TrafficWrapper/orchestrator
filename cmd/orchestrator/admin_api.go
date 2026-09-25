@@ -437,6 +437,10 @@ func (s *server) handleAdminStatus(w http.ResponseWriter, r *http.Request) {
 		writeStoreError(w, http.StatusInternalServerError, err)
 		return
 	}
+	if s.plaintextPublicListener() {
+		// Added line; worker lines keep their format (P2).
+		fmt.Fprintf(w, "warning=plaintext_public_listener listen=%s tls=false\n", s.cfg.Listen)
+	}
 	for _, worker := range workers {
 		fmt.Fprintf(w, "worker=%s status=%s desired=%d applied=%d egress_ack=%s egress_probe=%s\n",
 			worker.ID, worker.Status, worker.DesiredSeq, worker.AppliedSeq, worker.EgressIPObserved, worker.EgressIPProbe)
