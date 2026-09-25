@@ -246,7 +246,13 @@ func (s *server) handleNudge(ctx context.Context, peer []byte, raw []byte) (any,
 	}
 }
 
-func (s *server) handleAck(peer []byte, raw []byte) (any, error) {
+// handleAckContext is the /w/v1/ack handler: the ack's source address is
+// the orchestrator's own view of the worker's egress (X-L12).
+func (s *server) handleAckContext(ctx context.Context, peer []byte, raw []byte) (any, error) {
+	return s.ack(peer, raw, sourceIPFrom(ctx))
+}
+
+func (s *server) ack(peer []byte, raw []byte, seen string) (any, error) {
 	var req ackRequest
 	if err := json.Unmarshal(raw, &req); err != nil {
 		return nil, err
@@ -274,10 +280,13 @@ func (s *server) handleAck(peer []byte, raw []byte) (any, error) {
 		log.Printf("worker %s ack carried %d usage reports; accounting the first %d", rec.ID, len(req.Usage), maxAckUsageReports)
 		req.Usage = req.Usage[:maxAckUsageReports]
 	}
-	probe := s.probeEgressIP(rec)
-	egressMatch := probe != "" && probe == req.EgressIPObserved
-	if probe == "" {
-		log.Printf("worker %s egress probe unavailable; observed=%q", rec.ID, req.EgressIPObserved)
+	declared := firstNotBlank(stringFromMap(req.SelfDescribe, "egress_ip"), workerEgressIP(rec), req.EgressIPObserved)
+	check, probe := egressCheck(declared, seen, s.probeEgressIP(rec))
+	// Only a mismatch the orchestrator itself observed counts against the
+	// worker; "n/a" (private or co-located source) is not an alarm.
+	egressMatch := check != egressCheckMismatch
+	if err := s.store.recordEgressSeen(rec, seen, check, declared, probe); err != nil {
+		return nil, err
 	}
 	desiredSeq, quotaBlocks, err := s.store.recordAck(rec.ID, req.AppliedVersion, req.SelfCheck, req.EgressIPObserved, req.SelfDescribe, &probe, req.Usage, time.Now().UTC())
 	if err != nil {
@@ -294,7 +303,8 @@ const egressProbeCacheTTL = time.Minute
 
 func (s *server) probeEgressIP(rec workerRecord) string {
 	if s.cfg.EgressProbeURL == "" {
-		return stringFromMap(rec.SelfDescribe, "egress_ip")
+		// No independent probe: the worker's own value proves nothing.
+		return ""
 	}
 	// ORCH_EGRESS_PROBE_URL is one URL for the whole orchestrator (meant for a
 	// co-located worker), so the answer is the same for every ack: cache it

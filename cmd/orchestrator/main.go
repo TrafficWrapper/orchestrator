@@ -39,6 +39,11 @@ type orchConfig struct {
 	// app package every published APK must carry.
 	APKManifestTTL time.Duration
 	APKPackage     string
+	// EgressEchoURLs are sent to apps as egress_probe_urls
+	// (ORCH_EGRESS_ECHO_URLS); PublicTLSSPKIPins are the orchestrator's TLS
+	// SPKI pins behind a proxy (ORCH_PUBLIC_TLS_SPKI_SHA256).
+	EgressEchoURLs    []string
+	PublicTLSSPKIPins []string
 	// DiscoveryPublic is the public discovery mode (ORCH_DISCOVERY_PUBLIC).
 	DiscoveryPublic string
 	// APKInlineMaxBytes caps APKs shipped inside config pull
@@ -291,6 +296,12 @@ func readConfig() (orchConfig, error) {
 		env.errs = append(env.errs, err)
 	}
 	cfg.DiscoveryPublic = mode
+	if cfg.EgressEchoURLs, err = parseEgressEchoURLs(splitCSV(os.Getenv("ORCH_EGRESS_ECHO_URLS"))); err != nil {
+		env.errs = append(env.errs, err)
+	}
+	if cfg.PublicTLSSPKIPins, err = parseSPKIPins(splitCSV(os.Getenv("ORCH_PUBLIC_TLS_SPKI_SHA256"))); err != nil {
+		env.errs = append(env.errs, err)
+	}
 	return cfg, errors.Join(env.errs...)
 }
 

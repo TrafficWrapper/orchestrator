@@ -106,6 +106,11 @@ func (s *server) clientBundleContent() (map[string]any, error) {
 	if len(s.cfg.DNSServers) > 0 {
 		content["dns_servers"] = append([]string(nil), s.cfg.DNSServers...)
 	}
+	// Echo endpoints apps query through the tunnel to check their egress
+	// without a third-party service (APP-M17).
+	if len(s.cfg.EgressEchoURLs) > 0 {
+		content["egress_probe_urls"] = append([]string(nil), s.cfg.EgressEchoURLs...)
+	}
 	return content, nil
 }
 

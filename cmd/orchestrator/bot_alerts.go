@@ -217,6 +217,17 @@ func botWorkerProblemEntry(worker workerRecord, now time.Time) (botProblemEntry,
 				Detail: "self_check=" + botSafeText(firstNotBlank(checks, "degraded"), 128),
 			}, true
 		}
+		// The worker's declared egress differs from the public address the
+		// orchestrator observed (X-L12).
+		if worker.EgressCheck == egressCheckMismatch {
+			return botProblemEntry{
+				Scope:  "worker",
+				ID:     id,
+				Kind:   "worker_egress_mismatch",
+				Label:  botEntityLabel("", id),
+				Detail: "declared=" + botSafeText(workerEgressIP(worker), 64) + " observed=" + botSafeText(firstNotBlank(worker.EgressIPSeen, worker.EgressIPProbe), 64),
+			}, true
+		}
 		// Malformed fields are kept (the routes may still work) but flagged.
 		if len(worker.SelfDescribeIssues) > 0 {
 			selfDescribeEntry.Detail = botSafeText(selfDescribeIssuesSummary(worker.SelfDescribeIssues), 200)
