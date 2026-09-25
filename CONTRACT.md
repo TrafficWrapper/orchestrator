@@ -46,10 +46,9 @@ capacity reserved for workers. The cookie grants no authentication.
 
 ## Platform time: `server_time`
 
-Noise responses of enroll, pull, nudge, ack and telemetry (including their
-refusals) carry `server_time`: the orchestrator clock as Unix milliseconds.
-The `/w/v1/apk/chunk` response declares the field but does not fill it yet,
-so workers must not rely on it there. Workers may keep an offset to it for freshness
+Noise responses of enroll, pull, nudge, ack, telemetry and apk/chunk
+(including their refusals) carry `server_time`: the orchestrator clock as Unix
+milliseconds. Workers may keep an offset to it for freshness
 decisions; without the field they use their own clock.
 
 ## self_describe

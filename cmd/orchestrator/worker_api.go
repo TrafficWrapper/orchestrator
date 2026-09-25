@@ -389,6 +389,9 @@ func stampServerTime(resp any, now time.Time) any {
 	case workerRefusal:
 		r.ServerTime = ms
 		return r
+	case apkChunkResponse:
+		r.ServerTime = ms
+		return r
 	case map[string]any:
 		r["server_time"] = ms
 		return r
