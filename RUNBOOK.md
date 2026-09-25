@@ -124,11 +124,27 @@ updated.
 
 ## Worker compromise
 
-1. Disable or revoke the worker in the orchestrator.
-2. Rotate affected per-device transport material by re-issuing config.
-3. Remove the worker from seed workers and client bundles.
-4. Preserve logs/state privately for incident analysis.
-5. Rebuild the worker from clean state before re-approval.
+1. Revoke the worker: `POST /admin/v1/workers/revoke {"id": ..., "current_secret": ..., "totp_code": ...}`
+   (step-up: the current admin secret, the TOTP code when 2FA is on, and
+   owner approval in Telegram when the bot is set up). Revocation is
+   terminal: the key is refused on every call and can never re-enroll, even
+   with a fresh token. A reinstalled worker must come back with a new key.
+2. What the worker sees. A worker that declares `revoked_status` is refused
+   at once (`code: worker_revoked`). An older worker first gets one more
+   signed config with every protocol off and no devices, which drops all
+   accounts on its normal apply path; after it acks that config (or after 10
+   minutes) it is refused too. Live sessions on an old worker survive until
+   they reconnect, and the worker still knows every REALITY UUID it served.
+3. Rotate affected per-device transport material: re-enroll the devices the
+   worker served so their REALITY UUIDs and AWG credentials change.
+4. Remove the worker from seed workers.
+5. Preserve logs/state privately for incident analysis.
+
+Disabling (instead of revoking) is reversible: a disabled worker keeps
+pulling but gets every protocol off and an empty device list, and only gets
+a new config when it is enabled or disabled again. Usage and telemetry it
+relays are ignored. On old workers disabling removes accounts but does not
+cut sessions that are already open.
 
 Do not connect devices to a worker you do not operationally trust.
 

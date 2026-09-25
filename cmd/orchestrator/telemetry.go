@@ -34,6 +34,15 @@ func (s *server) handleWorkerTelemetry(peer []byte, raw []byte) (any, error) {
 	if rec.StaticPublicKey != protocol.KeyToBase64(peer) {
 		return map[string]any{"ok": false, "error": "worker identity mismatch"}, nil
 	}
+	switch {
+	case rec.Status == "pending":
+		return workerPendingResponse(), nil
+	case rec.Status == "revoked":
+		return workerRevokedResponse(), nil
+	case !workerGetsDevices(rec):
+		// A disabled worker serves no devices: nothing it relays counts.
+		return map[string]any{"ok": true}, nil
+	}
 	payload, err := base64.StdEncoding.DecodeString(req.PayloadBase64)
 	if err != nil || len(payload) == 0 || len(payload) > telemetryMaxPayloadBytes || !json.Valid(payload) {
 		return map[string]any{"ok": false, "error": "invalid telemetry payload"}, nil
@@ -201,10 +210,9 @@ func summarizeTelemetryPayload(deviceID, workerID string, payload []byte, receiv
 	if did, _ := root["did"].(string); strings.TrimSpace(did) != "" && strings.TrimSpace(did) != deviceID {
 		return telemetrySnapshotRecord{}, errors.New("telemetry payload device mismatch")
 	}
+	// last_seen and offline alerts use the orchestrator's clock; the
+	// worker's received_at is kept only as a diagnostic.
 	receivedAt := time.Now().UTC()
-	if parsed, err := time.Parse(time.RFC3339Nano, strings.TrimSpace(receivedAtRaw)); err == nil {
-		receivedAt = parsed.UTC()
-	}
 	rec := telemetrySnapshotRecord{
 		DeviceID:      deviceID,
 		WorkerID:      workerID,
@@ -214,6 +222,9 @@ func summarizeTelemetryPayload(deviceID, workerID string, payload []byte, receiv
 		ClientVC:      int64FromAny(root["vc"]),
 		Health:        "unknown",
 		Fields:        map[string]string{},
+	}
+	if parsed, err := time.Parse(time.RFC3339Nano, strings.TrimSpace(receivedAtRaw)); err == nil {
+		rec.Fields["worker_received_at"] = parsed.UTC().Format(time.RFC3339)
 	}
 	events, _ := root["events"].([]any)
 	if len(events) > 0 {

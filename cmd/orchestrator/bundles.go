@@ -24,6 +24,12 @@ func (s *server) buildBundles(rec workerRecord) (signedConfig, signedConfig, err
 	if err != nil {
 		return signedConfig{}, signedConfig{}, err
 	}
+	// Disabled and revoked workers get every protocol off and no devices.
+	serving := workerGetsDevices(rec)
+	devices := []any{}
+	if serving {
+		devices = approvedDevicePayloads(approvedDevices)
+	}
 	workerPayload := map[string]any{
 		"schema":    1,
 		"ns":        "worker-config-v1",
@@ -31,10 +37,10 @@ func (s *server) buildBundles(rec workerRecord) (signedConfig, signedConfig, err
 		"worker_id": rec.ID,
 		"issued_at": issued.Format(time.RFC3339),
 		"desired_state": map[string]any{
-			"reality":          map[string]any{"enabled": !rec.Disabled && workerProtocolEnabled(rec, "reality"), "public": rec.SelfDescribe["reality"]},
-			"awg":              map[string]any{"enabled": !rec.Disabled && workerProtocolEnabled(rec, "awg"), "public": rec.SelfDescribe["awg"]},
+			"reality":          map[string]any{"enabled": serving && workerProtocolEnabled(rec, "reality"), "public": rec.SelfDescribe["reality"]},
+			"awg":              map[string]any{"enabled": serving && workerProtocolEnabled(rec, "awg"), "public": rec.SelfDescribe["awg"]},
 			"egress_policy":    "direct",
-			"approved_devices": approvedDevicePayloads(approvedDevices),
+			"approved_devices": devices,
 			// Short IDs (cohorts) the worker must stop accepting.
 			"revoked_short_ids": append([]string{}, rec.RevokedShortIDs...),
 			"client_artifacts":  map[string]any{"config_json_path": "/tw/config.json", "version_json_path": "/tw/version.json"},

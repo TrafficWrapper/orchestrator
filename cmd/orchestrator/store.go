@@ -92,20 +92,25 @@ type workerRecord struct {
 	// SelfDescribeIssues lists what sanitization reported on the last
 	// self_describe; SelfDescribeForbidden keeps the worker out of client
 	// bundles until it reports one without secret-looking keys.
-	SelfDescribeIssues    []string        `json:"self_describe_issues,omitempty"`
-	SelfDescribeForbidden bool            `json:"self_describe_forbidden,omitempty"`
-	CreatedAt             time.Time       `json:"created_at"`
-	ApprovedAt            *time.Time      `json:"approved_at,omitempty"`
-	DesiredSeq            int64           `json:"desired_seq"`
-	AppliedSeq            int64           `json:"applied_seq"`
-	LastAckAt             *time.Time      `json:"last_ack_at,omitempty"`
-	EgressIPObserved      string          `json:"egress_ip_observed,omitempty"`
-	EgressIPProbe         string          `json:"egress_ip_probe,omitempty"`
-	LastError             string          `json:"last_error,omitempty"`
-	Disabled              bool            `json:"disabled,omitempty"`
-	ConfigPriority        *int            `json:"config_priority,omitempty"`
-	ConfigWeight          *int            `json:"config_weight,omitempty"`
-	ProtocolEnabled       map[string]bool `json:"protocol_enabled,omitempty"`
+	SelfDescribeIssues    []string `json:"self_describe_issues,omitempty"`
+	SelfDescribeForbidden bool     `json:"self_describe_forbidden,omitempty"`
+	// RevokedAt/RevokeSeq/RevokeFinal track a worker revocation: RevokeSeq
+	// is the empty config an old worker must ack before it is refused.
+	RevokedAt        *time.Time      `json:"revoked_at,omitempty"`
+	RevokeSeq        int64           `json:"revoke_seq,omitempty"`
+	RevokeFinal      bool            `json:"revoke_final,omitempty"`
+	CreatedAt        time.Time       `json:"created_at"`
+	ApprovedAt       *time.Time      `json:"approved_at,omitempty"`
+	DesiredSeq       int64           `json:"desired_seq"`
+	AppliedSeq       int64           `json:"applied_seq"`
+	LastAckAt        *time.Time      `json:"last_ack_at,omitempty"`
+	EgressIPObserved string          `json:"egress_ip_observed,omitempty"`
+	EgressIPProbe    string          `json:"egress_ip_probe,omitempty"`
+	LastError        string          `json:"last_error,omitempty"`
+	Disabled         bool            `json:"disabled,omitempty"`
+	ConfigPriority   *int            `json:"config_priority,omitempty"`
+	ConfigWeight     *int            `json:"config_weight,omitempty"`
+	ProtocolEnabled  map[string]bool `json:"protocol_enabled,omitempty"`
 	// APK delivery tracking: the release seq last shipped in a pull, the
 	// worker config seq it shipped with, and the release seq the worker has
 	// acknowledged applying. Lets pulls skip re-sending an unchanged APK.
@@ -1364,7 +1369,8 @@ func (s *orchStore) applyReportedDeviceUsageTx(tx *bolt.Tx, workerID string, rep
 		for id := range grouped.byID {
 			raw := b.Get([]byte(id))
 			if raw == nil {
-				needScan = true
+				// Unknown device (deleted, or never enrolled): nothing to
+				// account, and no full scan under the write lock.
 				continue
 			}
 			var rec deviceRecord
@@ -1723,6 +1729,11 @@ func (s *orchStore) updateWorkerPolicy(id string, patch workerPolicyPatch) error
 		}
 		before := workerDiscoveryFingerprint(rec, time.Now().UTC())
 		if patch.Enabled != nil {
+			if rec.Disabled == *patch.Enabled {
+				// Enable/disable transition: this worker needs a new
+				// config (with or without devices) even while disabled.
+				rec.DesiredSeq = max(rec.DesiredSeq, 0) + 1
+			}
 			rec.Disabled = !*patch.Enabled
 		}
 		if patch.Priority != nil {
@@ -1860,6 +1871,10 @@ func (s *orchStore) recordAck(id string, applied int64, selfCheck string, observ
 		if err != nil {
 			return err
 		}
+		// Only a worker entitled to devices may account traffic.
+		if !workerGetsDevices(rec) {
+			usage = nil
+		}
 		n, err := s.applyReportedDeviceUsageTx(tx, id, usage, now)
 		if err != nil {
 			return err
@@ -1900,6 +1915,9 @@ func applyAck(rec *workerRecord, applied int64, observed string, self map[string
 		}
 		rec.EgressIPObserved = observed
 		setWorkerSelfDescribe(rec, self)
+		if rec.Status == "revoked" && rec.RevokeSeq > 0 && applied >= rec.RevokeSeq {
+			rec.RevokeFinal = true
+		}
 		wasInactive := rec.Status == "inactive"
 		if (rec.Status == "approved" || rec.Status == "inactive") && rec.DesiredSeq == applied {
 			rec.Status = "active"
@@ -2190,7 +2208,9 @@ func (s *orchStore) bumpWorkerSeqsTx(tx *bolt.Tx) error {
 		if err := s.openJSON(bucketWorkers, k, raw, &rec); err != nil {
 			return nil, err
 		}
-		if rec.Status != "approved" && rec.Status != "active" {
+		// A disabled worker only gets a new config on enable/disable
+		// transitions, never for device changes.
+		if rec.Status != "approved" && rec.Status != "active" || rec.Disabled {
 			return nil, nil
 		}
 		if rec.DesiredSeq < 1 {

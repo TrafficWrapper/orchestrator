@@ -124,11 +124,29 @@ Impact: старые workers и devices отклонят orchestrator, пока 
 
 ## Компрометация worker
 
-1. Disable или revoke worker в orchestrator.
-2. Rotate affected per-device transport material через re-issuing config.
-3. Уберите worker из seed workers и client bundles.
-4. Сохраните logs/state приватно для incident analysis.
-5. Пересоберите worker из clean state перед re-approval.
+1. Отзовите worker: `POST /admin/v1/workers/revoke {"id": ..., "current_secret": ..., "totp_code": ...}`
+   (step-up: текущий admin secret, код TOTP при включённом 2FA и
+   подтверждение владельца в Telegram, если бот настроен). Отзыв
+   окончательный: ключ получает отказ на всех вызовах и не может заново
+   пройти enroll даже с новым токеном. Переустановленный worker приходит с
+   новым ключом.
+2. Что видит worker. Worker с capability `revoked_status` получает отказ
+   сразу (`code: worker_revoked`). Старый worker сначала получает ещё один
+   подписанный конфиг со всеми выключенными протоколами и пустым списком
+   устройств; его обычный путь применения удаляет все учётки. После ack этого
+   конфига (или через 10 минут) он тоже получает отказ. Живые сессии на
+   старом worker остаются до переподключения, а все REALITY UUID, которые он
+   обслуживал, ему известны.
+3. Ротируйте затронутый per-device transport material: заново проведите
+   enroll устройств этого worker, чтобы сменились REALITY UUID и учётки AWG.
+4. Уберите worker из seed workers.
+5. Сохраните logs/state приватно для incident analysis.
+
+Отключение (вместо отзыва) обратимо: отключённый worker продолжает pull, но
+получает все протоколы выключенными и пустой список устройств, а новый
+конфиг — только при включении или отключении. Учёт трафика и телеметрия от
+него игнорируются. На старых worker отключение удаляет учётки, но уже
+открытые сессии не рвёт.
 
 Не подключайте devices к worker, которому вы операционно не доверяете.
 
