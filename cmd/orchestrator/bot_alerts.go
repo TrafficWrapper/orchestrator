@@ -286,7 +286,10 @@ func buildBotProblemState(prev botProblemState, problems map[string]botProblemEn
 		if strings.TrimSpace(key) == "" {
 			continue
 		}
-		current.PendingPolls[key] = prev.PendingPolls[key] + 1
+		// Counters are clamped at the threshold they gate, so a steady
+		// problem leaves the state unchanged and it is not rewritten on
+		// every poll (ORC-I4).
+		current.PendingPolls[key] = clampedBotPollCount(prev.PendingPolls[key], botProblemPollsBeforeAlert)
 		if current.PendingPolls[key] >= botProblemPollsBeforeAlert {
 			current.Active[key] = entry
 		}
@@ -294,16 +297,37 @@ func buildBotProblemState(prev botProblemState, problems map[string]botProblemEn
 	for key, old := range prev.Active {
 		if _, ok := problems[key]; !ok {
 			current.Recovering[key] = old
-			current.RecoveryPolls[key] = prev.RecoveryPolls[key] + 1
+			current.RecoveryPolls[key] = clampedBotPollCount(prev.RecoveryPolls[key], botProblemRecoveryMaxPolls)
 		}
 	}
 	for key, old := range prev.Recovering {
 		if _, ok := problems[key]; !ok {
 			current.Recovering[key] = old
-			current.RecoveryPolls[key] = prev.RecoveryPolls[key] + 1
+			current.RecoveryPolls[key] = clampedBotPollCount(prev.RecoveryPolls[key], botProblemRecoveryMaxPolls)
 		}
 	}
 	return current
+}
+
+// clampedBotPollCount advances a stored poll counter by one, bounded to
+// [1, limit] whatever the stored value (ORC-I4).
+func clampedBotPollCount(prev, limit int) int {
+	if prev < 0 {
+		prev = 0
+	}
+	if prev >= limit {
+		return limit
+	}
+	return prev + 1
+}
+
+// botProblemRepeats reports whether an ongoing problem of this kind is
+// re-announced every botProblemRepeatCooldown. A device going offline is
+// routine (phones sleep, users disconnect), so it is announced once per
+// episode; worker and quota problems need operator action and keep their
+// reminders (ORC-I4).
+func botProblemRepeats(kind string) bool {
+	return kind != "device_offline"
 }
 
 func botProblemNotices(prev, current botProblemState, initialized bool) []botProblemNotice {
@@ -413,6 +437,11 @@ func botProblemNoticeOnCooldown(prev, current botProblemState, key string) bool 
 	last := prev.LastNotified[key]
 	if last.IsZero() {
 		return false
+	}
+	if !botProblemRepeats(current.Active[key].Kind) {
+		// Already announced in this episode; LastNotified is cleared when
+		// the recovery is announced or dropped.
+		return true
 	}
 	elapsed := current.UpdatedAt.Sub(last.UTC())
 	if elapsed < -botProblemRepeatCooldown {

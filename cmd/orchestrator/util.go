@@ -7,11 +7,13 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
 )
 
 func stringFromAny(value any) string {
@@ -140,16 +142,46 @@ func parseRFC3339Required(value string) (time.Time, error) {
 	return parsed, nil
 }
 
-func parseJSONObjectRaw(value string) (json.RawMessage, error) {
+// bootstrapLimitsNoteMaxRunes bounds the free-text note the admin UI stores
+// with a bootstrap token's limits.
+const bootstrapLimitsNoteMaxRunes = 256
+
+// parseBootstrapLimits validates the limits of a new bootstrap token against
+// the device limits schema when the token is created instead of at
+// enrollment (ORC-L10). This is admin input, so unknown fields are refused;
+// "note" is the label the admin UI sends. The object is returned as given:
+// it is also handed to the app in the bootstrap payload.
+func parseBootstrapLimits(value string) (json.RawMessage, error) {
 	trimmed := strings.TrimSpace(value)
 	if trimmed == "" {
 		trimmed = "{}"
 	}
-	var obj map[string]any
-	if err := json.Unmarshal([]byte(trimmed), &obj); err != nil {
+	if !strings.HasPrefix(trimmed, "{") {
+		return nil, errors.New("limits must be json object")
+	}
+	var strict struct {
+		deviceLimits
+		Note string `json:"note,omitempty"`
+	}
+	dec := json.NewDecoder(strings.NewReader(trimmed))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&strict); err != nil {
 		return nil, fmt.Errorf("limits must be json object: %w", err)
 	}
-	return json.RawMessage(trimmed), nil
+	if _, err := dec.Token(); err != io.EOF {
+		return nil, errors.New("limits: trailing data after json object")
+	}
+	if len([]rune(strict.Note)) > bootstrapLimitsNoteMaxRunes {
+		return nil, fmt.Errorf("limits: note must be %d characters or less", bootstrapLimitsNoteMaxRunes)
+	}
+	if rate := strings.TrimSpace(strict.RateLimit); len([]rune(rate)) > 32 || strings.ContainsFunc(rate, unicode.IsSpace) {
+		return nil, errors.New("limits: rate_limit must be a short token such as 20mbit")
+	}
+	raw := json.RawMessage(trimmed)
+	if _, err := parseDeviceLimitsRaw(raw); err != nil {
+		return nil, fmt.Errorf("limits: %w", err)
+	}
+	return raw, nil
 }
 
 func splitCSV(value string) []string {

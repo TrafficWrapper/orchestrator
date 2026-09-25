@@ -71,7 +71,7 @@ func bootstrapTokenCommand(cfg orchConfig, args []string) error {
 	if err != nil {
 		return err
 	}
-	limits, err := parseJSONObjectRaw(*limitsText)
+	limits, err := parseBootstrapLimits(*limitsText)
 	if err != nil {
 		return err
 	}
