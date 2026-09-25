@@ -354,7 +354,7 @@ func (s *server) handleAdminDevices(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *server) handleAdminConfig(w http.ResponseWriter, r *http.Request) {
-	bundle, err := s.buildClientBundle(0)
+	bundle, err := s.buildClientBundle()
 	if err != nil {
 		writeStoreError(w, http.StatusInternalServerError, err)
 		return
@@ -402,7 +402,12 @@ func (s *server) handleAdminConfigEdit(w http.ResponseWriter, r *http.Request) {
 		}
 		s.auditEvent(auditEntry{Event: "worker_config_edit", IP: clientIP(r), Result: "ok", Fields: map[string]string{"worker_id": id}})
 	}
-	bundle, err := s.buildClientBundle(0)
+	// An operator edit is published at once, without the confirmation delay.
+	if _, err := s.refreshClientBundle(true); err != nil {
+		writeStoreError(w, http.StatusInternalServerError, err)
+		return
+	}
+	bundle, err := s.buildClientBundle()
 	if err != nil {
 		writeStoreError(w, http.StatusInternalServerError, err)
 		return

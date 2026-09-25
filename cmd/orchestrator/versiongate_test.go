@@ -57,26 +57,17 @@ func TestRealityFingerprintForClientVersion(t *testing.T) {
 	}
 }
 
-func TestBuildClientBundleRealityFingerprintVersionGate(t *testing.T) {
+// The shared bundle is the same for every client (enroll and pull), so it
+// carries the default fingerprint; a modern variant for new clients is a
+// nested, gated option (X-M2), never a different top-level value.
+func TestSharedClientBundleUsesDefaultRealityFingerprint(t *testing.T) {
 	t.Setenv("REALITY_FP_DEFAULT", "chrome")
 	t.Setenv("REALITY_FP_MODERN", "firefox")
 	t.Setenv("REALITY_FP_MODERN_MIN_VC", "116")
 	s := newTestServer(t)
 	addApprovedWorker(t, s)
-
-	if got := clientBundleRealityFingerprint(t, s, "0.1.15"); got != "chrome" {
-		t.Fatalf("old client fingerprint=%q want chrome", got)
-	}
-	if got := clientBundleRealityFingerprint(t, s, "TrafficWrapper 0.1.16 (code 17)"); got != "firefox" {
-		t.Fatalf("new client fingerprint=%q want firefox", got)
-	}
-	t.Setenv("REALITY_FP_MODERN", "utls-modern")
-	if got := clientBundleRealityFingerprint(t, s, "0.1.16"); got != "chrome" {
-		t.Fatalf("invalid modern fingerprint=%q want chrome", got)
-	}
-	t.Setenv("REALITY_FP_MODERN", "")
-	if got := clientBundleRealityFingerprint(t, s, "0.1.16"); got != "chrome" {
-		t.Fatalf("modern empty fingerprint=%q want chrome", got)
+	if got := clientBundleRealityFingerprint(t, s, ""); got != "chrome" {
+		t.Fatalf("shared bundle fingerprint=%q want chrome", got)
 	}
 }
 
@@ -94,7 +85,7 @@ func TestBuildClientBundleDNSServers(t *testing.T) {
 	s.cfg.DNSServers = []string{"1.1.1.1", "1.0.0.1"}
 	addApprovedWorker(t, s)
 
-	bundle, err := s.buildClientBundleForClient(0, "0.1.17")
+	bundle, err := s.buildClientBundle()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -132,7 +123,7 @@ func addApprovedWorkerWithRealityFingerprint(t *testing.T, s *server, fingerprin
 
 func clientBundleRealityFingerprint(t *testing.T, s *server, clientVersion string) string {
 	t.Helper()
-	bundle, err := s.buildClientBundleForClient(0, clientVersion)
+	bundle, err := s.buildClientBundle()
 	if err != nil {
 		t.Fatal(err)
 	}

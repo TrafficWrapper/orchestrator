@@ -82,7 +82,7 @@ func TestVisionFlowNegotiatedAtEnrollment(t *testing.T) {
 		t.Fatalf("empty version must keep the stored one, got %q", dev.ClientVersion)
 	}
 	// The shared client bundle never carries a flow.
-	bundle, err := s.buildClientBundle(0)
+	bundle, err := s.buildClientBundle()
 	if err != nil {
 		t.Fatal(err)
 	}

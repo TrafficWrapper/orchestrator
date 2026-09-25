@@ -122,6 +122,25 @@ Procedure:
 Impact: old workers and devices reject the orchestrator until their pins are
 updated.
 
+## Client config seq after restore or rollback
+
+The client bundle seq is a persistent counter stored in the orchestrator
+DB, not derived from worker seqs. Apps reject a seq
+below what they have seen, so it must never go backwards:
+
+- First start after the upgrade sets it to the highest worker seq + 1000000
+  (or `ORCH_CLIENT_SEQ_FLOOR` if higher).
+- Every publish also raises each serving worker's config seq to at least the
+  counter. A rolled-back binary (which derives the client seq from worker
+  seqs) therefore still never publishes a seq below what clients have seen.
+- After restoring an older DB, workers that report a higher applied client
+  seq (within 10000) move the counter forward by themselves. For larger
+  gaps, raise it explicitly with step-up:
+  `POST /admin/v1/client-seq/floor {"floor": N, "current_secret": ..., "totp_code": ...}`
+  (or set `ORCH_CLIENT_SEQ_FLOOR` before the first start on the restored DB).
+- Workers that are ahead of their config seq after a restore are moved past
+  it automatically on their next pull, nudge or ack.
+
 ## Worker compromise
 
 1. Revoke the worker: `POST /admin/v1/workers/revoke {"id": ..., "current_secret": ..., "totp_code": ...}`

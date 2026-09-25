@@ -65,6 +65,9 @@ type ackRequest struct {
 	EgressIPObserved string         `json:"egress_ip_observed"`
 	SelfDescribe     map[string]any `json:"self_describe,omitempty"`
 	Usage            []deviceUsage  `json:"usage,omitempty"`
+	// ClientAppliedSeq is the client bundle seq the worker last applied
+	// (optional); see observeClientAppliedSeq.
+	ClientAppliedSeq int64 `json:"client_applied_seq,omitempty"`
 }
 
 type ackResponse struct {
@@ -143,6 +146,13 @@ func (s *server) handlePull(peer []byte, raw []byte) (any, error) {
 	}
 	if workerRevokeFinal(rec, req.WorkerCapabilities, time.Now().UTC()) {
 		return workerRevokedResponse(), nil
+	}
+	if req.HaveSeq > rec.DesiredSeq {
+		// The worker is ahead of us (restored DB): move past it so it
+		// accepts the next config instead of freezing on NotModified.
+		if rec, err = s.store.resyncWorkerAhead(rec.ID, req.HaveSeq); err != nil {
+			return nil, err
+		}
 	}
 	if req.HaveSeq >= rec.DesiredSeq {
 		return pullResponse{OK: true, Status: rec.Status, WorkerID: rec.ID, DesiredSeq: rec.DesiredSeq, NotModified: true}, nil
@@ -252,6 +262,7 @@ func (s *server) handleAck(peer []byte, raw []byte) (any, error) {
 	if quotaBlocks > 0 {
 		log.Printf("quota enforcement blocked devices count=%d worker=%s", quotaBlocks, rec.ID)
 	}
+	s.observeClientAppliedSeq(rec, req.ClientAppliedSeq)
 	return ackResponse{OK: true, DesiredSeq: desiredSeq, AppliedSeq: req.AppliedVersion, EgressIPProbe: probe, EgressMatch: egressMatch, QuotaBlocks: quotaBlocks}, nil
 }
 

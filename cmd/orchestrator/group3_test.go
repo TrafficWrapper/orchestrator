@@ -9,11 +9,11 @@ import (
 func TestClientBundleReusedUntilContentChanges(t *testing.T) {
 	s := newTestServer(t)
 	w := addApprovedWorkerWithStatic(t, s, "bundle-worker")
-	first, err := s.buildClientBundle(0)
+	first, err := s.buildClientBundle()
 	if err != nil {
 		t.Fatal(err)
 	}
-	second, err := s.buildClientBundle(0)
+	second, err := s.buildClientBundle()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -24,12 +24,15 @@ func TestClientBundleReusedUntilContentChanges(t *testing.T) {
 	if err := s.store.updateWorkerPolicy(w.ID, workerPolicyPatch{Enabled: &disabled}); err != nil {
 		t.Fatal(err)
 	}
-	third, err := s.buildClientBundle(0)
+	if _, err := s.checkClientBundle(); err != nil {
+		t.Fatal(err)
+	}
+	third, err := s.buildClientBundle()
 	if err != nil {
 		t.Fatal(err)
 	}
 	if third.ConfigJSON == first.ConfigJSON {
-		t.Fatal("changed worker set must produce a new bundle")
+		t.Fatal("an operator change must be published on the next check")
 	}
 }
 

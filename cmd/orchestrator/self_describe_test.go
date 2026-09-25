@@ -149,7 +149,7 @@ func TestForbiddenKeyExcludesOnlyThatWorker(t *testing.T) {
 	if _, ok := stored.SelfDescribe["reality"].(map[string]any)["private_key"]; ok {
 		t.Fatal("forbidden key must not be stored")
 	}
-	bundle, err := s.buildClientBundle(0)
+	bundle, err := s.buildClientBundle()
 	if err != nil {
 		t.Fatalf("bundle must still build: %v", err)
 	}
@@ -164,7 +164,10 @@ func TestForbiddenKeyExcludesOnlyThatWorker(t *testing.T) {
 	if _, _, err := s.store.recordAck(bad.ID, badRec.DesiredSeq, "ok", "", self, nil, nil, now); err != nil {
 		t.Fatal(err)
 	}
-	bundle, _ = s.buildClientBundle(0)
+	if _, err := s.refreshClientBundle(true); err != nil {
+		t.Fatal(err)
+	}
+	bundle, _ = s.buildClientBundle()
 	if !strings.Contains(bundle.ConfigJSON, bad.ID) {
 		t.Fatal("worker must return after a clean self_describe")
 	}

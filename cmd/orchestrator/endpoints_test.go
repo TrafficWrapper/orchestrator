@@ -432,7 +432,7 @@ func TestSignedDiscoveryBundleUsesUpdateKey(t *testing.T) {
 		t.Fatalf("reality endpoints=%d want 1", len(root.Endpoints.Reality))
 	}
 
-	bundle, err := s.buildClientBundleForClient(0, "0.1.18")
+	bundle, err := s.buildClientBundle()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -467,7 +467,7 @@ func TestDiscoveryBundleNextSinksAndClientRescuePointersAreOptional(t *testing.T
 		t.Fatalf("next_sinks=%v", root.NextSinks)
 	}
 
-	bundle, err := s.buildClientBundleForClient(0, "0.1.25")
+	bundle, err := s.buildClientBundle()
 	if err != nil {
 		t.Fatal(err)
 	}
