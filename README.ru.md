@@ -193,7 +193,7 @@ unset ORCH_NEW_ADMIN_PASSWORD
 | `ORCH_APK_PACKAGE` | Пакет приложения, который обязан быть в каждом публикуемом APK. | Опц. | пакет текущего релиза | Отвергает APK другого приложения. |
 | `ORCH_CLIENT_BUNDLE_TTL` | Горизонт `expires_at` клиентского бандла; содержимое старше 2/3 этого срока переиздаётся под новым seq. | Опц. | `24h` | Go duration, не меньше `1h`. |
 | `ORCH_CLIENT_SEQ_FLOOR` | Минимальный seq клиентского бандла (первый старт и восстановление старой БД). | Опц. | `0` | См. RUNBOOK «Seq клиентского конфига после restore или отката». |
-| `ORCH_CLIENT_IP_HEADER` | Из какого заголовка proxy брать IP клиента, если peer — loopback: `x-real-ip`, `x-forwarded-for`, `none` или `auto`. | Опц. | `auto` | Укажите заголовок, который перезаписывает ваш reverse proxy; см. Production TLS. |
+| `ORCH_CLIENT_IP_HEADER` | Из какого заголовка proxy брать IP клиента, если peer — loopback: `x-real-ip`, `x-forwarded-for`, `none` или `auto`. | Опц. | `auto` | `auto` не доверяет ни одному заголовку (как `none`); укажите заголовок, который перезаписывает ваш reverse proxy; см. Production TLS. |
 | `ORCH_UID` / `ORCH_GID` | Непривилегированные uid/gid, на которые entrypoint переключается после исправления владельца state-каталогов. | Опц. | `10001` | Оставьте default, если политика хоста не требует другого uid. |
 | `ORCH_PUBLIC_URL` | Public URL, попадает в bootstrap payloads и используется workers/devices. | Обяз. для реального deploy | `https://127.0.0.1:9091` | `https://orch.example.com` или LAN URL для dev. |
 | `ORCH_EGRESS_PROBE_URL` | Optional worker egress probe URL. | Опц. | empty | Обычно `http://127.0.0.1:9090/self-describe` в local dev. |

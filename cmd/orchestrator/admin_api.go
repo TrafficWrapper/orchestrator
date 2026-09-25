@@ -32,14 +32,22 @@ func (s *server) handleAdminBotStatus(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// handleAdminBotSetToken changes the bot, which is the owner's out-of-band
+// approval channel: it needs step-up (approved by the current owner when a
+// bot is set up), and the previous owner is told (ORC-L3).
 func (s *server) handleAdminBotSetToken(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Token   string `json:"token"`
 		OwnerID int64  `json:"owner_id"`
+		stepUpProof
 	}
 	if !decodeJSON(w, r, &req) {
 		return
 	}
+	if !s.stepUp(w, r, "bot_token_set", fmt.Sprintf("change the Telegram bot (new owner id %d)", req.OwnerID), req.stepUpProof) {
+		return
+	}
+	s.notifyBotOwner(fmt.Sprintf("Telegram bot settings are being changed from the admin API (addr %s, new owner id %d). If this was not you, rotate the admin password.", clientIP(r), req.OwnerID))
 	if err := s.store.setBotSettings(req.Token, req.OwnerID); err != nil {
 		writeStoreError(w, http.StatusBadRequest, err)
 		return

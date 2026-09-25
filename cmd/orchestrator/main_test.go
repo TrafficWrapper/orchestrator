@@ -1113,7 +1113,7 @@ func TestWebBotTokenSettingsUsesSessionCSRFAndEncryptedStore(t *testing.T) {
 	}
 	cookie := loginResp.Cookies()[0]
 
-	payload := map[string]any{"token": "123456:secret-bot-token", "owner_id": int64(1001)}
+	payload := map[string]any{"token": "123456:secret-bot-token", "owner_id": int64(1001), "current_secret": "owner-secret"}
 	rawPayload, _ := json.Marshal(payload)
 	noCSRFReq, _ := http.NewRequest(http.MethodPost, ts.URL+"/admin/v1/bot/set-token", bytes.NewReader(rawPayload))
 	noCSRFReq.Header.Set("content-type", "application/json")

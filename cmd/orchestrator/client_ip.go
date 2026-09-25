@@ -69,14 +69,13 @@ func clientIP(r *http.Request) string {
 		}
 		return host
 	}
-	if realIP != "" {
+	// auto trusts no header: a proxy that forwards one client-set header
+	// while overwriting the other would let clients pick their address
+	// (ORC-L12). Name the header the proxy overwrites explicitly.
+	if realIP != "" || forwarded != "" {
 		clientIPAutoWarnedOnce.Do(func() {
-			log.Printf("client ip: trusting X-Real-IP from a loopback proxy in auto mode; set ORCH_CLIENT_IP_HEADER to the header your proxy overwrites so clients cannot forge the other one")
+			log.Printf("client ip: ignoring X-Real-IP/X-Forwarded-For from a loopback proxy in auto mode; set ORCH_CLIENT_IP_HEADER=x-real-ip or x-forwarded-for to the header your proxy overwrites")
 		})
-		return realIP
-	}
-	if forwarded != "" {
-		return forwarded
 	}
 	return host
 }
