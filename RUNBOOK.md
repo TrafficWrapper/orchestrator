@@ -50,6 +50,20 @@ start rewrites every encrypted record in `orchestrator.db` into the new format
 the new format, so back up `./orch-state` before upgrading; rolling back means
 restoring that backup.
 
+The master key (`orch-state/master.key`) and the database belong together:
+
+- If `master.key` is missing while the database holds encrypted records, the
+  orchestrator refuses to start instead of creating a new key. Restore the
+  key from the same backup as the database. `ORCH_ALLOW_NEW_MASTER_KEY=1`
+  starts with a new key and makes every existing encrypted record unreadable.
+- If `master.key` does not decrypt the database (wrong backup), startup
+  fails. `ORCH_STORE_ALLOW_UNREADABLE=1` starts anyway without sealing the
+  format, so the right key can still be restored later.
+- If an older binary already sealed the format with a wrong key, stop the
+  orchestrator, put the right `master.key` back, run
+  `orchestrator store-clear-sealed-marker`, and start again: legacy records
+  are migrated with the right key.
+
 ## Rotate the config-signing key
 
 The config-signing key is held by the signer process and reached through
@@ -61,6 +75,8 @@ Procedure:
    rotation window.
 2. Back up current orchestrator state.
 3. Generate or install the new signer key in the signer state location.
+   With the orchestrator stopped, run `orchestrator signer-accept-key` so it
+   pins the new key instead of refusing it.
 4. Restart `signer` and `orchestrator`.
 5. Publish fresh `worker-config-v1` and `client-config-v1`.
 6. Re-issue client config/bootstrap material so devices pin the new config
@@ -177,8 +193,13 @@ stdin. Do not put real passwords into committed files or public logs.
 
 If the config signer private key is lost:
 
-1. Restore from a private backup if available.
-2. If no backup exists, create a new config-signing key.
+1. Restore from a private backup if available. The signer never replaces a
+   lost key by itself: once `<key>.initialized` exists next to the key file,
+   a missing key stops the signer.
+2. If no backup exists, remove `<key>.initialized` to let the signer create a
+   new config-signing key, then stop the orchestrator and run
+   `orchestrator signer-accept-key`: the orchestrator pins the signer's public
+   key and refuses to sign with any other one until the pin is cleared.
 3. Treat this as config key rotation.
 4. Re-enroll or re-bootstrap devices that pinned the old config public key.
 

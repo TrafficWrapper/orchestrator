@@ -181,7 +181,12 @@ func handleSignerConn(c net.Conn, pub minisign.PublicKey, priv minisign.PrivateK
 	_ = json.NewEncoder(c).Encode(resp)
 }
 
+// loadOrCreateMinisignKey loads the signing key. A key is only generated on
+// first initialisation: once <key>.initialized exists, a missing key file is
+// an error (a lost key must be restored or rotated on purpose, never silently
+// replaced; ORC-L7). Keys are written atomically and fsynced (ORC-L9).
 func loadOrCreateMinisignKey(path string) (minisign.PublicKey, minisign.PrivateKey, error) {
+	marker := path + ".initialized"
 	if raw, err := os.ReadFile(path); err == nil {
 		var priv minisign.PrivateKey
 		if err := priv.UnmarshalText(raw); err != nil {
@@ -191,9 +196,17 @@ func loadOrCreateMinisignKey(path string) (minisign.PublicKey, minisign.PrivateK
 		if !ok {
 			return minisign.PublicKey{}, minisign.PrivateKey{}, errors.New("bad minisign public key")
 		}
+		if _, err := os.Stat(marker); errors.Is(err, os.ErrNotExist) {
+			if err := writeFileAtomic(marker, []byte(mustText(pub)+"\n"), 0o600); err != nil {
+				return minisign.PublicKey{}, minisign.PrivateKey{}, err
+			}
+		}
 		return pub, priv, nil
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return minisign.PublicKey{}, minisign.PrivateKey{}, err
+	}
+	if _, err := os.Stat(marker); err == nil {
+		return minisign.PublicKey{}, minisign.PrivateKey{}, fmt.Errorf("signing key %s is missing but was initialised before: restore it, or remove %s to generate a new key on purpose", path, marker)
 	}
 	pub, priv, err := minisign.GenerateKey(nil)
 	if err != nil {
@@ -203,7 +216,10 @@ func loadOrCreateMinisignKey(path string) (minisign.PublicKey, minisign.PrivateK
 	if err != nil {
 		return minisign.PublicKey{}, minisign.PrivateKey{}, err
 	}
-	if err := os.WriteFile(path, raw, 0o600); err != nil {
+	if err := writeFileAtomic(path, raw, 0o600); err != nil {
+		return minisign.PublicKey{}, minisign.PrivateKey{}, err
+	}
+	if err := writeFileAtomic(marker, []byte(mustText(pub)+"\n"), 0o600); err != nil {
 		return minisign.PublicKey{}, minisign.PrivateKey{}, err
 	}
 	return pub, priv, nil
@@ -272,6 +288,9 @@ func (s *server) signerPublicKey() (string, error) {
 	}
 	pub, err := s.signer.publicKey()
 	if err != nil {
+		return "", err
+	}
+	if err := s.store.checkSignerKey(pub); err != nil {
 		return "", err
 	}
 	s.signerPubMu.Lock()

@@ -287,7 +287,7 @@ func (s *server) buildClientBundle() (signedConfig, error) {
 	if err != nil {
 		return signedConfig{}, err
 	}
-	signed, err := s.signer.sign(clientJSON)
+	signed, err := s.sign(clientJSON)
 	if err != nil {
 		return signedConfig{}, err
 	}
