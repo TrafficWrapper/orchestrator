@@ -158,6 +158,13 @@ type deviceRecord struct {
 	// RealityFlow is "" or xtls-rprx-vision, chosen from the capabilities the
 	// app declared at enrollment; workers set it on the device's account.
 	RealityFlow string `json:"reality_flow,omitempty"`
+	// RealityFlowPending is the flow offered to the app and waiting for its
+	// ack; RealityFlowChangedAt is when RealityFlow last changed.
+	RealityFlowPending   string     `json:"reality_flow_pending,omitempty"`
+	RealityFlowChangedAt *time.Time `json:"reality_flow_changed_at,omitempty"`
+	// ClientVersionCode is major*10000+minor*100+patch of the app version
+	// (diagnostics only).
+	ClientVersionCode int `json:"client_version_code,omitempty"`
 	// ClientCapabilities is the capability list the app sent at enrollment.
 	ClientCapabilities []string                      `json:"client_capabilities,omitempty"`
 	AWGPublicKey       string                        `json:"awg_public_key,omitempty"`
@@ -1885,7 +1892,7 @@ func (s *orchStore) updateWorkerPolicy(id string, patch workerPolicyPatch) error
 			rec.ConfigWeight = &value
 		}
 		if patch.ShortIDRevoked != nil {
-			rec.RevokedShortIDs = toggleString(rec.RevokedShortIDs, patch.ShortID, *patch.ShortIDRevoked)
+			rec.RevokedShortIDs = toggleString(normalizeShortIDs(rec.RevokedShortIDs), strings.ToLower(patch.ShortID), *patch.ShortIDRevoked)
 		}
 		if patch.AWGProfileDraining != nil {
 			rec.DrainingAWGProfiles = toggleString(rec.DrainingAWGProfiles, patch.AWGProfile, *patch.AWGProfileDraining)

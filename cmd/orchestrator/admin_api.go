@@ -345,6 +345,8 @@ func (s *server) handleAdminDevices(w http.ResponseWriter, r *http.Request) {
 			"status":                   device.Status,
 			"client_version":           device.ClientVersion, // enroll-time snapshot kept for API compatibility
 			"reality_flow":             device.RealityFlow,
+			"reality_flow_pending":     device.RealityFlowPending,
+			"client_version_code":      device.ClientVersionCode,
 			"client_capabilities":      device.ClientCapabilities,
 			"reality_cohort":           realityCohortIndex(device.ID, realityCohortSlots),
 			"installed_version":        installedVersion,
@@ -454,7 +456,7 @@ func adminWorkerPayload(worker workerRecord) map[string]any {
 		"self_describe_forbidden": worker.SelfDescribeForbidden,
 		"self_check_at":           formatOptionalTime(worker.SelfCheckAt),
 		"health":                  worker.SelfDescribe["health"],
-		"revoked_short_ids":       worker.RevokedShortIDs,
+		"revoked_short_ids":       normalizeShortIDs(worker.RevokedShortIDs),
 		"draining_awg":            worker.DrainingAWGProfiles,
 		"static_public_key8":      shortString(worker.StaticPublicKey, 8),
 	}

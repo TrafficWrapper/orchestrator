@@ -27,19 +27,18 @@ type deviceEnrollRequest struct {
 	// accepted alias.
 	ClientCapabilities []string `json:"client_capabilities,omitempty"`
 	Capabilities       []string `json:"capabilities,omitempty"`
+	// ClientVersionCode is the app's derived version code
+	// (major*10000+minor*100+patch), kept for diagnostics only.
+	ClientVersionCode int `json:"client_version_code,omitempty"`
+	// RealityFlowAck confirms the reality_flow_pending of the previous reply
+	// (apps declaring reality_flow_ack).
+	RealityFlowAck string `json:"reality_flow_ack,omitempty"`
 }
 
-// capabilities returns the declared client capabilities from either field,
-// trimmed, deduplicated and sorted.
+// capabilities returns the known client capabilities declared in either
+// field (allowedClientCapabilities); unknown ones are dropped silently.
 func (r deviceEnrollRequest) capabilities() []string {
-	var out []string
-	for _, c := range append(append([]string(nil), r.ClientCapabilities...), r.Capabilities...) {
-		if c = strings.TrimSpace(c); c != "" && !slices.Contains(out, c) {
-			out = append(out, c)
-		}
-	}
-	slices.Sort(out)
-	return out
+	return allowedClientCapabilities(append(append([]string(nil), r.ClientCapabilities...), r.Capabilities...))
 }
 
 type deviceEnrollResponse struct {
@@ -57,10 +56,13 @@ type deviceEnrollResponse struct {
 	// RealityFlow is the flow of this device's REALITY account on every
 	// worker ("" or xtls-rprx-vision); the app must use exactly this value
 	// on TCP REALITY routes (XHTTP routes never carry a flow).
-	RealityFlow     string       `json:"reality_flow"`
-	ServerAWGPublic string       `json:"server_awg_public,omitempty"`
-	SignerPublicKey string       `json:"signer_public_key,omitempty"`
-	ClientBundle    signedConfig `json:"client_bundle,omitempty"`
+	RealityFlow string `json:"reality_flow"`
+	// RealityFlowPending is the flow the device switches to once the app
+	// acks it in its next enrollment (apps declaring reality_flow_ack).
+	RealityFlowPending string       `json:"reality_flow_pending,omitempty"`
+	ServerAWGPublic    string       `json:"server_awg_public,omitempty"`
+	SignerPublicKey    string       `json:"signer_public_key,omitempty"`
+	ClientBundle       signedConfig `json:"client_bundle,omitempty"`
 }
 
 type bootstrapPayload struct {
@@ -144,11 +146,20 @@ func (s *server) deviceEnroll(peer []byte, raw []byte) (any, error) {
 		if version == "" {
 			version = existing.ClientVersion
 		}
-		if flow := deviceRealityFlow(caps); flow != existing.RealityFlow || !slices.Equal(caps, existing.ClientCapabilities) || version != existing.ClientVersion {
-			existing, err = s.store.updateDevice(existing.ID, flow != existing.RealityFlow, func(rec *deviceRecord) error {
-				rec.RealityFlow = flow
+		versionCode := deviceClientVersionCode(req.ClientVersionCode, version)
+		now := time.Now().UTC()
+		flow := decideRealityFlow(existing, caps, req.RealityFlowAck, now)
+		if flow.Switched || flow.Pending != existing.RealityFlowPending || !slices.Equal(caps, existing.ClientCapabilities) || version != existing.ClientVersion || versionCode != existing.ClientVersionCode {
+			// Only a flow switch is worker-visible (ORC-L5).
+			existing, err = s.store.updateDevice(existing.ID, flow.Switched, func(rec *deviceRecord) error {
+				if flow.Switched {
+					rec.RealityFlowChangedAt = &now
+				}
+				rec.RealityFlow = flow.Flow
+				rec.RealityFlowPending = flow.Pending
 				rec.ClientCapabilities = caps
 				rec.ClientVersion = version
+				rec.ClientVersionCode = versionCode
 				return nil
 			})
 			if err != nil {
@@ -167,17 +178,18 @@ func (s *server) deviceEnroll(peer []byte, raw []byte) (any, error) {
 			return nil, err
 		}
 		return deviceEnrollResponse{
-			OK:              true,
-			DeviceID:        existing.ID,
-			Status:          existing.Status,
-			RealityUUID:     existing.RealityUUID,
-			InternalIP:      existing.InternalIP,
-			PSK2:            existing.PSK2,
-			AWGProfiles:     existing.AWGProfiles,
-			RealityFlow:     existing.RealityFlow,
-			ServerAWGPublic: serverAWGPublic,
-			SignerPublicKey: pub,
-			ClientBundle:    bundle,
+			OK:                 true,
+			DeviceID:           existing.ID,
+			Status:             existing.Status,
+			RealityUUID:        existing.RealityUUID,
+			InternalIP:         existing.InternalIP,
+			PSK2:               existing.PSK2,
+			AWGProfiles:        existing.AWGProfiles,
+			RealityFlow:        existing.RealityFlow,
+			RealityFlowPending: existing.RealityFlowPending,
+			ServerAWGPublic:    serverAWGPublic,
+			SignerPublicKey:    pub,
+			ClientBundle:       bundle,
 		}, nil
 	} else if !errors.Is(err, errNotFound) {
 		return nil, err
@@ -191,6 +203,7 @@ func (s *server) deviceEnroll(peer []byte, raw []byte) (any, error) {
 		Model:              strings.TrimSpace(req.Model),
 		EnrollmentNonce:    strings.TrimSpace(req.EnrollmentNonce),
 		ClientVersion:      strings.TrimSpace(req.ClientVersion),
+		ClientVersionCode:  deviceClientVersionCode(req.ClientVersionCode, req.ClientVersion),
 		AWGPublicKey:       awgPublic,
 		RealityFlow:        deviceRealityFlow(req.capabilities()),
 		ClientCapabilities: req.capabilities(),

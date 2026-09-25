@@ -77,11 +77,12 @@ func runServe(cfg orchConfig) error {
 		return err
 	}
 	var background sync.WaitGroup
-	background.Add(4)
+	background.Add(5)
 	go func() { defer background.Done(); s.runNoiseSessionJanitor(ctx) }()
 	go func() { defer background.Done(); s.runWorkerJanitor(ctx) }()
 	go func() { defer background.Done(); s.runClientBundlePublisher(ctx) }()
 	go func() { defer background.Done(); s.runAPKManifestReissue(ctx) }()
+	go func() { defer background.Done(); s.runAWGCredentialBackfill(ctx) }()
 	// Deferred in reverse: wait for janitors before audit/store close.
 	defer background.Wait()
 	mux := http.NewServeMux()
