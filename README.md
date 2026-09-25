@@ -191,6 +191,8 @@ provided Compose file:
 | `ORCH_SIGNER_KEY_PATH` | Config-signing key path read by the `signer` command. | Optional | `$ORCH_STATE_DIR/orch-config.key` | Compose uses `/signer-state/orch-config.key` from `./signer-state`, which only the signer container mounts. |
 | `ORCH_SIGNER_LEGACY_KEY_PATH` | One-time migration source: a key found here is moved to `ORCH_SIGNER_KEY_PATH` and deleted. | Optional | empty | Compose uses `/orch-state/orch-config.key` so older deployments keep their pinned key. |
 | `ORCH_REALITY_FALLBACK_PROFILES` | Add workers' other REALITY profiles (XHTTP or TCP on another port) as fallback routes after the primary route. | Optional | `0` | See ARCHITECTURE "REALITY Vision, Short ID Cohorts and AWG Rotation". |
+| `ORCH_APK_MANIFEST_TTL` | Update manifest `expires_at` horizon; server-signed manifests are re-signed under a new seq when less than a third is left. | Optional | `2160h` (90 days) | Go duration, at least `24h`. |
+| `ORCH_APK_PACKAGE` | App package every published APK must carry. | Optional | package of the current release | Rejects an APK from another app. |
 | `ORCH_CLIENT_BUNDLE_TTL` | Client bundle `expires_at` horizon; content older than 2/3 of it is republished under a new seq. | Optional | `24h` | Go duration, at least `1h`. |
 | `ORCH_CLIENT_SEQ_FLOOR` | Lowest client bundle seq ever published (used on first start and after restoring an older DB). | Optional | `0` | See RUNBOOK "Client config seq after restore or rollback". |
 | `ORCH_CLIENT_IP_HEADER` | Which proxy header carries the client IP when the peer is loopback: `x-real-ip`, `x-forwarded-for`, `none`, or `auto`. | Optional | `auto` | Set it to the header your reverse proxy overwrites; see Production TLS. |

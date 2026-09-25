@@ -16,6 +16,8 @@ import (
 type apkVersionInfo struct {
 	VersionCode int64
 	VersionName string
+	// Package is the manifest package (applicationId) when readable.
+	Package string
 }
 
 func inspectAPKVersion(file multipart.File, size int64) (apkVersionInfo, error) {
@@ -85,6 +87,8 @@ func parseTextManifestVersion(raw []byte) (apkVersionInfo, error) {
 				out.VersionCode = code
 			case "versionName":
 				out.VersionName = strings.TrimSpace(attr.Value)
+			case "package":
+				out.Package = strings.TrimSpace(attr.Value)
 			}
 		}
 		return validateAPKVersionInfo(out)
@@ -203,6 +207,8 @@ func parseAXMLStartElementVersion(chunk []byte, pool []string) (apkVersionInfo, 
 				return apkVersionInfo{}, false, errors.New("versionName is a resource reference; fill it manually")
 			}
 			out.VersionName = value
+		case "package":
+			out.Package = strings.TrimSpace(axmlAttrString(pool, rawValue, dataType, data))
 		}
 	}
 	return out, true, nil

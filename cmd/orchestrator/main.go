@@ -34,8 +34,12 @@ type orchConfig struct {
 	// AllowNewMasterKey lets the store create master.key over a database
 	// that already holds encrypted records (discarding them);
 	// AllowUnreadableRecords starts even if some records do not decrypt.
-	AllowNewMasterKey       bool
-	AllowUnreadableRecords  bool
+	AllowNewMasterKey      bool
+	AllowUnreadableRecords bool
+	// APKManifestTTL sets update manifest expires_at; APKPackage pins the
+	// app package every published APK must carry.
+	APKManifestTTL          time.Duration
+	APKPackage              string
 	PublicURL               string
 	EgressProbeURL          string
 	AdminSecret             string
@@ -95,6 +99,7 @@ type server struct {
 	apkArtifact         *updateArtifact
 	apkArtifactSeq      int64
 	clientBundleMu      sync.Mutex
+	apkReissueMu        sync.Mutex
 	clientBundleSigned  signedClientBundle
 	updateKeyMu         sync.Mutex
 	updateKeyCache      *updateKeyCacheEntry
@@ -262,6 +267,8 @@ func readConfig() (orchConfig, error) {
 		ClientBundleTTL:         env.duration("ORCH_CLIENT_BUNDLE_TTL", 24*time.Hour, time.Hour),
 		AllowNewMasterKey:       env.bool("ORCH_ALLOW_NEW_MASTER_KEY", false),
 		AllowUnreadableRecords:  env.bool("ORCH_STORE_ALLOW_UNREADABLE", false),
+		APKManifestTTL:          env.duration("ORCH_APK_MANIFEST_TTL", defaultAPKManifestTTL, 24*time.Hour),
+		APKPackage:              strings.TrimSpace(os.Getenv("ORCH_APK_PACKAGE")),
 	}
 	return cfg, errors.Join(env.errs...)
 }

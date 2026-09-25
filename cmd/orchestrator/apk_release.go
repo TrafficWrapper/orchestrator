@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
@@ -126,6 +127,7 @@ func (s *server) handleAdminAPKDraft(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	manifestJSON, err := buildAPKManifest(apkManifestInput{
+		TTL:         s.apkManifestTTL(),
 		Seq:         seq,
 		VersionCode: req.VersionCode,
 		VersionName: req.VersionName,
@@ -157,6 +159,7 @@ func (s *server) handleAdminAPKPublish(w http.ResponseWriter, r *http.Request) {
 	defer apkFile.Close()
 	serverSigned := false
 	var manifest apkReleaseRecord
+	var inspected apkVersionInfo
 	if manifestJSON == "" && minisig == "" {
 		priv, pubText, err := s.loadServerUpdateSigningKey()
 		if err != nil {
@@ -174,8 +177,19 @@ func (s *server) handleAdminAPKPublish(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if parsed := parseFormInt64(r, "version_code"); parsed > 0 {
+			// The manifest must describe the APK it ships (APP-L5): a
+			// different version_code makes apps loop on the update.
+			if versionErr == nil && parsed != version.VersionCode {
+				writeError(w, fmt.Sprintf("version_code %d does not match the APK (%d)", parsed, version.VersionCode), http.StatusBadRequest)
+				return
+			}
 			version.VersionCode = parsed
 		}
+		if err := s.checkAPKPackage(version); err != nil {
+			writeError(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		inspected = version
 		if value := strings.TrimSpace(r.FormValue("version_name")); value != "" {
 			version.VersionName = value
 		}
@@ -189,6 +203,7 @@ func (s *server) handleAdminAPKPublish(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		manifestJSON, err = buildAPKManifest(apkManifestInput{
+			TTL:         s.apkManifestTTL(),
 			Seq:         seq,
 			VersionCode: version.VersionCode,
 			VersionName: version.VersionName,
@@ -223,6 +238,25 @@ func (s *server) handleAdminAPKPublish(w http.ResponseWriter, r *http.Request) {
 		writeStoreError(w, http.StatusBadRequest, err)
 		return
 	}
+	if !serverSigned {
+		// Offline-signed manifests are checked against the APK too.
+		version, versionErr := inspectAPKVersion(apkFile, apkHeader.Size)
+		if _, err := apkFile.Seek(0, io.SeekStart); err != nil {
+			writeStoreError(w, http.StatusBadRequest, err)
+			return
+		}
+		if versionErr == nil && version.VersionCode != manifest.VersionCode {
+			writeError(w, fmt.Sprintf("manifest version_code %d does not match the APK (%d)", manifest.VersionCode, version.VersionCode), http.StatusBadRequest)
+			return
+		}
+		if err := s.checkAPKPackage(version); err != nil {
+			writeError(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		inspected = version
+	}
+	manifest.Package = inspected.Package
+	manifest.ServerSigned = serverSigned
 	release, err := s.storeAPKRelease(manifest, manifestJSON, minisig, apkFile, apkHeader)
 	if err != nil {
 		writeStoreError(w, http.StatusBadRequest, err)
@@ -239,6 +273,9 @@ func (s *server) handleAdminAPKPublish(w http.ResponseWriter, r *http.Request) {
 }
 
 type apkManifestInput struct {
+	// IssuedAt and TTL set issued_at/expires_at (apps require expires_at).
+	IssuedAt    time.Time
+	TTL         time.Duration
 	Seq         int64
 	VersionCode int64
 	VersionName string
@@ -278,8 +315,17 @@ func buildAPKManifest(in apkManifestInput) (string, error) {
 		"apk_url":      apkName,
 		"min_version":  in.MinVersion,
 		"notes":        strings.TrimSpace(in.Notes),
-		"issued_at":    time.Now().UTC().Format(time.RFC3339),
 	}
+	issued := in.IssuedAt.UTC()
+	if issued.IsZero() {
+		issued = time.Now().UTC()
+	}
+	ttl := in.TTL
+	if ttl <= 0 {
+		ttl = defaultAPKManifestTTL
+	}
+	payload["issued_at"] = issued.Format(time.RFC3339)
+	payload["expires_at"] = issued.Add(ttl).Format(time.RFC3339)
 	return canonicalJSON(payload)
 }
 
@@ -673,6 +719,7 @@ func (s *server) seedUpdateAPKIfPresent(updatePrivate minisign.PrivateKey) error
 		return err
 	}
 	manifestJSON, err := buildAPKManifest(apkManifestInput{
+		TTL:         s.apkManifestTTL(),
 		Seq:         1,
 		VersionCode: s.cfg.SeedVersionCode,
 		VersionName: s.cfg.SeedVersionName,
@@ -689,6 +736,7 @@ func (s *server) seedUpdateAPKIfPresent(updatePrivate minisign.PrivateKey) error
 	if err != nil {
 		return err
 	}
+	manifest.ServerSigned = true
 	file, err := os.Open(path)
 	if err != nil {
 		return err
@@ -743,4 +791,125 @@ func safeAPKName(value string, versionCode int64) string {
 
 func actualSHAEquals(actual, expected string) bool {
 	return strings.EqualFold(strings.TrimSpace(actual), strings.TrimSpace(expected))
+}
+
+// defaultAPKManifestTTL bounds how long a signed update manifest is valid;
+// the orchestrator re-signs server-signed manifests well before expiry.
+const defaultAPKManifestTTL = 90 * 24 * time.Hour
+
+func (s *server) apkManifestTTL() time.Duration {
+	if s.cfg.APKManifestTTL > 0 {
+		return s.cfg.APKManifestTTL
+	}
+	return defaultAPKManifestTTL
+}
+
+// checkAPKPackage rejects an APK whose package differs from ORCH_APK_PACKAGE
+// or, when unset, from the current release's package.
+func (s *server) checkAPKPackage(version apkVersionInfo) error {
+	if version.Package == "" {
+		return nil
+	}
+	expected := strings.TrimSpace(s.cfg.APKPackage)
+	if expected == "" {
+		if current, ok, err := s.store.currentAPKRelease(); err == nil && ok {
+			expected = current.Package
+		}
+	}
+	if expected != "" && version.Package != expected {
+		return fmt.Errorf("APK package %q does not match the published app package %q", version.Package, expected)
+	}
+	return nil
+}
+
+// reissueAPKManifestIfDue re-signs the current server-signed manifest under
+// a new seq (same APK) once less than a third of its lifetime is left, or
+// right away when it has no expires_at (published before apps required it).
+// Workers then redistribute it like any new release.
+func (s *server) reissueAPKManifestIfDue(now time.Time) (bool, error) {
+	s.apkReissueMu.Lock()
+	defer s.apkReissueMu.Unlock()
+	rel, ok, err := s.store.currentAPKRelease()
+	if err != nil || !ok {
+		return false, err
+	}
+	raw, err := os.ReadFile(rel.ManifestPath)
+	if err != nil {
+		return false, err
+	}
+	var current struct {
+		ExpiresAt string `json:"expires_at"`
+	}
+	if err := json.Unmarshal(raw, &current); err != nil {
+		return false, err
+	}
+	ttl := s.apkManifestTTL()
+	if expires, err := time.Parse(time.RFC3339, current.ExpiresAt); err == nil && now.Before(expires.Add(-ttl/3)) {
+		return false, nil
+	}
+	priv, pubText, keyErr := s.loadServerUpdateSigningKey()
+	if !rel.ServerSigned {
+		// Releases from before ServerSigned was recorded: re-sign only what
+		// the local update key signed.
+		minisig, err := os.ReadFile(rel.MinisigPath)
+		if keyErr != nil || err != nil || verifyManifestSignature(string(raw), string(minisig), pubText) != nil {
+			log.Printf("ALERT update manifest seq=%d is offline-signed and expires at %q; publish a re-signed manifest", rel.Seq, current.ExpiresAt)
+			return false, nil
+		}
+	}
+	if keyErr != nil {
+		return false, keyErr
+	}
+	manifestJSON, err := buildAPKManifest(apkManifestInput{
+		IssuedAt:    now,
+		TTL:         ttl,
+		Seq:         rel.Seq + 1,
+		VersionCode: rel.VersionCode,
+		VersionName: rel.VersionName,
+		APKSHA256:   rel.APKSHA256,
+		APKSize:     rel.APKSize,
+		APKName:     rel.APKName,
+		MinVersion:  rel.MinVersion,
+		Notes:       rel.Notes,
+	})
+	if err != nil {
+		return false, err
+	}
+	minisig := string(minisign.Sign(priv, []byte(manifestJSON)))
+	manifest, err := parseAPKManifest(manifestJSON)
+	if err != nil {
+		return false, err
+	}
+	manifest.Package = rel.Package
+	manifest.ServerSigned = true
+	apk, err := os.Open(rel.APKPath)
+	if err != nil {
+		return false, err
+	}
+	defer apk.Close()
+	if _, err := s.storeAPKRelease(manifest, manifestJSON, minisig, apk, nil); err != nil {
+		return false, err
+	}
+	log.Printf("re-signed update manifest seq=%d -> %d (same APK) before expiry", rel.Seq, manifest.Seq)
+	return true, nil
+}
+
+// runAPKManifestReissue checks the update manifest's lifetime hourly.
+func (s *server) runAPKManifestReissue(ctx context.Context) {
+	ticker := time.NewTicker(time.Hour)
+	defer ticker.Stop()
+	check := func() {
+		if _, err := s.reissueAPKManifestIfDue(time.Now().UTC()); err != nil {
+			log.Printf("update manifest re-sign: %v", err)
+		}
+	}
+	check()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			check()
+		}
+	}
 }
