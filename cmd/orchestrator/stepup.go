@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"net/http"
 	"time"
 )
@@ -37,19 +38,35 @@ func (s *server) stepUp(w http.ResponseWriter, r *http.Request, event, action st
 		writeError(w, "re-authentication required: current_secret (and totp_code) invalid", http.StatusForbidden)
 		return false
 	}
+	if approved, err := s.ownerApproval(r, action); err != nil || !approved {
+		limiter.chargeFailure(ip)
+		s.auditEvent(auditEntry{Event: event, IP: ip, Result: "denied"})
+		writeError(w, "owner approval denied", http.StatusForbidden)
+		return false
+	}
 	limiter.recordSuccess(ip)
+	return true
+}
+
+// ownerApproval asks the owner through the bot when one is configured. It
+// fails closed: with bot settings stored but no approver running (restart
+// in progress, settings unreadable) the action is refused rather than let
+// through unapproved (ORC-I3). action "" is a login.
+func (s *server) ownerApproval(r *http.Request, action string) (bool, error) {
 	if approver := s.currentAuthApprover(); approver != nil && approver.enabled() {
-		approved, err := approver.requestLoginApproval(r.Context(), loginApprovalRequest{
+		return approver.requestLoginApproval(r.Context(), loginApprovalRequest{
 			Action:     action,
-			RemoteAddr: ip,
+			RemoteAddr: clientIP(r),
 			UserAgent:  r.UserAgent(),
 			CreatedAt:  time.Now().UTC(),
 		})
-		if err != nil || !approved {
-			s.auditEvent(auditEntry{Event: event, IP: ip, Result: "denied"})
-			writeError(w, "owner approval denied", http.StatusForbidden)
-			return false
-		}
 	}
-	return true
+	_, configured, err := s.store.botSettings()
+	if err != nil {
+		return false, err
+	}
+	if configured && s.hasBotFactory() {
+		return false, errors.New("owner approval temporarily unavailable; retry")
+	}
+	return true, nil
 }
