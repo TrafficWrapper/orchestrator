@@ -53,11 +53,16 @@ type pullResponse struct {
 	// DiscoveryBundle is the signed discovery feed the worker serves at
 	// /tw/endpoints.json (X-M7).
 	DiscoveryBundle *discoveryBundle `json:"discovery_bundle,omitempty"`
+	// UpdateRef replaces Update for workers declaring apk_fetch_v1 in this
+	// pull; they fetch the APK over /w/v1/apk/chunk.
+	UpdateRef *updateRef `json:"update_ref,omitempty"`
 	// OrchestratorCapabilities tells the worker which newer formats this
 	// orchestrator accepts (see orchestratorCapabilities).
 	OrchestratorCapabilities []string `json:"orchestrator_capabilities,omitempty"`
-	// release frees the APK shipment slot once the response is written.
-	release func()
+	// release frees the APK shipment slot once the response is written;
+	// writeTimeout bounds that write.
+	release      func()
+	writeTimeout time.Duration
 }
 
 type updateArtifact struct {
@@ -177,11 +182,14 @@ func (s *server) handlePull(peer []byte, raw []byte) (any, error) {
 	if err != nil {
 		return nil, err
 	}
-	update, release, err := s.updateArtifactForPull(rec, req.HaveSeq)
+	apk, err := s.apkDeliveryForPull(rec, req.HaveSeq, req.WorkerCapabilities)
 	if err != nil {
+		if apk.release != nil {
+			apk.release()
+		}
 		return nil, err
 	}
-	return pullResponse{OK: true, Status: rec.Status, WorkerID: rec.ID, DesiredSeq: rec.DesiredSeq, WorkerBundle: wb, ClientBundle: cb, Update: update, DiscoveryBundle: s.discoveryBundleForPull(), release: release, OrchestratorCapabilities: orchestratorCapabilities()}, nil
+	return pullResponse{OK: true, Status: rec.Status, WorkerID: rec.ID, DesiredSeq: rec.DesiredSeq, WorkerBundle: wb, ClientBundle: cb, Update: apk.update, UpdateRef: apk.ref, DiscoveryBundle: s.discoveryBundleForPull(), release: apk.release, writeTimeout: apk.writeTimeout, OrchestratorCapabilities: orchestratorCapabilities()}, nil
 }
 
 // maxAckUsageReports bounds one ack's accounting work; workers split larger
@@ -331,6 +339,8 @@ func (p pullResponse) releaseAfterWrite() {
 		p.release()
 	}
 }
+
+func (p pullResponse) responseWriteTimeout() time.Duration { return p.writeTimeout }
 
 // Capabilities this orchestrator announces to workers
 // (orchestrator_capabilities in pull, nudge and ack responses). A worker

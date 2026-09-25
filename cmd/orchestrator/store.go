@@ -123,6 +123,12 @@ type workerRecord struct {
 	APKSentSeq    int64 `json:"apk_sent_seq,omitempty"`
 	APKSentAtSeq  int64 `json:"apk_sent_at_seq,omitempty"`
 	APKAppliedSeq int64 `json:"apk_applied_seq,omitempty"`
+	// Inline APK attempt marker (see beginAPKInline).
+	APKInlineSHA      string     `json:"apk_inline_sha,omitempty"`
+	APKInlineHaveSeq  int64      `json:"apk_inline_have_seq,omitempty"`
+	APKInlinePending  bool       `json:"apk_inline_pending,omitempty"`
+	APKInlineFailures int        `json:"apk_inline_failures,omitempty"`
+	APKInlineRetryAt  *time.Time `json:"apk_inline_retry_at,omitempty"`
 	// SelfCheck is the worker's last reported self-check ("ok" or
 	// "degraded: camouflage,reality"), from ack.
 	SelfCheck   string     `json:"self_check,omitempty"`
@@ -2053,6 +2059,7 @@ func applyAck(rec *workerRecord, applied int64, observed string, self map[string
 		rec.LastAckAt = &now
 		if rec.APKSentSeq > 0 && applied >= rec.APKSentAtSeq {
 			rec.APKAppliedSeq = rec.APKSentSeq
+			rec.APKInlinePending, rec.APKInlineFailures, rec.APKInlineRetryAt = false, 0, nil
 		}
 		rec.EgressIPObserved = observed
 		setWorkerSelfDescribe(rec, self)

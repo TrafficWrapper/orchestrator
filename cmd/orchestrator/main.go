@@ -40,7 +40,11 @@ type orchConfig struct {
 	APKManifestTTL time.Duration
 	APKPackage     string
 	// DiscoveryPublic is the public discovery mode (ORCH_DISCOVERY_PUBLIC).
-	DiscoveryPublic         string
+	DiscoveryPublic string
+	// APKInlineMaxBytes caps APKs shipped inside config pull
+	// (ORCH_APK_INLINE_MAX_BYTES); APKMaxBytes caps published APKs.
+	APKInlineMaxBytes       int64
+	APKMaxBytes             int64
 	PublicURL               string
 	EgressProbeURL          string
 	AdminSecret             string
@@ -96,6 +100,13 @@ type server struct {
 	readyAt             time.Time
 	apkShipOnce         sync.Once
 	apkShipSem          chan struct{}
+	apkShipMu           sync.Mutex
+	apkShipWorkers      map[string]bool
+	apkRef              *updateRef
+	apkChunkOnce        sync.Once
+	apkChunkSem         chan struct{}
+	// startedAt is when this process started serving (ORC-L34).
+	startedAt           time.Time
 	apkArtifactMu       sync.Mutex
 	apkArtifact         *updateArtifact
 	apkArtifactSeq      int64
@@ -269,6 +280,11 @@ func readConfig() (orchConfig, error) {
 		AllowUnreadableRecords:  env.bool("ORCH_STORE_ALLOW_UNREADABLE", false),
 		APKManifestTTL:          env.duration("ORCH_APK_MANIFEST_TTL", defaultAPKManifestTTL, 24*time.Hour),
 		APKPackage:              strings.TrimSpace(os.Getenv("ORCH_APK_PACKAGE")),
+		APKInlineMaxBytes:       env.int64("ORCH_APK_INLINE_MAX_BYTES", defaultAPKInlineMaxBytes, 0),
+		APKMaxBytes:             env.int64("ORCH_APK_MAX_BYTES", defaultAPKMaxBytes, 1),
+	}
+	if err := validateAPKLimits(cfg); err != nil {
+		env.errs = append(env.errs, err)
 	}
 	mode, err := parseDiscoveryMode(os.Getenv("ORCH_DISCOVERY_PUBLIC"))
 	if err != nil {

@@ -26,12 +26,32 @@ func TestRequestBodyLimitsRejectOversizedLogin(t *testing.T) {
 
 func TestRequestBodyLimitsRejectDeclaredOversizedNoiseBody(t *testing.T) {
 	h := withRequestBodyLimits(http.HandlerFunc(func(http.ResponseWriter, *http.Request) { t.Fatal("handler called") }))
-	req := httptest.NewRequest(http.MethodPost, "/w/v1/ack", strings.NewReader("{}"))
-	req.ContentLength = noiseRequestBodyMaxBytes + 1
+	// Ack has its own larger limit (ORC-L27); every other Noise path keeps
+	// the default one.
+	for path, limit := range map[string]int64{"/w/v1/config/pull": noiseRequestBodyMaxBytes, "/w/v1/ack": ackRequestBodyMaxBytes} {
+		req := httptest.NewRequest(http.MethodPost, path, strings.NewReader("{}"))
+		req.ContentLength = limit + 1
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		if rec.Code != http.StatusRequestEntityTooLarge {
+			t.Fatalf("%s: status=%d want 413", path, rec.Code)
+		}
+	}
+}
+
+// ORC-L27: an ack with a full usage report fits.
+func TestRequestBodyLimitsAckFitsLargeUsage(t *testing.T) {
+	called := false
+	h := withRequestBodyLimits(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+		called = true
+		_, _ = io.Copy(io.Discard, r.Body)
+	}))
+	body := strings.Repeat("A", noiseRequestBodyMaxBytes*3)
+	req := httptest.NewRequest(http.MethodPost, "/w/v1/ack", strings.NewReader(body))
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
-	if rec.Code != http.StatusRequestEntityTooLarge {
-		t.Fatalf("status=%d want 413", rec.Code)
+	if !called || rec.Code == http.StatusRequestEntityTooLarge {
+		t.Fatalf("large ack refused: %d", rec.Code)
 	}
 }
 

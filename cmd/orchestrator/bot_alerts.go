@@ -102,6 +102,9 @@ func (s *server) botProblemSnapshot(now time.Time) (map[string]botProblemEntry, 
 		}
 	}
 	for _, worker := range workers {
+		if s.startupGrace(now) {
+			worker = s.seenSinceStart(worker)
+		}
 		if entry, ok := botWorkerProblemEntry(worker, now); ok {
 			out[botProblemKey(entry)] = entry
 		}

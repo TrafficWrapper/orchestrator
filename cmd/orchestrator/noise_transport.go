@@ -320,6 +320,15 @@ func (s *server) handleNoiseContext(fn func(context.Context, []byte, []byte) (an
 		if rel, ok := resp.(interface{ releaseAfterWrite() }); ok {
 			defer rel.releaseAfterWrite()
 		}
+		// Large responses get a write deadline so a slow reader cannot hold
+		// the slot indefinitely (ORC-M16); cleared for the next request on
+		// this connection.
+		if wt, ok := resp.(interface{ responseWriteTimeout() time.Duration }); ok && wt.responseWriteTimeout() > 0 {
+			rc := http.NewResponseController(w)
+			if rc.SetWriteDeadline(time.Now().Add(wt.responseWriteTimeout())) == nil {
+				defer func() { _ = rc.SetWriteDeadline(time.Time{}) }()
+			}
+		}
 		encrypted, err := protocol.EncryptJSON(sendCipher, resp)
 		if err != nil {
 			writeJSON(w, noiseEnvelopeResponse{OK: false, Error: err.Error()})

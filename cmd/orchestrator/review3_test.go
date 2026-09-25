@@ -7,6 +7,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"fmt"
 	"io"
 	"math/big"
 	"net/http"
@@ -66,7 +67,7 @@ func TestAPKSkippedWhenBusyBumpsWorkerForRetry(t *testing.T) {
 	apkShipmentWait = 20 * time.Millisecond
 	t.Cleanup(func() { apkShipmentWait = old })
 	for i := 0; i < maxConcurrentAPKShipments; i++ {
-		release, ok := s.acquireAPKShipment(time.Second)
+		release, ok := s.acquireAPKShipment(fmt.Sprintf("other-%d", i), time.Second)
 		if !ok {
 			t.Fatal("slot not granted")
 		}
@@ -74,9 +75,9 @@ func TestAPKSkippedWhenBusyBumpsWorkerForRetry(t *testing.T) {
 	}
 	w := addApprovedWorkerWithStatic(t, s, "busy-worker")
 	rec, _ := s.store.worker(w.ID)
-	update, release, err := s.updateArtifactForPull(rec, rec.DesiredSeq-1)
-	if err != nil || update != nil || release != nil {
-		t.Fatalf("busy slots must skip the APK: update=%v err=%v", update != nil, err)
+	apk, err := s.apkDeliveryForPull(rec, rec.DesiredSeq-1, nil)
+	if err != nil || apk.update != nil || apk.release != nil {
+		t.Fatalf("busy slots must skip the APK: update=%v err=%v", apk.update != nil, err)
 	}
 	after, _ := s.store.worker(w.ID)
 	if after.DesiredSeq <= rec.DesiredSeq {
