@@ -61,7 +61,15 @@ func withRequestBodyLimits(next http.Handler) http.Handler {
 			next.ServeHTTP(w, r)
 			return
 		}
+		// Buffering happens before any limiter or authentication, so bound
+		// how many bodies are being read at once (ORC-L37).
+		if !acquireBodySlot(r) {
+			w.Header().Set("Retry-After", "5")
+			http.Error(w, "server busy", http.StatusServiceUnavailable)
+			return
+		}
 		raw, err := io.ReadAll(body)
+		releaseBodySlot()
 		_ = body.Close()
 		if err != nil {
 			var tooLarge *http.MaxBytesError
@@ -78,3 +86,29 @@ func withRequestBodyLimits(next http.Handler) http.Handler {
 		next.ServeHTTP(w, r)
 	})
 }
+
+// bufferedBodySlots bounds concurrent buffered body reads; a slow sender holds
+// a slot for at most bufferedBodyReadTimeout.
+var bufferedBodySlots = make(chan struct{}, 512)
+
+const bodySlotWait = 5 * time.Second
+
+func acquireBodySlot(r *http.Request) bool {
+	select {
+	case bufferedBodySlots <- struct{}{}:
+		return true
+	default:
+	}
+	timer := time.NewTimer(bodySlotWait)
+	defer timer.Stop()
+	select {
+	case bufferedBodySlots <- struct{}{}:
+		return true
+	case <-timer.C:
+		return false
+	case <-r.Context().Done():
+		return false
+	}
+}
+
+func releaseBodySlot() { <-bufferedBodySlots }

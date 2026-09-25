@@ -97,6 +97,17 @@ once on intake (enroll, nudge, ack) and only the sanitized copy is stored:
   workers; for each profile the subnet most workers agree on wins. A worker
   whose subnet differs (or is not a private /16../26 pool) keeps its AWG out
   of client bundles and raises an alert.
+- Handshake budget. Anonymous handshakes share a per-address (/32, IPv6
+  /64) and per-network (/24, IPv6 /56) pending pool. After any authenticated
+  `/w/` call an approved worker gets `cookie` in the (plaintext) Noise
+  envelope response: `v1.<worker_id>.<expiry_unix>.<mac>`, valid for 1 hour.
+  Sending it back as `cookie` in the next `POST /w/v1/handshake/start` body
+  puts the handshake in a reserved worker pool (per-worker limits), so a flood
+  from many networks cannot lock workers out. Workers that never send it keep
+  using the shared pool. The cookie grants no authentication; the Noise
+  handshake still does that. Before any authentication the server also caps
+  open connections (8192), header size (64 KiB) and concurrent buffered
+  request bodies (512).
 
 ## Device Enrollment and Connect
 

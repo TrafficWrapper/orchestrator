@@ -62,7 +62,7 @@ type loginLimiterKey struct {
 func loginLimiterKeys(ip string) []loginLimiterKey {
 	return []loginLimiterKey{
 		{key: rateLimitKey(ip), limit: adminLoginFailureLimit},
-		{key: pendingPrefixKey(ip), limit: adminLoginPrefixFailureLimit},
+		{key: loginPrefixKey(ip), limit: adminLoginPrefixFailureLimit},
 	}
 }
 
@@ -115,7 +115,7 @@ func (l *loginLimiter) recordSuccess(key string) {
 	if l == nil || strings.TrimSpace(key) == "" {
 		return
 	}
-	prefix := pendingPrefixKey(key)
+	prefix := loginPrefixKey(key)
 	key = rateLimitKey(key)
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -193,4 +193,9 @@ func retryAfterSeconds(until time.Time, now time.Time) string {
 	remaining := until.Sub(now)
 	seconds := int64((remaining + time.Second - 1) / time.Second)
 	return strconv.FormatInt(seconds, 10)
+}
+
+// loginPrefixKey aggregates login failures by IPv4 /24 and IPv6 /48.
+func loginPrefixKey(ip string) string {
+	return networkPrefixKey(ip, 24, 48)
 }
