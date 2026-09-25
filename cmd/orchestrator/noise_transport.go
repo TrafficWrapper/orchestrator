@@ -253,7 +253,7 @@ func (s *server) runNoiseSessionJanitor(ctx context.Context) {
 				}
 				return true
 			})
-			s.pruneExpiredAdminSessions(time.Now().UTC())
+			s.pruneExpiredAdminSessions(time.Now())
 		}
 	}
 }

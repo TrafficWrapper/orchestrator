@@ -23,7 +23,7 @@ func (s *server) stepUp(w http.ResponseWriter, r *http.Request, event, action st
 	attempt := limiter.reserveAttempt(ip)
 	if !attempt.Allowed {
 		w.Header().Set("Retry-After", retryAfterSeconds(attempt.LockedUntil, limiter.clock()))
-		s.auditEvent(auditEntry{Event: event, IP: ip, Result: "locked"})
+		s.auditRepeatedEvent(event+"|locked|"+rateLimitKey(ip), auditEntry{Event: event, IP: ip, Result: "locked"})
 		writeError(w, "too many failed login attempts", http.StatusTooManyRequests)
 		return false
 	}

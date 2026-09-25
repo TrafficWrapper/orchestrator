@@ -62,6 +62,13 @@ type orchConfig struct {
 	SeedVersionName         string
 	APKKeepReleases         int
 	TLS                     bool
+	// TLSStrict refuses to start with built-in TLS off on a non-loopback
+	// listen address (ORCH_TLS_STRICT, P2).
+	TLSStrict bool
+	// AuditMaxBytes and AuditKeep rotate audit.log by size
+	// (ORCH_AUDIT_MAX_BYTES, ORCH_AUDIT_KEEP; ORC-M12).
+	AuditMaxBytes int64
+	AuditKeep     int
 }
 
 type server struct {
@@ -279,6 +286,9 @@ func readConfig() (orchConfig, error) {
 		SeedVersionName:         getenv("SEED_APK_VERSION_NAME", "seed"),
 		APKKeepReleases:         int(env.int64("ORCH_APK_KEEP_RELEASES", 5, 0)),
 		TLS:                     env.bool("ORCH_TLS", true),
+		TLSStrict:               env.bool("ORCH_TLS_STRICT", false),
+		AuditMaxBytes:           env.int64("ORCH_AUDIT_MAX_BYTES", defaultAuditMaxBytes, minAuditMaxBytes),
+		AuditKeep:               int(env.int64("ORCH_AUDIT_KEEP", defaultAuditKeep, 1)),
 		ClientSeqFloor:          env.int64("ORCH_CLIENT_SEQ_FLOOR", 0, 0),
 		ClientBundleTTL:         env.duration("ORCH_CLIENT_BUNDLE_TTL", 24*time.Hour, time.Hour),
 		AllowNewMasterKey:       env.bool("ORCH_ALLOW_NEW_MASTER_KEY", false),
@@ -361,6 +371,44 @@ func (e *envReader) url(key, fallback string, required bool) string {
 		e.errs = append(e.errs, fmt.Errorf("%s=%q: want an absolute http(s) URL", key, value))
 	}
 	return value
+}
+
+// listenAddrIsLoopback reports whether ORCH_LISTEN binds loopback only; an
+// empty host (":9091") listens on every interface.
+func listenAddrIsLoopback(addr string) bool {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		return false
+	}
+	if host == "localhost" {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
+}
+
+// plaintextPublicListener reports built-in TLS off on a non-loopback listen
+// address; the admin UI and /admin/v1/status flag it (P2).
+func (s *server) plaintextPublicListener() bool {
+	return !s.cfg.TLS && !listenAddrIsLoopback(s.cfg.Listen)
+}
+
+// checkPlaintextListener logs plain HTTP at startup: a warning on loopback
+// (the TLS-proxy setup), an ERROR on any other address, and with
+// ORCH_TLS_STRICT=1 it refuses to start there (P2).
+func checkPlaintextListener(cfg orchConfig) error {
+	if cfg.TLS {
+		return nil
+	}
+	if listenAddrIsLoopback(cfg.Listen) {
+		log.Printf("WARNING: built-in TLS is disabled (ORCH_TLS=%q); serve plain HTTP only behind a TLS-terminating proxy", os.Getenv("ORCH_TLS"))
+		return nil
+	}
+	if cfg.TLSStrict {
+		return fmt.Errorf("built-in TLS is disabled (ORCH_TLS=%q) on non-loopback listen address %q and ORCH_TLS_STRICT=1: enable ORCH_TLS or listen on loopback behind a TLS proxy", os.Getenv("ORCH_TLS"), cfg.Listen)
+	}
+	log.Printf("ERROR: built-in TLS is disabled (ORCH_TLS=%q) on non-loopback listen address %q: admin logins, sessions and tokens are plain HTTP unless a TLS proxy terminates in front. Listen on 127.0.0.1 behind the proxy, or set ORCH_TLS_STRICT=1 to refuse such a start.", os.Getenv("ORCH_TLS"), cfg.Listen)
+	return nil
 }
 
 // publicURLIsLoopback reports whether devices would be handed a bootstrap

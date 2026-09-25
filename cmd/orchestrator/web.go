@@ -43,6 +43,12 @@ type webPageData struct {
 	BotConfigured  bool
 	BotOwnerID     int64
 	BotUpdatedAt   string
+	// CSPNonce authorizes the page's own script (ORC-L15).
+	CSPNonce string
+	// PlaintextPublicListener flags built-in TLS off on a non-loopback
+	// listen address (P2); Listen is that address.
+	PlaintextPublicListener bool
+	Listen                  string
 }
 
 type webWorker struct {
@@ -149,7 +155,7 @@ func (s *server) handleWebChangePassword(w http.ResponseWriter, r *http.Request)
 		Path:           "/change-password",
 		Authenticated:  false,
 		CSRFToken:      session.CSRFToken,
-		SessionExpires: session.ExpiresAt.Format(time.RFC3339),
+		SessionExpires: session.ExpiresAt.UTC().Format(time.RFC3339),
 		MustChange:     true,
 		Now:            time.Now().UTC().Format(time.RFC3339),
 	})
@@ -157,6 +163,13 @@ func (s *server) handleWebChangePassword(w http.ResponseWriter, r *http.Request)
 
 func (s *server) handleWebDashboard(w http.ResponseWriter, r *http.Request) {
 	if r.URL.Path != "/" {
+		http.NotFound(w, r)
+		return
+	}
+	// Without a session "/" answers like any unknown path, so the listener
+	// does not identify the product; the login page stays at /login
+	// (ORC-L31).
+	if _, ok := s.webSession(r); !ok {
 		http.NotFound(w, r)
 		return
 	}
@@ -206,6 +219,9 @@ func (s *server) renderWebPage(w http.ResponseWriter, r *http.Request, name, tit
 }
 
 func (s *server) renderWeb(w http.ResponseWriter, data webPageData) {
+	data.CSPNonce = randID()
+	w.Header().Set("Content-Security-Policy", webContentSecurityPolicy(data.CSPNonce))
+	w.Header().Set("Cache-Control", "no-store")
 	w.Header().Set("content-type", "text/html; charset=utf-8")
 	if err := webTemplates.ExecuteTemplate(w, "layout", data); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -246,12 +262,15 @@ func (s *server) webData(templateName, title, path string, session adminSession)
 		Path:           path,
 		Authenticated:  true,
 		CSRFToken:      session.CSRFToken,
-		SessionExpires: session.ExpiresAt.Format(time.RFC3339),
+		SessionExpires: session.ExpiresAt.UTC().Format(time.RFC3339),
 		ConfigSeq:      platformConfigSeq(workers),
 		WorkerTotal:    len(workers),
 		DeviceTotal:    len(devices),
 		Health:         "ok",
 		Now:            time.Now().UTC().Format(time.RFC3339),
+
+		PlaintextPublicListener: s.plaintextPublicListener(),
+		Listen:                  s.cfg.Listen,
 	}
 	if bot, ok, err := s.store.botSettings(); err == nil && ok {
 		page.BotConfigured = true

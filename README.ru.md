@@ -123,7 +123,8 @@ docker compose logs orchestrator | grep -i 'initial admin password'
 docker compose exec orchestrator orchestrator public-key
 ```
 
-Откройте web UI по `ORCH_PUBLIC_URL`, войдите с initial password из лога
+Откройте web UI по `ORCH_PUBLIC_URL/login` (без сессии `/` отвечает 404, как
+любой неизвестный путь), войдите с initial password из лога
 контейнера и сразу смените пароль. Initial password хранится только как hash и
 не создаёт полноценную admin session до смены.
 
@@ -205,7 +206,10 @@ unset ORCH_NEW_ADMIN_PASSWORD
 | `ORCH_ADMIN_SESSION_TOKEN` | Optional bearer session token для local CLI admin requests при запущенном сервере. | Опц. | empty | Получите из `/admin/v1/login`; не кладите в shell history или git. |
 | `ORCH_UPDATE_PUBKEY` | Public minisign key для APK update manifests. | Опц. | empty | Для управляемого update-канала задайте свой offline `update.pub` до первого старта. Empty разрешает seed-on-first-run сгенерировать demo key в local state. |
 | `ORCH_DNS_SERVERS` | Optional comma-separated DNS servers, попадают в client configs. | Опц. | empty | Пример: `1.1.1.1,1.0.0.1`. Empty оставляет built-in in-tunnel defaults клиента. |
-| `ORCH_TLS` | Включает built-in self-signed TLS listener. Принимает `1/0`, `true/false`, `yes/no`, `on/off`; другие значения — ошибка старта. | Опц. | `1` | `0` только для local dev за доверенным транспортом. |
+| `ORCH_TLS` | Включает built-in self-signed TLS listener. Принимает `1/0`, `true/false`, `yes/no`, `on/off`; другие значения — ошибка старта. | Опц. | `1` | `0` только для local dev за доверенным транспортом. При `0` и не-loopback `ORCH_LISTEN` в логе `ERROR`, в админке баннер. |
+| `ORCH_TLS_STRICT` | Не стартовать, если `ORCH_TLS=0`, а `ORCH_LISTEN` не loopback-адрес. | Опц. | `0` | Поставьте `1`, когда TLS терминирует прокси перед `127.0.0.1:9091`. |
+| `ORCH_AUDIT_MAX_BYTES` | Размер, при котором `audit.log` в каталоге состояния ротируется в `audit.log.1`. | Опц. | `67108864` (64 MiB) | Байты, не меньше `1048576`. |
+| `ORCH_AUDIT_KEEP` | Сколько ротированных файлов аудита хранить (`audit.log.1` — самый новый). | Опц. | `5` | Не меньше `1`. |
 | `SEED_APK_PATH` | Путь к APK для seed-on-first-run. | Опц. | `./seed/app.apk` | Compose монтирует `./seed` и ставит `/seed/app.apk`. |
 | `SEED_APK_VERSION_CODE` | Version code в generated seed update manifest. | Опц. | `1` | Должен совпадать с seed APK version code. |
 | `SEED_APK_VERSION_NAME` | Version name в generated seed update manifest. | Опц. | `seed` | Например `0.1.0`. |
@@ -232,7 +236,9 @@ insecure-TLS override.
 Рекомендуемый вариант:
 
 1. Запустить orchestrator на loopback без встроенного TLS:
-   `ORCH_LISTEN=127.0.0.1:9091`, `ORCH_TLS=0`.
+   `ORCH_LISTEN=127.0.0.1:9091`, `ORCH_TLS=0` и `ORCH_TLS_STRICT=1`, чтобы
+   plain HTTP никогда не отдавался на публичном адресе (RUNBOOK «Plain HTTP на
+   публичном адресе»).
 2. Поставить Caddy, nginx или другой reverse proxy перед orchestrator.
 3. Выпустить Let's Encrypt certificate для вашего `ORCH_PUBLIC_URL`.
 4. Проксировать HTTPS на `http://127.0.0.1:9091`.
