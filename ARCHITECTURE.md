@@ -188,9 +188,29 @@ policy; AWG remains a fallback path when REALITY is unhealthy.
   131), not Android versionCode. `xhttp.host` is sent when it differs from
   the server name. `ORCH_REALITY_FALLBACK_PROFILES` is no longer used.
 - **AWG dialect rotation.** `POST /admin/v1/workers/awg-drain {id, profile,
-  draining}` stops offering an AWG profile to clients (devices keep
-  credentials for every profile), so they move to the worker's other profile
-  before the old one is removed.
+  draining}` stops offering an AWG profile to clients, so they move to the
+  worker's other profile before the old one is removed. Every approved device
+  gets credentials for the union of the fleet's AWG profiles; a background
+  pass provisions a newly added profile for existing devices and bumps the
+  worker config. Draining the base profile `awg` is refused (409) while
+  approved devices lack `route_alternatives_v1`; `force: true` overrides it
+  with step-up (`current_secret`, `totp_code`) and is audited. A worker whose
+  base was drained earlier keeps its behaviour (with an alert) until the
+  operator undrains it. Rotating the base dialect for old apps needs a new
+  key or subnet of the base profile itself.
+- **Client capabilities.** Enrollment keeps only known values of
+  `client_capabilities` (`reality_vision`, `reality_profiles`,
+  `reality_short_id`, `awg_dialect_wide`, `ipv6_endpoints`, `tunnel_dns`,
+  `route_alternatives_v1`, `reality_flow_ack`; at most 32 entries of up to
+  64 bytes are read) and drops the rest silently. It stores the app's
+  `client_version_code` (sent, or derived from `client_version`) for
+  diagnostics. An app with `reality_flow_ack` turns Vision on in two phases:
+  the reply keeps the active `reality_flow` and adds `reality_flow_pending`;
+  the device's account switches on the next enrollment carrying
+  `reality_flow_ack` equal to it. Turning Vision off is immediate. Turning it
+  on again within 10 minutes of the last switch keeps the previous flow
+  without an error. Short IDs are stored and compared lower-cased; the base
+  short ID and the last cohort cannot be revoked.
 - **Health and limits.** Ack `self_check` (`ok` / `degraded: ...`) and
   self-describe `health` are shown in the admin UI/API; the Telegram bot alerts
   on degraded workers. Device limits sent to workers include

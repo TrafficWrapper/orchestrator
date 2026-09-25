@@ -40,7 +40,7 @@ func (s *server) buildBundles(rec workerRecord) (signedConfig, signedConfig, err
 			"egress_policy":    "direct",
 			"approved_devices": devices,
 			// Short IDs (cohorts) the worker must stop accepting.
-			"revoked_short_ids": append([]string{}, rec.RevokedShortIDs...),
+			"revoked_short_ids": normalizeShortIDs(rec.RevokedShortIDs),
 			"client_artifacts":  map[string]any{"config_json_path": "/tw/config.json", "version_json_path": "/tw/version.json"},
 		},
 	}

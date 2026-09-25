@@ -3,6 +3,8 @@ package main
 import (
 	"crypto/sha256"
 	"encoding/binary"
+	"errors"
+	"fmt"
 	"math"
 	"net/http"
 	"slices"
@@ -62,13 +64,42 @@ func clientCohortShortIDs(rec workerRecord) []string {
 	out := make([]string, 0, len(raw))
 	for _, v := range raw {
 		id, _ := v.(string)
-		id = strings.TrimSpace(id)
-		if slices.Contains(rec.RevokedShortIDs, id) {
+		// Workers lower-case short IDs; compare the same way (X-L3).
+		id = strings.ToLower(strings.TrimSpace(id))
+		if shortIDRevoked(rec, id) {
 			id = ""
 		}
 		out = append(out, id)
 	}
 	return out
+}
+
+func shortIDRevoked(rec workerRecord, id string) bool {
+	for _, revoked := range rec.RevokedShortIDs {
+		if strings.EqualFold(strings.TrimSpace(revoked), id) {
+			return true
+		}
+	}
+	return false
+}
+
+// checkShortIDRevocation refuses revoking the worker's base short ID (every
+// old app uses it) or the last remaining cohort (X-L3).
+func checkShortIDRevocation(rec workerRecord, id string) error {
+	reality, _ := mapFromAny(rec.SelfDescribe["reality"])
+	if base := strings.ToLower(firstStringFromMap(reality, "short_id", "shortId")); base != "" && base == id {
+		return errors.New("the base short ID cannot be revoked")
+	}
+	remaining := 0
+	for _, cohort := range clientCohortShortIDs(rec) {
+		if cohort != "" && cohort != id {
+			remaining++
+		}
+	}
+	if remaining == 0 {
+		return errors.New("revoking this short ID would revoke every cohort")
+	}
+	return nil
 }
 
 // rateMbpsFromLimit converts the operator's rate limit text ("20mbit",
@@ -155,9 +186,21 @@ func (s *server) handleAdminWorkerShortID(w http.ResponseWriter, r *http.Request
 	if !decodeJSON(w, r, &req) {
 		return
 	}
-	if strings.TrimSpace(req.ShortID) == "" || req.Revoked == nil {
+	req.ShortID = strings.ToLower(strings.TrimSpace(req.ShortID))
+	if req.ShortID == "" || req.Revoked == nil {
 		writeError(w, "short_id and revoked are required", http.StatusBadRequest)
 		return
+	}
+	if *req.Revoked {
+		rec, err := s.store.worker(req.ID)
+		if err != nil {
+			writeStoreError(w, http.StatusNotFound, err)
+			return
+		}
+		if err := checkShortIDRevocation(rec, req.ShortID); err != nil {
+			writeError(w, err.Error(), http.StatusBadRequest)
+			return
+		}
 	}
 	if err := s.store.updateWorkerPolicy(req.ID, workerPolicyPatch{ShortID: req.ShortID, ShortIDRevoked: req.Revoked}); err != nil {
 		writeStoreError(w, http.StatusBadRequest, err)
@@ -172,6 +215,10 @@ func (s *server) handleAdminWorkerAWGDrain(w http.ResponseWriter, r *http.Reques
 		ID       string `json:"id"`
 		Profile  string `json:"profile"`
 		Draining *bool  `json:"draining"`
+		// Force drains the base profile although some devices cannot use
+		// route alternatives (needs step-up).
+		Force bool `json:"force,omitempty"`
+		stepUpProof
 	}
 	if !decodeJSON(w, r, &req) {
 		return
@@ -180,6 +227,22 @@ func (s *server) handleAdminWorkerAWGDrain(w http.ResponseWriter, r *http.Reques
 	if profile == "" || req.Draining == nil {
 		writeError(w, "profile and draining are required", http.StatusBadRequest)
 		return
+	}
+	// Draining the base AWG profile leaves apps without route alternatives
+	// with no AWG route they have credentials for (X-M4).
+	if profile == "awg" && *req.Draining {
+		n, err := s.store.devicesWithoutCapability(capabilityRouteAlternatives)
+		if err != nil {
+			writeStoreError(w, http.StatusInternalServerError, err)
+			return
+		}
+		if n > 0 && !req.Force {
+			writeError(w, fmt.Sprintf("%d approved devices do not support route alternatives; draining the base profile would cut their AWG (repeat with force and step-up)", n), http.StatusConflict)
+			return
+		}
+		if n > 0 && !s.stepUp(w, r, "worker_awg_drain_force", "drain the base AWG profile", req.stepUpProof) {
+			return
+		}
 	}
 	if err := s.store.updateWorkerPolicy(req.ID, workerPolicyPatch{AWGProfile: profile, AWGProfileDraining: req.Draining}); err != nil {
 		writeStoreError(w, http.StatusBadRequest, err)
