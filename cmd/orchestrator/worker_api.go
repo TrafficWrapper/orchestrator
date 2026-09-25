@@ -46,6 +46,9 @@ type pullResponse struct {
 	WorkerBundle signedConfig    `json:"worker_bundle,omitempty"`
 	ClientBundle signedConfig    `json:"client_bundle,omitempty"`
 	Update       *updateArtifact `json:"update,omitempty"`
+	// OrchestratorCapabilities tells the worker which newer formats this
+	// orchestrator accepts (see orchestratorCapabilities).
+	OrchestratorCapabilities []string `json:"orchestrator_capabilities,omitempty"`
 	// release frees the APK shipment slot once the response is written.
 	release func()
 }
@@ -71,13 +74,14 @@ type ackRequest struct {
 }
 
 type ackResponse struct {
-	OK            bool   `json:"ok"`
-	Error         string `json:"error,omitempty"`
-	DesiredSeq    int64  `json:"desired_seq,omitempty"`
-	AppliedSeq    int64  `json:"applied_seq,omitempty"`
-	EgressIPProbe string `json:"egress_ip_probe,omitempty"`
-	EgressMatch   bool   `json:"egress_match"`
-	QuotaBlocks   int    `json:"quota_blocks,omitempty"`
+	OK                       bool     `json:"ok"`
+	OrchestratorCapabilities []string `json:"orchestrator_capabilities,omitempty"`
+	Error                    string   `json:"error,omitempty"`
+	DesiredSeq               int64    `json:"desired_seq,omitempty"`
+	AppliedSeq               int64    `json:"applied_seq,omitempty"`
+	EgressIPProbe            string   `json:"egress_ip_probe,omitempty"`
+	EgressMatch              bool     `json:"egress_match"`
+	QuotaBlocks              int      `json:"quota_blocks,omitempty"`
 }
 
 type deviceUsage struct {
@@ -95,10 +99,11 @@ type nudgeRequest struct {
 }
 
 type nudgeResponse struct {
-	OK         bool   `json:"ok"`
-	Error      string `json:"error,omitempty"`
-	DesiredSeq int64  `json:"desired_seq,omitempty"`
-	Heartbeat  bool   `json:"heartbeat,omitempty"`
+	OK                       bool     `json:"ok"`
+	OrchestratorCapabilities []string `json:"orchestrator_capabilities,omitempty"`
+	Error                    string   `json:"error,omitempty"`
+	DesiredSeq               int64    `json:"desired_seq,omitempty"`
+	Heartbeat                bool     `json:"heartbeat,omitempty"`
 }
 
 func (s *server) handleEnroll(peer []byte, raw []byte) (any, error) {
@@ -155,7 +160,7 @@ func (s *server) handlePull(peer []byte, raw []byte) (any, error) {
 		}
 	}
 	if req.HaveSeq >= rec.DesiredSeq {
-		return pullResponse{OK: true, Status: rec.Status, WorkerID: rec.ID, DesiredSeq: rec.DesiredSeq, NotModified: true}, nil
+		return pullResponse{OK: true, Status: rec.Status, WorkerID: rec.ID, DesiredSeq: rec.DesiredSeq, NotModified: true, OrchestratorCapabilities: orchestratorCapabilities()}, nil
 	}
 	wb, cb, err := s.buildBundles(rec)
 	if err != nil {
@@ -165,7 +170,7 @@ func (s *server) handlePull(peer []byte, raw []byte) (any, error) {
 	if err != nil {
 		return nil, err
 	}
-	return pullResponse{OK: true, Status: rec.Status, WorkerID: rec.ID, DesiredSeq: rec.DesiredSeq, WorkerBundle: wb, ClientBundle: cb, Update: update, release: release}, nil
+	return pullResponse{OK: true, Status: rec.Status, WorkerID: rec.ID, DesiredSeq: rec.DesiredSeq, WorkerBundle: wb, ClientBundle: cb, Update: update, release: release, OrchestratorCapabilities: orchestratorCapabilities()}, nil
 }
 
 // maxAckUsageReports bounds one ack's accounting work; workers split larger
@@ -208,7 +213,7 @@ func (s *server) handleNudge(ctx context.Context, peer []byte, raw []byte) (any,
 			updatedHeartbeat = true
 		}
 		if rec.DesiredSeq > req.HaveSeq || expired {
-			return nudgeResponse{OK: true, DesiredSeq: rec.DesiredSeq, Heartbeat: rec.DesiredSeq <= req.HaveSeq}, nil
+			return nudgeResponse{OK: true, DesiredSeq: rec.DesiredSeq, Heartbeat: rec.DesiredSeq <= req.HaveSeq, OrchestratorCapabilities: orchestratorCapabilities()}, nil
 		}
 		select {
 		case <-ctx.Done():
@@ -263,7 +268,7 @@ func (s *server) handleAck(peer []byte, raw []byte) (any, error) {
 		log.Printf("quota enforcement blocked devices count=%d worker=%s", quotaBlocks, rec.ID)
 	}
 	s.observeClientAppliedSeq(rec, req.ClientAppliedSeq)
-	return ackResponse{OK: true, DesiredSeq: desiredSeq, AppliedSeq: req.AppliedVersion, EgressIPProbe: probe, EgressMatch: egressMatch, QuotaBlocks: quotaBlocks}, nil
+	return ackResponse{OK: true, DesiredSeq: desiredSeq, AppliedSeq: req.AppliedVersion, EgressIPProbe: probe, EgressMatch: egressMatch, QuotaBlocks: quotaBlocks, OrchestratorCapabilities: orchestratorCapabilities()}, nil
 }
 
 const egressProbeCacheTTL = time.Minute
@@ -314,4 +319,13 @@ func (p pullResponse) releaseAfterWrite() {
 	if p.release != nil {
 		p.release()
 	}
+}
+
+// Capabilities this orchestrator announces to workers
+// (orchestrator_capabilities in pull, nudge and ack responses). A worker
+// only uses a newer format when the orchestrator announced it.
+const orchCapUsageSourceAWG = "usage_source_awg_v1"
+
+func orchestratorCapabilities() []string {
+	return []string{orchCapUsageSourceAWG}
 }

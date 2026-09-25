@@ -1559,17 +1559,25 @@ func applyDeviceUsageReport(rec *deviceRecord, workerID string, report deviceUsa
 	next := deviceUsageCounter{RxBytes: report.RxBytes, TxBytes: report.TxBytes}
 	prev, ok := rec.UsageCounters[stateKey]
 	if !ok {
+		// The first report under a key is a baseline for every source:
+		// workers keep lifetime totals, so charging it would bill traffic
+		// from before this enrollment or counter key (ORC-M9).
 		rec.UsageCounters[stateKey] = next
-		if report.Source != "" {
-			rec.UsageRxBytes = saturatingAddUint64(rec.UsageRxBytes, report.RxBytes)
-			rec.UsageTxBytes = saturatingAddUint64(rec.UsageTxBytes, report.TxBytes)
-		}
 		updatedAt := now.UTC()
 		rec.UsageUpdatedAt = &updatedAt
 		return true
 	}
-	deltaRx := usageCounterDelta(prev.RxBytes, report.RxBytes)
-	deltaTx := usageCounterDelta(prev.TxBytes, report.TxBytes)
+	if report.RxBytes < prev.RxBytes || report.TxBytes < prev.TxBytes {
+		// Counters only grow; a smaller value is a reset or another
+		// counter. Rebase without charging instead of double-billing.
+		log.Printf("usage counter went backwards device=%s key_source=%q rx %d->%d tx %d->%d; rebasing", rec.ID, report.Source, prev.RxBytes, report.RxBytes, prev.TxBytes, report.TxBytes)
+		rec.UsageCounters[stateKey] = next
+		updatedAt := now.UTC()
+		rec.UsageUpdatedAt = &updatedAt
+		return true
+	}
+	deltaRx := report.RxBytes - prev.RxBytes
+	deltaTx := report.TxBytes - prev.TxBytes
 	changed := false
 	if deltaRx > 0 {
 		rec.UsageRxBytes = saturatingAddUint64(rec.UsageRxBytes, deltaRx)
@@ -1616,20 +1624,19 @@ func deviceUsageStateKey(workerID string, report deviceUsage) string {
 	return workerID + "\x00" + key
 }
 
+// normalizeDeviceUsageSource maps a report source to the state-key source.
+// "awg" (with device_id) is accepted since orchestrator_capabilities
+// advertises usage_source_awg_v1; reports without source stay keyed by the
+// AWG public key.
 func normalizeDeviceUsageSource(source string) string {
 	switch strings.ToLower(strings.TrimSpace(source)) {
 	case "reality":
 		return "reality"
+	case "awg":
+		return "awg"
 	default:
 		return ""
 	}
-}
-
-func usageCounterDelta(previous, current uint64) uint64 {
-	if current >= previous {
-		return current - previous
-	}
-	return current
 }
 
 func saturatingAddUint64(a, b uint64) uint64 {
