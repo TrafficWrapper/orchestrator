@@ -316,6 +316,7 @@ func (s *server) apiRoutes() []apiRoute {
 		{"/admin/v1/bootstrap-token/create", s.admin(adminPOST, s.handleAdminBootstrapTokenCreate)},
 		{"/admin/v1/bootstrap-token/qr", s.admin(adminPOST, s.handleAdminBootstrapTokenQR)},
 		{"/admin/v1/approve-worker", s.admin(adminPOST, s.handleAdminApproveWorker)},
+		{"/admin/v1/workers/revoke", s.admin(adminPOST, s.handleAdminWorkerRevoke)},
 		{"/admin/v1/revoke-device", s.admin(adminPOST, s.handleAdminRevokeDevice)},
 		{"/admin/v1/delete-device", s.admin(adminPOST, s.handleAdminDeleteDevice)},
 		{"/admin/v1/device-alias", s.admin(adminPOST, s.handleAdminDeviceAlias)},

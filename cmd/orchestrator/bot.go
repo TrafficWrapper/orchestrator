@@ -50,6 +50,8 @@ type authApprover interface {
 }
 
 type loginApprovalRequest struct {
+	// Action names a sensitive admin action; empty means a login.
+	Action     string
 	RemoteAddr string
 	UserAgent  string
 	CreatedAt  time.Time
@@ -1072,7 +1074,12 @@ func (a *botAuthApprover) requestLoginApproval(ctx context.Context, req loginApp
 		delete(a.pending, nonce)
 		a.mu.Unlock()
 	}()
-	text := fmt.Sprintf("Подтвердить вход в админку?\nnonce: %s\naddr: %s\nua: %s",
+	question := "Подтвердить вход в админку?"
+	if req.Action != "" {
+		question = "Подтвердить действие в админке: " + botSafeText(req.Action, 120) + "?"
+	}
+	text := fmt.Sprintf("%s\nnonce: %s\naddr: %s\nua: %s",
+		question,
 		nonce,
 		firstNotBlank(req.RemoteAddr, "-"),
 		shortString(firstNotBlank(req.UserAgent, "-"), 80),

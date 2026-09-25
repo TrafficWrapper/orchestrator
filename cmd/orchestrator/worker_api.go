@@ -22,6 +22,7 @@ type enrollRequest struct {
 type enrollResponse struct {
 	OK              bool   `json:"ok"`
 	Error           string `json:"error,omitempty"`
+	Code            string `json:"code,omitempty"`
 	WorkerID        string `json:"worker_id,omitempty"`
 	Status          string `json:"status,omitempty"`
 	SignerPublicKey string `json:"signer_public_key,omitempty"`
@@ -30,6 +31,9 @@ type enrollResponse struct {
 type pullRequest struct {
 	WorkerID string `json:"worker_id"`
 	HaveSeq  int64  `json:"have_seq"`
+	// WorkerCapabilities is what the running worker supports; it wins over
+	// a possibly stale self_describe (e.g. after an image downgrade).
+	WorkerCapabilities []string `json:"worker_capabilities,omitempty"`
 }
 
 type pullResponse struct {
@@ -103,6 +107,11 @@ func (s *server) handleEnroll(peer []byte, raw []byte) (any, error) {
 	if strings.TrimSpace(req.WorkerStaticPub) != "" && req.WorkerStaticPub != staticPub {
 		return nil, errors.New("worker static pub mismatch")
 	}
+	// A revoked key cannot come back through a fresh token (checked before
+	// the token is spent).
+	if existing, err := s.store.worker(workerID(staticPub)); err == nil && existing.Status == "revoked" {
+		return enrollResponse{OK: false, Error: "worker revoked", Status: "revoked", Code: workerCodeRevoked}, nil
+	}
 	if _, err := s.store.consumeToken(req.Token, staticPub); err != nil {
 		return enrollResponse{OK: false, Error: err.Error()}, nil
 	}
@@ -132,6 +141,9 @@ func (s *server) handlePull(peer []byte, raw []byte) (any, error) {
 	if rec.Status == "pending" {
 		return pullResponse{OK: false, Status: "pending", Error: "owner approval required"}, nil
 	}
+	if workerRevokeFinal(rec, req.WorkerCapabilities, time.Now().UTC()) {
+		return workerRevokedResponse(), nil
+	}
 	if req.HaveSeq >= rec.DesiredSeq {
 		return pullResponse{OK: true, Status: rec.Status, WorkerID: rec.ID, DesiredSeq: rec.DesiredSeq, NotModified: true}, nil
 	}
@@ -145,6 +157,10 @@ func (s *server) handlePull(peer []byte, raw []byte) (any, error) {
 	}
 	return pullResponse{OK: true, Status: rec.Status, WorkerID: rec.ID, DesiredSeq: rec.DesiredSeq, WorkerBundle: wb, ClientBundle: cb, Update: update, release: release}, nil
 }
+
+// maxAckUsageReports bounds one ack's accounting work; workers split larger
+// reports across acks.
+const maxAckUsageReports = 32768
 
 const (
 	nudgeLongPollTimeout = 25 * time.Second
@@ -170,6 +186,12 @@ func (s *server) handleNudge(ctx context.Context, peer []byte, raw []byte) (any,
 		}
 		if rec.StaticPublicKey != protocol.KeyToBase64(peer) {
 			return nudgeResponse{OK: false, Error: "worker identity mismatch"}, nil
+		}
+		switch {
+		case rec.Status == "pending":
+			return workerPendingResponse(), nil
+		case workerRevokeFinal(rec, nil, time.Now().UTC()):
+			return workerRevokedResponse(), nil
 		}
 		if !updatedHeartbeat {
 			_ = s.store.updateWorkerHeartbeat(rec.ID, req.HaveSeq, req.SelfDescribe)
@@ -201,6 +223,22 @@ func (s *server) handleAck(peer []byte, raw []byte) (any, error) {
 	}
 	if rec.StaticPublicKey != protocol.KeyToBase64(peer) {
 		return ackResponse{OK: false, Error: "worker identity mismatch"}, nil
+	}
+	switch rec.Status {
+	case "pending":
+		return workerPendingResponse(), nil
+	case "revoked":
+		// Record that the empty phase-one config was applied, then refuse.
+		if !workerRevokeFinal(rec, nil, time.Now().UTC()) {
+			if _, _, err := s.store.recordAck(rec.ID, req.AppliedVersion, req.SelfCheck, req.EgressIPObserved, nil, nil, nil, time.Now().UTC()); err != nil {
+				return nil, err
+			}
+		}
+		return workerRevokedResponse(), nil
+	}
+	if len(req.Usage) > maxAckUsageReports {
+		log.Printf("worker %s ack carried %d usage reports; accounting the first %d", rec.ID, len(req.Usage), maxAckUsageReports)
+		req.Usage = req.Usage[:maxAckUsageReports]
 	}
 	probe := s.probeEgressIP(rec)
 	egressMatch := probe != "" && probe == req.EgressIPObserved
