@@ -70,7 +70,7 @@ func TestRevokeOldWorkerIsTwoPhase(t *testing.T) {
 		t.Fatal("revoked worker must get every protocol off")
 	}
 	ackRaw, _ := json.Marshal(ackRequest{WorkerID: rec.ID, AppliedVersion: revoked.RevokeSeq})
-	ack, err := s.handleAck(peer, ackRaw)
+	ack, err := s.handleAckContext(context.Background(), peer, ackRaw)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -144,7 +144,7 @@ func TestPendingWorkerCallsCarryCode(t *testing.T) {
 		t.Fatalf("nudge=%+v", resp)
 	}
 	raw, _ = json.Marshal(ackRequest{WorkerID: rec.ID})
-	if resp, _ := s.handleAck(kp.Public, raw); resp.(workerRefusal).Code != workerCodePending {
+	if resp, _ := s.handleAckContext(context.Background(), kp.Public, raw); resp.(workerRefusal).Code != workerCodePending {
 		t.Fatalf("ack=%+v", resp)
 	}
 	raw, _ = json.Marshal(workerTelemetryRequest{WorkerID: rec.ID})

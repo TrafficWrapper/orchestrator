@@ -74,6 +74,9 @@ type bootstrapPayload struct {
 	BootstrapToken  string          `json:"bootstrap_token"`
 	Limits          json.RawMessage `json:"limits,omitempty"`
 	Expires         string          `json:"expires"`
+	// OrchTLSSPKISHA256 lists base64 SHA-256 SPKI pins (current and backup)
+	// of the orchestrator's TLS certificate for first enrollment (APP-L36).
+	OrchTLSSPKISHA256 []string `json:"orch_tls_spki_sha256,omitempty"`
 }
 
 // handleDeviceEnroll adds a structured code to refusals (the error texts
@@ -250,6 +253,8 @@ func makeBootstrapPayload(cfg orchConfig, pubkey, orchNoisePublic, token string,
 		BootstrapToken:  token,
 		Limits:          copyRawJSON(rec.Limits),
 		Expires:         rec.ExpiresAt.UTC().Format(time.RFC3339),
+
+		OrchTLSSPKISHA256: orchTLSSPKIPins(cfg),
 	}
 }
 

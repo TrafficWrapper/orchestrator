@@ -446,6 +446,8 @@ func adminWorkerPayload(worker workerRecord) map[string]any {
 		"applied_seq":             worker.AppliedSeq,
 		"egress_ack":              worker.EgressIPObserved,
 		"egress_probe":            worker.EgressIPProbe,
+		"egress_seen":             worker.EgressIPSeen,
+		"egress_check":            worker.EgressCheck,
 		"enabled":                 !worker.Disabled,
 		"priority":                effectiveWorkerPriority(worker),
 		"weight":                  effectiveWorkerWeight(worker),
