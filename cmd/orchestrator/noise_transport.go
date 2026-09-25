@@ -312,6 +312,9 @@ func (s *server) handleNoiseContext(fn func(context.Context, []byte, []byte) (an
 		if err != nil {
 			resp = map[string]any{"ok": false, "error": err.Error()}
 		}
+		if strings.HasPrefix(r.URL.Path, "/w/") {
+			resp = stampServerTime(resp, time.Now())
+		}
 		// Responses holding a scarce resource (an APK shipment slot) release
 		// it only after the encrypted response has been written.
 		if rel, ok := resp.(interface{ releaseAfterWrite() }); ok {

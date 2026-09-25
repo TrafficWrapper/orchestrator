@@ -43,8 +43,11 @@ func (r deviceEnrollRequest) capabilities() []string {
 }
 
 type deviceEnrollResponse struct {
-	OK          bool                        `json:"ok"`
-	Error       string                      `json:"error,omitempty"`
+	OK    bool   `json:"ok"`
+	Error string `json:"error,omitempty"`
+	// Code classifies a refusal (enrollErrorCode); apps without it fall
+	// back to matching Error.
+	Code        string                      `json:"code,omitempty"`
 	DeviceID    string                      `json:"device_id,omitempty"`
 	Status      string                      `json:"status,omitempty"`
 	RealityUUID string                      `json:"reality_uuid,omitempty"`
@@ -54,7 +57,7 @@ type deviceEnrollResponse struct {
 	// RealityFlow is the flow of this device's REALITY account on every
 	// worker ("" or xtls-rprx-vision); the app must use exactly this value
 	// on TCP REALITY routes (XHTTP routes never carry a flow).
-	RealityFlow     string       `json:"reality_flow,omitempty"`
+	RealityFlow     string       `json:"reality_flow"`
 	ServerAWGPublic string       `json:"server_awg_public,omitempty"`
 	SignerPublicKey string       `json:"signer_public_key,omitempty"`
 	ClientBundle    signedConfig `json:"client_bundle,omitempty"`
@@ -71,7 +74,18 @@ type bootstrapPayload struct {
 	Expires         string          `json:"expires"`
 }
 
+// handleDeviceEnroll adds a structured code to refusals (the error texts
+// stay what apps 0.1.28–0.1.31 match on).
 func (s *server) handleDeviceEnroll(peer []byte, raw []byte) (any, error) {
+	resp, err := s.deviceEnroll(peer, raw)
+	if r, ok := resp.(deviceEnrollResponse); ok && !r.OK && r.Code == "" {
+		r.Code = enrollErrorCode(r.Error)
+		resp = r
+	}
+	return resp, err
+}
+
+func (s *server) deviceEnroll(peer []byte, raw []byte) (any, error) {
 	var req deviceEnrollRequest
 	if err := json.Unmarshal(raw, &req); err != nil {
 		return nil, err
@@ -107,6 +121,8 @@ func (s *server) handleDeviceEnroll(peer []byte, raw []byte) (any, error) {
 		storedNoisePub := strings.TrimSpace(existing.NoisePublicKey)
 		storedAWGPublic := strings.TrimSpace(existing.AWGPublicKey)
 		switch {
+		case existing.Status == "revoked":
+			return deviceEnrollResponse{OK: false, Error: "device is not approved", Code: "device_revoked"}, nil
 		case existing.Status != "approved":
 			return deviceEnrollResponse{OK: false, Error: "device is not approved"}, nil
 		case storedIdentityPub == "" || storedIdentityPub != identityPub:
@@ -229,4 +245,27 @@ func clientBundleHasWorkers(bundle signedConfig) bool {
 		Workers []json.RawMessage `json:"workers"`
 	}
 	return json.Unmarshal([]byte(bundle.ConfigJSON), &doc) == nil && len(doc.Workers) > 0
+}
+
+// enrollErrorCode maps an enrollment refusal to its structured code. Codes
+// of retryable refusals (no_worker, retry) come with texts that carry the
+// transient markers old apps look for ("no approved worker", "retry").
+func enrollErrorCode(text string) string {
+	switch {
+	case strings.Contains(text, "no approved worker"):
+		return "no_worker"
+	case strings.Contains(text, "bootstrap token"):
+		return "token_invalid"
+	case strings.Contains(text, "device is not approved"):
+		return "device_not_approved"
+	case strings.Contains(text, "identity mismatch"):
+		return "identity_mismatch"
+	case strings.Contains(text, "noise pub mismatch"):
+		return "noise_mismatch"
+	case strings.Contains(text, "awg public key mismatch"):
+		return "awg_key_mismatch"
+	case strings.Contains(text, "retry"):
+		return "retry"
+	}
+	return ""
 }

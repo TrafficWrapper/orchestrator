@@ -20,7 +20,9 @@ type enrollRequest struct {
 }
 
 type enrollResponse struct {
-	OK              bool   `json:"ok"`
+	OK bool `json:"ok"`
+	// ServerTime is the orchestrator clock (unix ms) for worker skew.
+	ServerTime      int64  `json:"server_time,omitempty"`
 	Error           string `json:"error,omitempty"`
 	Code            string `json:"code,omitempty"`
 	WorkerID        string `json:"worker_id,omitempty"`
@@ -37,7 +39,9 @@ type pullRequest struct {
 }
 
 type pullResponse struct {
-	OK           bool            `json:"ok"`
+	OK bool `json:"ok"`
+	// ServerTime is the orchestrator clock (unix ms) for worker skew.
+	ServerTime   int64           `json:"server_time,omitempty"`
 	Error        string          `json:"error,omitempty"`
 	Status       string          `json:"status,omitempty"`
 	WorkerID     string          `json:"worker_id,omitempty"`
@@ -74,7 +78,9 @@ type ackRequest struct {
 }
 
 type ackResponse struct {
-	OK                       bool     `json:"ok"`
+	OK bool `json:"ok"`
+	// ServerTime is the orchestrator clock (unix ms) for worker skew.
+	ServerTime               int64    `json:"server_time,omitempty"`
 	OrchestratorCapabilities []string `json:"orchestrator_capabilities,omitempty"`
 	Error                    string   `json:"error,omitempty"`
 	DesiredSeq               int64    `json:"desired_seq,omitempty"`
@@ -99,7 +105,9 @@ type nudgeRequest struct {
 }
 
 type nudgeResponse struct {
-	OK                       bool     `json:"ok"`
+	OK bool `json:"ok"`
+	// ServerTime is the orchestrator clock (unix ms) for worker skew.
+	ServerTime               int64    `json:"server_time,omitempty"`
 	OrchestratorCapabilities []string `json:"orchestrator_capabilities,omitempty"`
 	Error                    string   `json:"error,omitempty"`
 	DesiredSeq               int64    `json:"desired_seq,omitempty"`
@@ -328,4 +336,32 @@ const orchCapUsageSourceAWG = "usage_source_awg_v1"
 
 func orchestratorCapabilities() []string {
 	return []string{orchCapUsageSourceAWG}
+}
+
+// stampServerTime sets server_time (orchestrator clock, unix ms) on a
+// worker-facing Noise response so workers can judge freshness by the
+// platform clock instead of their own (WRK-L26).
+func stampServerTime(resp any, now time.Time) any {
+	ms := now.UnixMilli()
+	switch r := resp.(type) {
+	case pullResponse:
+		r.ServerTime = ms
+		return r
+	case nudgeResponse:
+		r.ServerTime = ms
+		return r
+	case ackResponse:
+		r.ServerTime = ms
+		return r
+	case enrollResponse:
+		r.ServerTime = ms
+		return r
+	case workerRefusal:
+		r.ServerTime = ms
+		return r
+	case map[string]any:
+		r["server_time"] = ms
+		return r
+	}
+	return resp
 }

@@ -22,7 +22,21 @@ type workerTelemetryRequest struct {
 	ReceivedAt    string            `json:"received_at,omitempty"`
 }
 
+// handleWorkerTelemetry adds a structured code to refusals; error texts are
+// unchanged (old workers match "device is not approved").
 func (s *server) handleWorkerTelemetry(peer []byte, raw []byte) (any, error) {
+	resp, err := s.workerTelemetry(peer, raw)
+	if m, ok := resp.(map[string]any); ok && m["ok"] == false {
+		if _, has := m["code"]; !has {
+			if code := telemetryErrorCode(stringFromMap(m, "error")); code != "" {
+				m["code"] = code
+			}
+		}
+	}
+	return resp, err
+}
+
+func (s *server) workerTelemetry(peer []byte, raw []byte) (any, error) {
 	var req workerTelemetryRequest
 	if err := json.Unmarshal(raw, &req); err != nil {
 		return nil, err
@@ -329,4 +343,24 @@ func publicRouteLabel(value string) string {
 	default:
 		return strings.TrimSpace(value)
 	}
+}
+
+// telemetryErrorCode maps a telemetry refusal to its structured code.
+func telemetryErrorCode(text string) string {
+	switch {
+	case strings.Contains(text, "freshness window"), strings.Contains(text, "timestamp invalid"):
+		return "stale_timestamp"
+	case strings.Contains(text, "replay"):
+		return "replay"
+	case strings.HasPrefix(text, "telemetry signature"), strings.HasPrefix(text, "telemetry device mismatch"),
+		strings.HasPrefix(text, "telemetry key type"), strings.HasPrefix(text, "telemetry public key"):
+		return "bad_signature"
+	case text == "unknown device":
+		return "unknown_device"
+	case strings.Contains(text, "device is not approved"):
+		return "device_not_approved"
+	case strings.Contains(text, "invalid telemetry payload"), strings.Contains(text, "payload device mismatch"):
+		return "invalid_payload"
+	}
+	return ""
 }

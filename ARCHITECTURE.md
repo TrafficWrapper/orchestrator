@@ -118,6 +118,15 @@ once on intake (enroll, nudge, ack) and only the sanitized copy is stored:
   every publish. `workers` is always an array; enrollment with no worker
   available fails with a retryable "no approved worker" error before the
   token is spent. Workers may report `client_applied_seq` in ack.
+- Refusal codes and platform time. Refusals keep their error texts (older
+  apps and workers match them) and add `code`: on `/d/v1/enroll`
+  token_invalid, device_not_approved, device_revoked, identity_mismatch,
+  noise_mismatch, awg_key_mismatch, no_worker, retry; on `/w/v1/telemetry`
+  stale_timestamp, replay, bad_signature, unknown_device,
+  device_not_approved, invalid_payload, worker_revoked, worker_pending.
+  Every worker-facing Noise response carries `server_time` (orchestrator
+  clock, unix ms). The enroll response always carries `reality_flow`, also
+  when empty.
 
 ## Device Enrollment and Connect
 

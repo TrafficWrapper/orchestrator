@@ -65,10 +65,11 @@ func workerGetsDevices(rec workerRecord) bool {
 }
 
 type workerRefusal struct {
-	OK     bool   `json:"ok"`
-	Status string `json:"status"`
-	Error  string `json:"error"`
-	Code   string `json:"code"`
+	OK         bool   `json:"ok"`
+	Status     string `json:"status"`
+	Error      string `json:"error"`
+	Code       string `json:"code"`
+	ServerTime int64  `json:"server_time,omitempty"`
 }
 
 func workerRevokedResponse() workerRefusal {
