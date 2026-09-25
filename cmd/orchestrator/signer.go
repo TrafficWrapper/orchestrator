@@ -53,6 +53,17 @@ func runSigner(cfg orchConfig) error {
 	if err != nil {
 		return err
 	}
+	// The discovery feed has its own key in the signer (ORC-L20); it is
+	// used once the orchestrator runs with ORCH_DISCOVERY_SIGNER=1.
+	discPub, discPriv, err := loadOrCreateMinisignKey(discoveryKeyPath(keyPath))
+	if err != nil {
+		return err
+	}
+	policy, err := loadSignerPolicy(signerPolicyPath(keyPath))
+	if err != nil {
+		return err
+	}
+	keys := signerKeys{pub: pub, priv: priv, discPub: discPub, discPriv: discPriv, policy: policy}
 	_ = os.Remove(cfg.SignerSocket)
 	if err := os.MkdirAll(filepath.Dir(cfg.SignerSocket), 0o700); err != nil {
 		return err
@@ -75,7 +86,7 @@ func runSigner(cfg orchConfig) error {
 		if err != nil {
 			return err
 		}
-		go handleSignerConn(c, pub, priv)
+		go handleSignerConn(c, keys)
 	}
 }
 
@@ -156,7 +167,18 @@ func writeFileAtomic(path string, data []byte, perm os.FileMode) error {
 	return nil
 }
 
-func handleSignerConn(c net.Conn, pub minisign.PublicKey, priv minisign.PrivateKey) {
+// signerKeys are the signer's keys and signing policy.
+type signerKeys struct {
+	pub, discPub   minisign.PublicKey
+	priv, discPriv minisign.PrivateKey
+	policy         *signerPolicy
+}
+
+func discoveryKeyPath(keyPath string) string {
+	return filepath.Join(filepath.Dir(keyPath), "discovery.key")
+}
+
+func handleSignerConn(c net.Conn, keys signerKeys) {
 	defer c.Close()
 	_ = c.SetDeadline(time.Now().Add(signerCallTimeout))
 	var req signerRequest
@@ -166,10 +188,18 @@ func handleSignerConn(c net.Conn, pub minisign.PublicKey, priv minisign.PrivateK
 	} else {
 		switch req.Action {
 		case "public-key":
-			resp.PublicKey = mustText(pub)
-		case "sign":
+			resp.PublicKey = mustText(keys.pub)
+		case "discovery-public-key":
+			resp.PublicKey = mustText(keys.discPub)
+		case "sign", "sign-discovery":
+			pub, priv, namespaces := keys.pub, keys.priv, []string{nsClientConfig, nsWorkerConfig}
+			if req.Action == "sign-discovery" {
+				pub, priv, namespaces = keys.discPub, keys.discPriv, []string{nsDiscovery}
+			}
 			if strings.TrimSpace(req.Message) == "" {
 				resp = signerResponse{OK: false, Error: "message is empty"}
+			} else if err := keys.policy.admit(req.Message, namespaces...); err != nil {
+				resp = signerResponse{OK: false, Error: err.Error()}
 			} else {
 				resp.Signature = string(minisign.Sign(priv, []byte(req.Message)))
 				resp.PublicKey = mustText(pub)
@@ -239,6 +269,29 @@ func (c signerClient) publicKey() (string, error) {
 		return "", err
 	}
 	return resp.PublicKey, nil
+}
+
+// discoverySigner signs the discovery feed with the signer's discovery key.
+type discoverySigner interface {
+	discoveryPublicKey() (string, error)
+	signDiscovery(message string) (string, string, error)
+}
+
+func (c signerClient) discoveryPublicKey() (string, error) {
+	resp, err := c.call(signerRequest{Action: "discovery-public-key"})
+	if err != nil {
+		return "", err
+	}
+	return resp.PublicKey, nil
+}
+
+// signDiscovery returns the signature and the public key that made it.
+func (c signerClient) signDiscovery(message string) (string, string, error) {
+	resp, err := c.call(signerRequest{Action: "sign-discovery", Message: message})
+	if err != nil {
+		return "", "", err
+	}
+	return resp.Signature, resp.PublicKey, nil
 }
 
 func (c signerClient) sign(message string) (signedConfig, error) {

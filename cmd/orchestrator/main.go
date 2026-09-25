@@ -39,6 +39,9 @@ type orchConfig struct {
 	// app package every published APK must carry.
 	APKManifestTTL time.Duration
 	APKPackage     string
+	// DiscoverySigner signs the discovery feed with the isolated signer's
+	// discovery key instead of the update key (ORCH_DISCOVERY_SIGNER).
+	DiscoverySigner bool
 	// DiscoveryPublic is the public discovery mode (ORCH_DISCOVERY_PUBLIC).
 	DiscoveryPublic string
 	// APKInlineMaxBytes caps APKs shipped inside config pull
@@ -280,6 +283,7 @@ func readConfig() (orchConfig, error) {
 		AllowUnreadableRecords:  env.bool("ORCH_STORE_ALLOW_UNREADABLE", false),
 		APKManifestTTL:          env.duration("ORCH_APK_MANIFEST_TTL", defaultAPKManifestTTL, 24*time.Hour),
 		APKPackage:              strings.TrimSpace(os.Getenv("ORCH_APK_PACKAGE")),
+		DiscoverySigner:         env.bool("ORCH_DISCOVERY_SIGNER", false),
 		APKInlineMaxBytes:       env.int64("ORCH_APK_INLINE_MAX_BYTES", defaultAPKInlineMaxBytes, 0),
 		APKMaxBytes:             env.int64("ORCH_APK_MAX_BYTES", defaultAPKMaxBytes, 1),
 	}

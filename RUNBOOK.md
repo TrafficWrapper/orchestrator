@@ -177,6 +177,23 @@ because older apps need a complete AWG entry. The feed is re-sent to workers
 whenever its seq changes and at least every 5 hours, well before its 12-hour
 `expires_at`.
 
+## Signer policy and the discovery key
+
+The signer signs only `client-config-v1` and `worker-config-v1` documents with
+the config key, and only `rendezvous-v1` feeds with its separate discovery key
+(`discovery.key` next to the config key). For every stream (the client config,
+each worker's config, the discovery feed) the seq may rise by at most
+10,000,000 over the highest seq signed before; the highest values are kept in
+`sign-policy.json` next to the keys. The one-time client seq migration fits
+this step. Raise a client seq floor by more than that in several steps.
+
+To move discovery off the update key, set `ORCH_DISCOVERY_SIGNER=1` and
+restart. The client bundle announces the new `discovery_pubkey` and the feed
+is signed with it in the same change, so apps that received the new bundle
+accept the feed. Apps still offline until then reject new feeds until they
+fetch a bundle; do this only after the monotonic client seq is live, as a
+planned operator action.
+
 ## Worker compromise
 
 1. Revoke the worker: `POST /admin/v1/workers/revoke {"id": ..., "current_secret": ..., "totp_code": ...}`
