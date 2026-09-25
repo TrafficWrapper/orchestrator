@@ -108,6 +108,16 @@ once on intake (enroll, nudge, ack) and only the sanitized copy is stored:
   handshake still does that. Before any authentication the server also caps
   open connections (8192), header size (64 KiB) and concurrent buffered
   request bodies (512).
+- Client bundle seq. The shared client bundle (the same for enrollment and
+  pull) is published with a persistent, strictly increasing seq: one seq is
+  always one content (only `issued_at`/`expires_at` are re-signed, at most
+  once a minute). A content change is published under seq+1 after two
+  identical checks 5 s apart (operator actions publish on the next check);
+  content older than 2/3 of `ORCH_CLIENT_BUNDLE_TTL` is republished under
+  seq+1. Workers get their config seq raised to at least the client seq on
+  every publish. `workers` is always an array; enrollment with no worker
+  available fails with a retryable "no approved worker" error before the
+  token is spent. Workers may report `client_applied_seq` in ack.
 
 ## Device Enrollment and Connect
 

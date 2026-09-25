@@ -45,6 +45,9 @@ var (
 )
 
 type orchStore struct {
+	// clientContentForced asks the client bundle publisher to publish a
+	// change without waiting for confirmation (an operator action).
+	clientContentForced     atomic.Bool
 	db                      *bolt.DB
 	aead                    cipher.AEAD
 	tokenLookupKey          []byte
@@ -96,21 +99,24 @@ type workerRecord struct {
 	SelfDescribeForbidden bool     `json:"self_describe_forbidden,omitempty"`
 	// RevokedAt/RevokeSeq/RevokeFinal track a worker revocation: RevokeSeq
 	// is the empty config an old worker must ack before it is refused.
-	RevokedAt        *time.Time      `json:"revoked_at,omitempty"`
-	RevokeSeq        int64           `json:"revoke_seq,omitempty"`
-	RevokeFinal      bool            `json:"revoke_final,omitempty"`
-	CreatedAt        time.Time       `json:"created_at"`
-	ApprovedAt       *time.Time      `json:"approved_at,omitempty"`
-	DesiredSeq       int64           `json:"desired_seq"`
-	AppliedSeq       int64           `json:"applied_seq"`
-	LastAckAt        *time.Time      `json:"last_ack_at,omitempty"`
-	EgressIPObserved string          `json:"egress_ip_observed,omitempty"`
-	EgressIPProbe    string          `json:"egress_ip_probe,omitempty"`
-	LastError        string          `json:"last_error,omitempty"`
-	Disabled         bool            `json:"disabled,omitempty"`
-	ConfigPriority   *int            `json:"config_priority,omitempty"`
-	ConfigWeight     *int            `json:"config_weight,omitempty"`
-	ProtocolEnabled  map[string]bool `json:"protocol_enabled,omitempty"`
+	RevokedAt   *time.Time `json:"revoked_at,omitempty"`
+	RevokeSeq   int64      `json:"revoke_seq,omitempty"`
+	RevokeFinal bool       `json:"revoke_final,omitempty"`
+	// AutoDetectEmptySince is when the worker first reported an empty
+	// auto-detected address it used to report (see keepAutoDetected).
+	AutoDetectEmptySince *time.Time      `json:"auto_detect_empty_since,omitempty"`
+	CreatedAt            time.Time       `json:"created_at"`
+	ApprovedAt           *time.Time      `json:"approved_at,omitempty"`
+	DesiredSeq           int64           `json:"desired_seq"`
+	AppliedSeq           int64           `json:"applied_seq"`
+	LastAckAt            *time.Time      `json:"last_ack_at,omitempty"`
+	EgressIPObserved     string          `json:"egress_ip_observed,omitempty"`
+	EgressIPProbe        string          `json:"egress_ip_probe,omitempty"`
+	LastError            string          `json:"last_error,omitempty"`
+	Disabled             bool            `json:"disabled,omitempty"`
+	ConfigPriority       *int            `json:"config_priority,omitempty"`
+	ConfigWeight         *int            `json:"config_weight,omitempty"`
+	ProtocolEnabled      map[string]bool `json:"protocol_enabled,omitempty"`
 	// APK delivery tracking: the release seq last shipped in a pull, the
 	// worker config seq it shipped with, and the release seq the worker has
 	// acknowledged applying. Lets pulls skip re-sending an unchanged APK.
@@ -1688,6 +1694,7 @@ func (s *orchStore) upsertPendingWorker(staticPub string, self map[string]any) (
 }
 
 func (s *orchStore) approveWorker(id string) error {
+	s.clientContentForced.Store(true)
 	return s.updateWorker(id, func(rec *workerRecord) error {
 		if rec.Status == "pending" || rec.Status == "approved" || rec.Status == "active" {
 			now := time.Now().UTC()
@@ -1716,6 +1723,7 @@ type workerPolicyPatch struct {
 }
 
 func (s *orchStore) updateWorkerPolicy(id string, patch workerPolicyPatch) error {
+	s.clientContentForced.Store(true)
 	changed := false
 	err := s.db.Update(func(tx *bolt.Tx) error {
 		b := tx.Bucket(bucketWorkers)
@@ -1924,6 +1932,9 @@ func applyAck(rec *workerRecord, applied int64, observed string, self map[string
 			if wasInactive {
 				forceWorkerResync(rec, applied)
 			}
+		} else if applied > rec.DesiredSeq && rec.Status != "revoked" {
+			// Worker ahead of us (restored DB): resync past it.
+			forceWorkerResync(rec, applied)
 		}
 	}
 }
@@ -2028,6 +2039,11 @@ func applyHeartbeat(rec *workerRecord, haveSeq int64, self map[string]any, now t
 		if wasInactive {
 			forceWorkerResync(rec, haveSeq)
 		}
+	}
+	if haveSeq > rec.DesiredSeq && rec.Status != "revoked" {
+		// Worker ahead of us (restored DB): resync past it.
+		forceWorkerResync(rec, haveSeq)
+		beforeStatus = ""
 	}
 	recent := rec.LastAckAt != nil && now.Sub(*rec.LastAckAt) < heartbeatWriteInterval
 	if recent && !selfChanged && rec.Status == beforeStatus {
@@ -2466,6 +2482,7 @@ func setWorkerSelfDescribe(rec *workerRecord, self map[string]any) bool {
 	if report.Rejected {
 		return changed
 	}
+	keepAutoDetected(rec, clean, time.Now().UTC())
 	if report.Forbidden != rec.SelfDescribeForbidden {
 		changed = true
 	}
@@ -2496,4 +2513,66 @@ func (s *orchStore) deletePendingWorker(id string) error {
 		}
 		return b.Delete([]byte(id))
 	})
+}
+
+// resyncWorkerAhead moves a worker's DesiredSeq past haveSeq when the worker
+// reports a config newer than we think we issued (restored DB).
+func (s *orchStore) resyncWorkerAhead(id string, haveSeq int64) (workerRecord, error) {
+	var out workerRecord
+	err := s.updateWorker(id, func(rec *workerRecord) error {
+		if haveSeq > rec.DesiredSeq {
+			forceWorkerResync(rec, haveSeq)
+		}
+		out = *rec
+		return nil
+	})
+	return out, err
+}
+
+// autoDetectEmptyGrace is how long an auto-detected address that a worker
+// suddenly reports empty keeps its last value, so a flapping probe does not
+// republish the client bundle for the whole fleet.
+const autoDetectEmptyGrace = 10 * time.Minute
+
+// autoDetectedFields are self_describe values workers detect at runtime.
+var autoDetectedFields = [][2]string{{"", "egress_ip"}, {"reality", "address_v6"}, {"awg", "endpoint_v6"}}
+
+func autoDetectedField(self map[string]any, section, key string) (map[string]any, string) {
+	holder := self
+	if section != "" {
+		holder, _ = self[section].(map[string]any)
+	}
+	if holder == nil {
+		return nil, ""
+	}
+	value, _ := holder[key].(string)
+	return holder, value
+}
+
+// keepAutoDetected carries previous non-empty auto-detected addresses into
+// clean while they have been empty for less than autoDetectEmptyGrace.
+func keepAutoDetected(rec *workerRecord, clean map[string]any, now time.Time) {
+	var lost [][2]string
+	for _, field := range autoDetectedFields {
+		_, old := autoDetectedField(rec.SelfDescribe, field[0], field[1])
+		holder, current := autoDetectedField(clean, field[0], field[1])
+		if old != "" && current == "" && holder != nil {
+			lost = append(lost, field)
+		}
+	}
+	if len(lost) == 0 {
+		rec.AutoDetectEmptySince = nil
+		return
+	}
+	if rec.AutoDetectEmptySince == nil {
+		rec.AutoDetectEmptySince = &now
+	}
+	if now.Sub(*rec.AutoDetectEmptySince) >= autoDetectEmptyGrace {
+		return
+	}
+	for _, field := range lost {
+		_, old := autoDetectedField(rec.SelfDescribe, field[0], field[1])
+		holder, _ := autoDetectedField(clean, field[0], field[1])
+		holder[field[1]] = old
+	}
 }

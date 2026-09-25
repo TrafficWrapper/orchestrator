@@ -82,6 +82,7 @@ func workerPendingResponse() workerRefusal {
 // revokeWorker marks a worker revoked. Workers that never got devices are
 // final immediately; others get one more (empty) config first.
 func (s *orchStore) revokeWorker(id string) error {
+	s.clientContentForced.Store(true)
 	id = strings.TrimSpace(id)
 	err := s.db.Update(func(tx *bolt.Tx) error {
 		b := tx.Bucket(bucketWorkers)

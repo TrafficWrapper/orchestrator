@@ -139,9 +139,12 @@ func (s *server) handleDeviceEnroll(peer []byte, raw []byte) (any, error) {
 				return nil, err
 			}
 		}
-		bundle, err := s.buildClientBundleForClient(0, existing.ClientVersion)
+		bundle, err := s.buildClientBundle()
 		if err != nil {
 			return nil, err
+		}
+		if !clientBundleHasWorkers(bundle) {
+			return deviceEnrollResponse{OK: false, Error: "no approved worker available yet"}, nil
 		}
 		pub, err := s.signerPublicKey()
 		if err != nil {
@@ -176,13 +179,18 @@ func (s *server) handleDeviceEnroll(peer []byte, raw []byte) (any, error) {
 		RealityFlow:        deviceRealityFlow(req.capabilities()),
 		ClientCapabilities: req.capabilities(),
 	}
+	// Never hand out ok:true with no worker to connect to, and decide that
+	// before the one-time token is spent (retryable for all app versions).
+	bundle, err := s.buildClientBundle()
+	if err != nil {
+		return nil, err
+	}
+	if !clientBundleHasWorkers(bundle) {
+		return deviceEnrollResponse{OK: false, Error: "no approved worker available yet"}, nil
+	}
 	_, stored, err := s.store.consumeBootstrapToken(req.BootstrapToken, device, awgProfiles)
 	if err != nil {
 		return deviceEnrollResponse{OK: false, Error: err.Error()}, nil
-	}
-	bundle, err := s.buildClientBundleForClient(0, stored.ClientVersion)
-	if err != nil {
-		return nil, err
 	}
 	pub, err := s.signerPublicKey()
 	if err != nil {
@@ -214,4 +222,11 @@ func makeBootstrapPayload(cfg orchConfig, pubkey, orchNoisePublic, token string,
 		Limits:          copyRawJSON(rec.Limits),
 		Expires:         rec.ExpiresAt.UTC().Format(time.RFC3339),
 	}
+}
+
+func clientBundleHasWorkers(bundle signedConfig) bool {
+	var doc struct {
+		Workers []json.RawMessage `json:"workers"`
+	}
+	return json.Unmarshal([]byte(bundle.ConfigJSON), &doc) == nil && len(doc.Workers) > 0
 }

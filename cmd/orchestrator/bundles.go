@@ -1,8 +1,6 @@
 package main
 
 import (
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -54,37 +52,25 @@ func (s *server) buildBundles(rec workerRecord) (signedConfig, signedConfig, err
 	if err != nil {
 		return signedConfig{}, signedConfig{}, err
 	}
-	clientSigned, err := s.buildClientBundle(rec.DesiredSeq)
+	clientSigned, err := s.buildClientBundle()
 	if err != nil {
 		return signedConfig{}, signedConfig{}, err
 	}
 	return workerSigned, clientSigned, nil
 }
 
-func (s *server) buildClientBundle(minSeq int64) (signedConfig, error) {
-	return s.buildClientBundleForClient(minSeq, "")
-}
-
-func (s *server) buildClientBundleForClient(minSeq int64, clientVersion string) (signedConfig, error) {
+// clientBundleContent is the shared client bundle without seq and
+// timestamps: the part whose changes are published under a new seq.
+func (s *server) clientBundleContent() (map[string]any, error) {
 	workers, err := s.store.workers()
 	if err != nil {
-		return signedConfig{}, err
+		return nil, err
 	}
-	issued := time.Now().UTC()
-	seq := minSeq
+	now := time.Now().UTC()
 	items := []any{}
 	awgExcluded := awgProfileConflictWorkers(workers)
 	for _, rec := range workers {
-		if rec.Status != "approved" && rec.Status != "active" {
-			continue
-		}
-		if rec.DesiredSeq > seq {
-			seq = rec.DesiredSeq
-		}
-		if rec.Disabled {
-			continue
-		}
-		if !workerFreshForClients(rec, issued) {
+		if !workerGetsDevices(rec) || !workerFreshForClients(rec, now) {
 			continue
 		}
 		// Each worker is validated on its own: one bad self_describe drops
@@ -93,7 +79,7 @@ func (s *server) buildClientBundleForClient(minSeq int64, clientVersion string) 
 			log.Printf("client bundle: worker %s excluded: forbidden key in self_describe", rec.ID)
 			continue
 		}
-		item, ok := s.clientWorkerPayload(rec, clientVersion, awgExcluded[rec.ID])
+		item, ok := s.clientWorkerPayload(rec, "", awgExcluded[rec.ID])
 		if !ok {
 			continue
 		}
@@ -103,96 +89,24 @@ func (s *server) buildClientBundleForClient(minSeq int64, clientVersion string) 
 		}
 		items = append(items, item)
 	}
-	if seq < 1 {
-		seq = 1
-	}
-	clientPayload := map[string]any{
-		"schema":     1,
-		"ns":         "client-config-v1",
-		"seq":        seq,
-		"issued_at":  issued.Format(time.RFC3339),
-		"expires_at": issued.Add(24 * time.Hour).Format(time.RFC3339),
-		"workers":    items,
+	content := map[string]any{
+		"schema":  1,
+		"ns":      "client-config-v1",
+		"workers": items,
 	}
 	if strings.TrimSpace(s.cfg.UpdatePublicKey) != "" {
-		clientPayload["update_pubkey"] = strings.TrimSpace(s.cfg.UpdatePublicKey)
+		content["update_pubkey"] = strings.TrimSpace(s.cfg.UpdatePublicKey)
 	}
 	if pub := s.discoveryPublicKey(); pub != "" {
-		clientPayload["discovery_pubkey"] = pub
+		content["discovery_pubkey"] = pub
 	}
 	if len(s.cfg.DiscoveryRescuePointers) > 0 {
-		clientPayload["discovery_rescue_pointers"] = append([]string(nil), s.cfg.DiscoveryRescuePointers...)
+		content["discovery_rescue_pointers"] = append([]string(nil), s.cfg.DiscoveryRescuePointers...)
 	}
 	if len(s.cfg.DNSServers) > 0 {
-		clientPayload["dns_servers"] = append([]string(nil), s.cfg.DNSServers...)
+		content["dns_servers"] = append([]string(nil), s.cfg.DNSServers...)
 	}
-	// After a seq bump every worker builds this same bundle. Reuse a recently
-	// signed one when everything but the timestamps is identical, skipping
-	// the forbidden-key re-parse and the signer round trip.
-	contentKey, err := clientBundleContentKey(clientPayload)
-	if err != nil {
-		return signedConfig{}, err
-	}
-	if cached, ok := s.cachedClientBundle(contentKey, issued); ok {
-		return cached, nil
-	}
-	clientJSON, err := canonicalJSON(clientPayload)
-	if err != nil {
-		return signedConfig{}, err
-	}
-	if err := rejectForbiddenKeys([]byte(clientJSON)); err != nil {
-		return signedConfig{}, err
-	}
-	signed, err := s.signer.sign(clientJSON)
-	if err != nil {
-		return signedConfig{}, err
-	}
-	s.storeClientBundle(contentKey, issued, signed)
-	return signed, nil
-}
-
-// clientBundleReuseTTL bounds how stale issued_at may be on a reused bundle
-// (expires_at is 24h after it).
-const clientBundleReuseTTL = time.Minute
-
-type clientBundleCacheEntry struct {
-	signed signedConfig
-	issued time.Time
-}
-
-func clientBundleContentKey(payload map[string]any) (string, error) {
-	content := make(map[string]any, len(payload))
-	for k, v := range payload {
-		if k != "issued_at" && k != "expires_at" {
-			content[k] = v
-		}
-	}
-	raw, err := canonicalJSON(content)
-	if err != nil {
-		return "", err
-	}
-	sum := sha256.Sum256([]byte(raw))
-	return hex.EncodeToString(sum[:]), nil
-}
-
-func (s *server) cachedClientBundle(key string, now time.Time) (signedConfig, bool) {
-	s.clientBundleMu.Lock()
-	defer s.clientBundleMu.Unlock()
-	entry, ok := s.clientBundleCache[key]
-	if !ok || now.Sub(entry.issued) >= clientBundleReuseTTL || now.Before(entry.issued) {
-		return signedConfig{}, false
-	}
-	return entry.signed, true
-}
-
-func (s *server) storeClientBundle(key string, issued time.Time, signed signedConfig) {
-	s.clientBundleMu.Lock()
-	defer s.clientBundleMu.Unlock()
-	// Keys differ per client-version gate and worker set; keep it small.
-	if s.clientBundleCache == nil || len(s.clientBundleCache) >= 16 {
-		s.clientBundleCache = map[string]clientBundleCacheEntry{}
-	}
-	s.clientBundleCache[key] = clientBundleCacheEntry{signed: signed, issued: issued}
+	return content, nil
 }
 
 // clientWorkerPayload builds one worker's bundle entry. excludeAWG drops its

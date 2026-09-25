@@ -20,7 +20,7 @@ func TestSelectAWGProfileForClientVersion(t *testing.T) {
 	}
 }
 
-func TestDeviceEnrollAllocatesAWGProfilesAndClientBundleSelectsByVersion(t *testing.T) {
+func TestDeviceEnrollAllocatesAWGProfilesAndSharedBundleUsesBase(t *testing.T) {
 	s := newTestServer(t)
 	rec, err := s.store.upsertPendingWorker("worker-static-profiles", map[string]any{
 		"label":     "Worker Profiles",
@@ -81,19 +81,14 @@ func TestDeviceEnrollAllocatesAWGProfilesAndClientBundleSelectsByVersion(t *test
 		t.Fatalf("next profile allocated from wrong subnet: %+v", resp.AWGProfiles["next"])
 	}
 
-	oldBundle, err := s.buildClientBundleForClient(0, "0.1.15")
+	// The shared bundle offers the base profile every device has
+	// credentials for; newer profiles become nested, gated alternatives.
+	shared, err := s.buildClientBundle()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := clientBundleAWGProfile(t, oldBundle.ConfigJSON); got != "awg" {
-		t.Fatalf("old client route profile=%q want awg", got)
-	}
-	newBundle, err := s.buildClientBundleForClient(0, "0.1.16")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got := clientBundleAWGProfile(t, newBundle.ConfigJSON); got != "next" {
-		t.Fatalf("new client route profile=%q want next", got)
+	if got := clientBundleAWGProfile(t, shared.ConfigJSON); got != "awg" {
+		t.Fatalf("shared bundle route profile=%q want awg", got)
 	}
 	workers, err := s.store.workers()
 	if err != nil {

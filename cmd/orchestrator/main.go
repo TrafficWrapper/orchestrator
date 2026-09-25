@@ -27,6 +27,10 @@ type orchConfig struct {
 	SignerLegacyKeyPath     string
 	ClientIPHeader          string
 	RealityFallbackProfiles bool
+	// ClientSeqFloor is the lowest client bundle seq ever published
+	// (ORCH_CLIENT_SEQ_FLOOR); ClientBundleTTL sets expires_at.
+	ClientSeqFloor          int64
+	ClientBundleTTL         time.Duration
 	PublicURL               string
 	EgressProbeURL          string
 	AdminSecret             string
@@ -86,7 +90,7 @@ type server struct {
 	apkArtifact         *updateArtifact
 	apkArtifactSeq      int64
 	clientBundleMu      sync.Mutex
-	clientBundleCache   map[string]clientBundleCacheEntry
+	clientBundleSigned  signedClientBundle
 	updateKeyMu         sync.Mutex
 	updateKeyCache      *updateKeyCacheEntry
 	signerPubMu         sync.Mutex
@@ -231,6 +235,8 @@ func readConfig() (orchConfig, error) {
 		APKKeepReleases:         int(env.int64("ORCH_APK_KEEP_RELEASES", 5, 0)),
 		TLS:                     env.bool("ORCH_TLS", true),
 		RealityFallbackProfiles: env.bool("ORCH_REALITY_FALLBACK_PROFILES", false),
+		ClientSeqFloor:          env.int64("ORCH_CLIENT_SEQ_FLOOR", 0, 0),
+		ClientBundleTTL:         env.duration("ORCH_CLIENT_BUNDLE_TTL", 24*time.Hour, time.Hour),
 	}
 	return cfg, errors.Join(env.errs...)
 }
@@ -263,6 +269,19 @@ func (e *envReader) int64(key string, fallback, min int64) int64 {
 	parsed, err := strconv.ParseInt(value, 10, 64)
 	if err != nil || parsed < min {
 		e.errs = append(e.errs, fmt.Errorf("%s=%q: want an integer >= %d", key, value, min))
+		return fallback
+	}
+	return parsed
+}
+
+func (e *envReader) duration(key string, fallback, min time.Duration) time.Duration {
+	value := strings.TrimSpace(os.Getenv(key))
+	if value == "" {
+		return fallback
+	}
+	parsed, err := time.ParseDuration(value)
+	if err != nil || parsed < min {
+		e.errs = append(e.errs, fmt.Errorf("%s=%q: want a duration >= %s", key, value, min))
 		return fallback
 	}
 	return parsed
