@@ -243,6 +243,10 @@ type apkReleaseRecord struct {
 	MinisigPath  string    `json:"minisig_path"`
 	APKPath      string    `json:"apk_path"`
 	CreatedAt    time.Time `json:"created_at"`
+	// Package is the APK's package; ServerSigned means the orchestrator
+	// holds the update key and can re-sign the manifest before it expires.
+	Package      string `json:"package,omitempty"`
+	ServerSigned bool   `json:"server_signed,omitempty"`
 }
 
 func openOrchStore(cfg orchConfig) (*orchStore, error) {
