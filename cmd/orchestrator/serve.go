@@ -96,16 +96,25 @@ func runServe(cfg orchConfig) error {
 	httpServer.BaseContext = func(net.Listener) context.Context { return ctx }
 	serveErr := make(chan error, 1)
 	go func() {
+		listener, err := net.Listen("tcp", addr)
+		if err != nil {
+			serveErr <- err
+			return
+		}
+		// Bound concurrent connections so a flood cannot exhaust file
+		// descriptors or memory before any request is authenticated.
+		listener = newLimitListener(listener, maxServerConnections)
 		if cfg.TLS {
 			cert, key, err := loadOrCreateTLS(cfg)
 			if err != nil {
+				_ = listener.Close()
 				serveErr <- err
 				return
 			}
-			serveErr <- httpServer.ListenAndServeTLS(cert, key)
+			serveErr <- httpServer.ServeTLS(listener, cert, key)
 			return
 		}
-		serveErr <- httpServer.ListenAndServe()
+		serveErr <- httpServer.Serve(listener)
 	}()
 	select {
 	case err := <-serveErr:
@@ -132,7 +141,48 @@ func newOrchestratorHTTPServer(addr string, handler http.Handler) *http.Server {
 		TLSConfig:         &tls.Config{MinVersion: tls.VersionTLS12},
 		ReadHeaderTimeout: 15 * time.Second,
 		IdleTimeout:       120 * time.Second,
+		MaxHeaderBytes:    maxRequestHeaderBytes,
 	}
+}
+
+const (
+	// maxRequestHeaderBytes: no API needs more than a few KiB of headers.
+	maxRequestHeaderBytes = 64 << 10
+	// maxServerConnections bounds open connections; every worker holds at
+	// most one long-poll at a time, so this leaves ample headroom.
+	maxServerConnections = 8192
+)
+
+// limitListener caps concurrent connections: Accept waits for a free slot.
+type limitListener struct {
+	net.Listener
+	slots chan struct{}
+}
+
+func newLimitListener(l net.Listener, n int) net.Listener {
+	return &limitListener{Listener: l, slots: make(chan struct{}, n)}
+}
+
+func (l *limitListener) Accept() (net.Conn, error) {
+	l.slots <- struct{}{}
+	conn, err := l.Listener.Accept()
+	if err != nil {
+		<-l.slots
+		return nil, err
+	}
+	return &limitConn{Conn: conn, release: func() { <-l.slots }}, nil
+}
+
+type limitConn struct {
+	net.Conn
+	once    sync.Once
+	release func()
+}
+
+func (c *limitConn) Close() error {
+	err := c.Conn.Close()
+	c.once.Do(c.release)
+	return err
 }
 
 func (s *server) runWorkerJanitor(ctx context.Context) {

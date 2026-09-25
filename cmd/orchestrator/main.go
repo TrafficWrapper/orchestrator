@@ -42,23 +42,27 @@ type orchConfig struct {
 }
 
 type server struct {
-	cfg              orchConfig
-	store            *orchStore
-	signer           configSigner
-	static           noise.DHKey
-	sessions         sync.Map
-	sessionCount     atomic.Int64
-	handshakeMu      sync.Mutex
-	handshakeRates   map[string]handshakeRate
-	handshakePending map[string]int
-	handshakePrune   time.Time
-	telemetryNonceMu sync.Mutex
-	telemetryNonces  map[string]map[string]time.Time
-	loginLimiterMu   sync.Mutex
-	loginLimiter     *loginLimiter
-	audit            *auditLog
-	discoverySeqMu   sync.Mutex
-	discoveryCacheMu sync.Mutex
+	cfg          orchConfig
+	store        *orchStore
+	signer       configSigner
+	static       noise.DHKey
+	sessions     sync.Map
+	sessionCount atomic.Int64
+	// Reserved pool for workers presenting a handshake cookie.
+	workerSessionCount atomic.Int64
+	cookieKeyOnce      sync.Once
+	cookieKey          []byte
+	handshakeMu        sync.Mutex
+	handshakeRates     map[string]handshakeRate
+	handshakePending   map[string]int
+	handshakePrune     time.Time
+	telemetryNonceMu   sync.Mutex
+	telemetryNonces    map[string]map[string]time.Time
+	loginLimiterMu     sync.Mutex
+	loginLimiter       *loginLimiter
+	audit              *auditLog
+	discoverySeqMu     sync.Mutex
+	discoveryCacheMu   sync.Mutex
 	// discoveryBuildMu serializes bundle rebuilds; the fields below it are
 	// guarded by it.
 	discoveryBuildMu    sync.Mutex

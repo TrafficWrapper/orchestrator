@@ -22,6 +22,9 @@ type noiseSession struct {
 	// pendingKey identifies the source bucket charged for this pending
 	// handshake (see reserveHandshakeStart).
 	pendingKey string
+	// workerPool is the worker ID when the handshake took a reserved worker
+	// slot via a handshake cookie (see reserveWorkerHandshake).
+	workerPool string
 }
 
 type handshakeRate struct {
@@ -31,6 +34,8 @@ type handshakeRate struct {
 
 type startRequest struct {
 	Message string `json:"message"`
+	// Cookie is an optional worker handshake cookie from an earlier call.
+	Cookie string `json:"cookie,omitempty"`
 }
 
 type startResponse struct {
@@ -50,26 +55,40 @@ type noiseEnvelopeResponse struct {
 	OK      bool   `json:"ok"`
 	Error   string `json:"error,omitempty"`
 	Payload string `json:"payload,omitempty"`
+	// Cookie lets a worker's next handshake use the reserved worker pool.
+	Cookie string `json:"cookie,omitempty"`
 }
 
 func (s *server) handleHandshakeStart(w http.ResponseWriter, r *http.Request) {
 	defer r.Body.Close()
-	reserved, reason := s.reserveHandshakeStart(r)
+	// The body is already buffered and size-capped (withRequestBodyLimits),
+	// so it can be read before a slot is reserved.
+	var req startRequest
+	decodeErr := json.NewDecoder(r.Body).Decode(&req)
+	sess := noiseSession{pendingKey: clientIP(r)}
+	reserved := false
+	if decodeErr == nil && req.Cookie != "" && strings.HasPrefix(r.URL.Path, "/w/") {
+		if id, ok := s.verifyWorkerCookie(req.Cookie, time.Now()); ok && s.reserveWorkerHandshake(id, time.Now()) {
+			sess.workerPool = id
+			reserved = true
+		}
+	}
 	if !reserved {
-		w.WriteHeader(http.StatusTooManyRequests)
-		writeJSON(w, startResponse{OK: false, Error: reason})
-		return
+		ok, reason := s.reserveHandshakeStart(r)
+		if !ok {
+			w.WriteHeader(http.StatusTooManyRequests)
+			writeJSON(w, startResponse{OK: false, Error: reason})
+			return
+		}
 	}
 	stored := false
-	ip := clientIP(r)
 	defer func() {
 		if !stored {
-			s.releasePendingHandshake(ip)
+			s.releaseSession(sess)
 		}
 	}()
-	var req startRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeJSON(w, startResponse{OK: false, Error: err.Error()})
+	if decodeErr != nil {
+		writeJSON(w, startResponse{OK: false, Error: decodeErr.Error()})
 		return
 	}
 	msg1, err := base64.StdEncoding.DecodeString(req.Message)
@@ -98,7 +117,9 @@ func (s *server) handleHandshakeStart(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	sid := randID()
-	s.sessions.Store(sid, noiseSession{hs: hs, createdAt: time.Now(), pendingKey: ip})
+	sess.hs = hs
+	sess.createdAt = time.Now()
+	s.sessions.Store(sid, sess)
 	stored = true
 	writeJSON(w, startResponse{OK: true, SID: sid, Message: base64.StdEncoding.EncodeToString(msg2)})
 }
@@ -159,17 +180,23 @@ func (s *server) releasePendingHandshake(ip string) {
 	}
 }
 
-// pendingPrefixKey aggregates addresses one level wider than rateLimitKey:
-// IPv4 /24 and IPv6 /48.
+// pendingPrefixKey aggregates pending handshakes one level wider than
+// rateLimitKey: IPv4 /24 and IPv6 /56 (a /48 would let one site starve its
+// neighbours, a /32 would lump whole providers together).
 func pendingPrefixKey(ip string) string {
+	return networkPrefixKey(ip, 24, 56)
+}
+
+// networkPrefixKey keys ip by its IPv4 or IPv6 prefix of the given length.
+func networkPrefixKey(ip string, v4Bits, v6Bits int) string {
 	addr, err := netip.ParseAddr(strings.TrimSpace(ip))
 	if err != nil {
 		return "prefix:" + strings.TrimSpace(ip)
 	}
 	addr = addr.Unmap()
-	bits := 48
+	bits := v6Bits
 	if addr.Is4() {
-		bits = 24
+		bits = v4Bits
 	}
 	prefix, err := addr.Prefix(bits)
 	if err != nil {
@@ -221,7 +248,7 @@ func (s *server) runNoiseSessionJanitor(ctx context.Context) {
 				sess, ok := value.(noiseSession)
 				if !ok || sess.createdAt.Before(cutoff) {
 					if _, loaded := s.sessions.LoadAndDelete(key); loaded {
-						s.releasePendingHandshake(sess.pendingKey)
+						s.releaseSession(sess)
 					}
 				}
 				return true
@@ -251,7 +278,7 @@ func (s *server) handleNoiseContext(fn func(context.Context, []byte, []byte) (an
 			return
 		}
 		sess := v.(noiseSession)
-		s.releasePendingHandshake(sess.pendingKey)
+		s.releaseSession(sess)
 		if time.Since(sess.createdAt) > noiseSessionTTL {
 			writeJSON(w, noiseEnvelopeResponse{OK: false, Error: "noise session expired"})
 			return
@@ -277,6 +304,10 @@ func (s *server) handleNoiseContext(fn func(context.Context, []byte, []byte) (an
 			return
 		}
 		peer := append([]byte(nil), sess.hs.PeerStatic()...)
+		cookie := ""
+		if strings.HasPrefix(r.URL.Path, "/w/") {
+			cookie = s.cookieForPeer(protocol.KeyToBase64(peer), time.Now())
+		}
 		resp, err := fn(r.Context(), peer, plain)
 		if err != nil {
 			resp = map[string]any{"ok": false, "error": err.Error()}
@@ -291,7 +322,7 @@ func (s *server) handleNoiseContext(fn func(context.Context, []byte, []byte) (an
 			writeJSON(w, noiseEnvelopeResponse{OK: false, Error: err.Error()})
 			return
 		}
-		writeJSON(w, noiseEnvelopeResponse{OK: true, Payload: base64.StdEncoding.EncodeToString(encrypted)})
+		writeJSON(w, noiseEnvelopeResponse{OK: true, Payload: base64.StdEncoding.EncodeToString(encrypted), Cookie: cookie})
 	}
 }
 
