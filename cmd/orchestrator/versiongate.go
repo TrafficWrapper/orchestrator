@@ -147,3 +147,19 @@ func clampRealityFingerprint(value string) string {
 		return "chrome"
 	}
 }
+
+// realityModernFingerprint is the optional modern fingerprint and the
+// derived version code (major*10000+minor*100+patch of versionName, 0.1.31
+// -> 131) from which apps may use it.
+func realityModernFingerprint() (string, int) {
+	modern := strings.TrimSpace(os.Getenv("REALITY_FP_MODERN"))
+	minVC := getenvInt("REALITY_FP_MODERN_MIN_VC", 0)
+	if modern == "" || minVC <= 0 {
+		return "", 0
+	}
+	fp := clampRealityFingerprint(modern)
+	if fp != strings.ToLower(modern) {
+		return "", 0
+	}
+	return fp, minVC
+}

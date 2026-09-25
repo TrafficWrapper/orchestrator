@@ -171,12 +171,22 @@ policy; AWG remains a fallback path when REALITY is unhealthy.
   when the slot is blank. `POST /admin/v1/workers/short-id
   {id, short_id, revoked}` fills `desired_state.revoked_short_ids`. The admin
   device list shows each device's `reality_cohort` slot.
-- **Fallback profiles.** With `ORCH_REALITY_FALLBACK_PROFILES=1`, the
-  other `reality_profiles` (XHTTP, or TCP on another port) are added as extra
-  REALITY routes right after a worker's primary route. No flow is sent; each
-  REALITY route carries `vision` (true when the profile's `flows` include
-  `xtls-rprx-vision`), and the app applies its `reality_flow` only there. Off by default: the app fills only two
-  REALITY slots, so fallbacks displace a second worker's REALITY route.
+- **Route alternatives.** Each worker publishes one primary REALITY route (its
+  legacy object, plus `address_v6` of the base profile) and one primary AWG
+  route (the base profile), so apps 0.1.28–0.1.31 see the same slots as
+  before. Its other REALITY profiles are nested in the primary route's
+  `params.reality_profiles[]` (name, network, port, address, address_v6,
+  server_name, public_key, short_id, flows, vision, xhttp), and other AWG
+  profiles in `params.awg_profiles[]` (profile, port, endpoint, endpoint_v6,
+  public_key, dialect, dialect_id, dns, min_version_code). `vision` is true
+  only when the worker declared `reality_flow` or the profile's `flows`
+  include `xtls-rprx-vision`, and `flows` always agree with it. The
+  fingerprint is orchestrator policy (`REALITY_FP_DEFAULT`); with
+  `REALITY_FP_MODERN`/`REALITY_FP_MODERN_MIN_VC` routes also carry
+  `fingerprint_modern` and `fingerprint_modern_min_version_code`. Version
+  codes are derived from versionName (major*10000+minor*100+patch, 0.1.31 →
+  131), not Android versionCode. `xhttp.host` is sent when it differs from
+  the server name. `ORCH_REALITY_FALLBACK_PROFILES` is no longer used.
 - **AWG dialect rotation.** `POST /admin/v1/workers/awg-drain {id, profile,
   draining}` stops offering an AWG profile to clients (devices keep
   credentials for every profile), so they move to the worker's other profile

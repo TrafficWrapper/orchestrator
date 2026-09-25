@@ -174,12 +174,23 @@ AWG остаётся fallback path, когда REALITY unhealthy.
   `short_id`. `POST /admin/v1/workers/short-id {id, short_id, revoked}`
   заполняет `desired_state.revoked_short_ids`. В списке устройств админки виден
   слот `reality_cohort`.
-- **Fallback-профили.** При `ORCH_REALITY_FALLBACK_PROFILES=1` остальные
-  `reality_profiles` (XHTTP или TCP на другом порту) добавляются доп. REALITY
-  маршрутами сразу после основного маршрута воркера. Flow не передаётся; у
-  каждого REALITY маршрута есть `vision` (true, если в `flows` профиля есть
-  `xtls-rprx-vision`), и приложение ставит свой `reality_flow` только туда. По умолчанию выключено: приложение заполняет
-  только два REALITY слота, и fallback вытесняет REALITY второго воркера.
+- **Альтернативные маршруты.** Каждый воркер публикует один основной
+  REALITY-маршрут (legacy-объект плюс `address_v6` базового профиля) и один
+  основной AWG-маршрут (базовый профиль), так что приложения 0.1.28–0.1.31
+  видят те же слоты, что и раньше. Остальные REALITY-профили вложены в
+  `params.reality_profiles[]` основного маршрута (name, network, port,
+  address, address_v6, server_name, public_key, short_id, flows, vision,
+  xhttp), остальные AWG-профили — в `params.awg_profiles[]` (profile, port,
+  endpoint, endpoint_v6, public_key, dialect, dialect_id, dns,
+  min_version_code). `vision` = true, только если воркер объявил
+  `reality_flow` или в `flows` профиля есть `xtls-rprx-vision`, и `flows`
+  всегда с ним согласованы. Fingerprint — политика оркестратора
+  (`REALITY_FP_DEFAULT`); при `REALITY_FP_MODERN`/`REALITY_FP_MODERN_MIN_VC`
+  маршруты несут также `fingerprint_modern` и
+  `fingerprint_modern_min_version_code`. Коды версий — производные от
+  versionName (major*10000+minor*100+patch, 0.1.31 → 131), а не Android
+  versionCode. `xhttp.host` передаётся, если отличается от server name.
+  `ORCH_REALITY_FALLBACK_PROFILES` больше не используется.
 - **Ротация диалекта AWG.** `POST /admin/v1/workers/awg-drain {id, profile,
   draining}` перестаёт отдавать клиентам AWG-профиль (учётные данные для всех
   профилей у устройств остаются), клиенты переходят на другой профиль воркера,

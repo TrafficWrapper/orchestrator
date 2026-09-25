@@ -1600,8 +1600,10 @@ func TestClientRoutePayloadIncludesCanonicalParams(t *testing.T) {
 		t.Fatalf("xhttp network not preserved: %#v", xhttpParams)
 	}
 	xhttp := xhttpParams["xhttp"].(map[string]any)
-	if _, ok := xhttp["host"]; ok {
-		t.Fatalf("xhttp host should not be emitted to client routes: %#v", xhttp)
+	// A host different from the server name is kept: the inbound checks it
+	// (X-L11).
+	if xhttp["host"] != "cdn.operator.example" {
+		t.Fatalf("distinct xhttp host must reach clients: %#v", xhttp)
 	}
 	if xhttp["path"] != "/operator-path" || xhttp["mode"] != "stream-up" {
 		t.Fatalf("xhttp params not preserved: %#v", xhttp)

@@ -143,22 +143,29 @@ func TestRateMbpsDerivedFromRateLimit(t *testing.T) {
 	}
 }
 
-func TestAWGProfileDrainingHidesProfileFromClients(t *testing.T) {
+// X-M4: the primary AWG route is the base profile; other, non-drained
+// profiles are nested alternatives. Only a base drained before this rule
+// keeps the old behaviour (first remaining profile as primary).
+func TestAWGPrimaryIsBaseWithNestedAlternatives(t *testing.T) {
 	rec := workerRecord{SelfDescribe: map[string]any{
 		"awg":          map[string]any{"endpoint": "w:51888", "public_key": "k1", "profile": "awg"},
-		"awg_profiles": []any{map[string]any{"endpoint": "w:51999", "public_key": "k2", "profile": "awg-new"}},
+		"awg_profiles": []any{map[string]any{"endpoint": "w:51999", "public_key": "k2", "profile": "awg-new", "min_version_code": 131}},
 	}}
-	if len(awgProfilesForClients(rec)) != 2 {
-		t.Fatal("no draining: both profiles offered")
+	primary, ok := awgPrimaryProfile(rec)
+	if !ok || primary.Name != "awg" {
+		t.Fatalf("primary=%+v", primary)
+	}
+	nested := nestedAWGProfiles(rec, primary.Name)
+	if len(nested) != 1 || nested[0].(map[string]any)["profile"] != "awg-new" || nested[0].(map[string]any)["min_version_code"] != 131 {
+		t.Fatalf("nested=%v", nested)
+	}
+	rec.DrainingAWGProfiles = []string{"awg-new"}
+	if len(nestedAWGProfiles(rec, "awg")) != 0 {
+		t.Fatal("a draining profile must not be offered")
 	}
 	rec.DrainingAWGProfiles = []string{"awg"}
-	got := awgProfilesForClients(rec)
-	if len(got) != 1 || got[0].Name != "awg-new" {
-		t.Fatalf("draining profile still offered: %+v", got)
-	}
-	rec.DrainingAWGProfiles = []string{"awg", "awg-new"}
-	if len(awgProfilesForClients(rec)) != 2 {
-		t.Fatal("draining everything must fall back to all profiles")
+	if primary, _ := awgPrimaryProfile(rec); primary.Name != "awg-new" {
+		t.Fatalf("legacy drained base: primary=%q", primary.Name)
 	}
 }
 
@@ -197,41 +204,57 @@ func TestWorkerWithSlowAckStaysFreshViaHeartbeat(t *testing.T) {
 	}
 }
 
-func TestRealityFallbackRoutesAreOptInWithoutFlow(t *testing.T) {
+// P1/X-M2/X-L2/X-L11: other REALITY profiles are nested alternatives of the
+// primary route, never separate routes; vision and flows agree; IPv6 comes
+// from the base profile; a distinct xhttp host is kept.
+func TestRealityAlternativesAreNested(t *testing.T) {
 	s := newTestServer(t)
 	w := addApprovedWorkerWithStatic(t, s, "fallback-worker")
 	if _, err := s.store.upsertPendingWorker("fallback-worker", map[string]any{
 		"egress_ip": "203.0.113.5",
-		"reality":   map[string]any{"address": "203.0.113.5", "port": 443, "publicKey": "pub", "shortId": "sid", "network": "tcp"},
+		"reality":   map[string]any{"address": "203.0.113.5", "port": 443, "publicKey": "pub", "shortId": "sid", "network": "tcp", "fingerprint": "firefox"},
 		"reality_profiles": []any{
-			map[string]any{"name": "base", "address": "203.0.113.5", "port": 443, "network": "tcp", "public_key": "pub", "short_id": "sid", "flows": []any{"", realityFlowVision}},
-			map[string]any{"name": "xh", "address": "203.0.113.5", "port": 8443, "network": "xhttp", "public_key": "pub", "short_id": "sid", "flows": []any{""}, "xhttp": map[string]any{"path": "/x", "mode": "auto"}},
-			map[string]any{"name": "tcp2", "address": "203.0.113.5", "port": 2053, "network": "tcp", "public_key": "pub", "short_id": "sid", "flows": []any{"", realityFlowVision}},
+			map[string]any{"name": "reality", "address": "203.0.113.5", "address_v6": "2001:db8::5", "port": 443, "network": "tcp", "public_key": "pub", "short_id": "sid", "flows": []any{"", realityFlowVision}},
+			map[string]any{"name": "xh", "address": "203.0.113.5", "port": 8443, "network": "xhttp", "server_name": "a.example", "public_key": "pub", "short_id": "sid", "flows": []any{""}, "xhttp": map[string]any{"path": "/x", "mode": "auto", "host": "b.example"}},
+			map[string]any{"name": "tcp2", "address": "203.0.113.5", "port": 2053, "network": "tcp", "public_key": "pub", "short_id": "sid"},
 		},
 	}); err != nil {
 		t.Fatal(err)
 	}
 	rec, _ := s.store.worker(w.ID)
 	item, _ := s.clientWorkerPayload(rec, "", false)
-	if n := len(item["routes"].([]any)); n != 1 {
-		t.Fatalf("fallback routes must be off by default, routes=%d", n)
-	}
-	s.cfg.RealityFallbackProfiles = true
-	item, _ = s.clientWorkerPayload(rec, "", false)
 	routes := item["routes"].([]any)
-	if len(routes) != 3 {
-		t.Fatalf("want primary + xhttp + tcp fallback, got %d", len(routes))
+	var reality map[string]any
+	for _, r := range routes {
+		if r.(map[string]any)["type"] == "reality" {
+			if reality != nil {
+				t.Fatal("more than one reality route per worker")
+			}
+			reality = r.(map[string]any)
+		}
 	}
-	if routes[0].(map[string]any)["vision"] != true {
-		t.Fatalf("primary tcp route must allow vision: %v", routes[0])
+	params := reality["params"].(map[string]any)
+	if reality["vision"] != true || params["address_v6"] != "2001:db8::5" || params["fingerprint"] != "chrome" {
+		t.Fatalf("primary: vision=%v v6=%v fp=%v", reality["vision"], params["address_v6"], params["fingerprint"])
 	}
-	fb := routes[1].(map[string]any)
-	if intFromMap(fb, "port", 0) != 8443 || fb["network"] != "xhttp" || fb["flow"] != nil || fb["flows"] != nil || fb["vision"] != false {
-		t.Fatalf("bad xhttp fallback route: %v", fb)
+	nested := params["reality_profiles"].([]any)
+	if len(nested) != 2 {
+		t.Fatalf("nested=%v", nested)
 	}
-	tcp := routes[2].(map[string]any)
-	if intFromMap(tcp, "port", 0) != 2053 || tcp["flow"] != nil || tcp["vision"] != true {
-		t.Fatalf("bad tcp fallback route: %v", tcp)
+	xh := nested[0].(map[string]any)
+	if xh["vision"] != false || xh["xhttp"].(map[string]any)["host"] != "b.example" || len(xh["flows"].([]any)) != 1 {
+		t.Fatalf("xhttp alternative=%v", xh)
+	}
+	tcp2 := nested[1].(map[string]any)
+	if tcp2["vision"] != false || len(tcp2["flows"].([]any)) != 1 {
+		t.Fatalf("tcp alternative without flows or capability must not claim vision: %v", tcp2)
+	}
+	// With the reality_flow capability a TCP profile without flows gets
+	// both flows.
+	rec.SelfDescribe["capabilities"] = []any{"reality_flow"}
+	nested = nestedRealityProfiles(rec, 443, baseRealityProfile(rec, 443))
+	if tcp2 := nested[1].(map[string]any); tcp2["vision"] != true || len(tcp2["flows"].([]any)) != 2 {
+		t.Fatalf("capability tcp alternative=%v", tcp2)
 	}
 }
 

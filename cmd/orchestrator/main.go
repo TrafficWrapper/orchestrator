@@ -20,13 +20,12 @@ import (
 )
 
 type orchConfig struct {
-	StateDir                string
-	Listen                  string
-	SignerSocket            string
-	SignerKeyPath           string
-	SignerLegacyKeyPath     string
-	ClientIPHeader          string
-	RealityFallbackProfiles bool
+	StateDir            string
+	Listen              string
+	SignerSocket        string
+	SignerKeyPath       string
+	SignerLegacyKeyPath string
+	ClientIPHeader      string
 	// ClientSeqFloor is the lowest client bundle seq ever published
 	// (ORCH_CLIENT_SEQ_FLOOR); ClientBundleTTL sets expires_at.
 	ClientSeqFloor  int64
@@ -262,7 +261,6 @@ func readConfig() (orchConfig, error) {
 		SeedVersionName:         getenv("SEED_APK_VERSION_NAME", "seed"),
 		APKKeepReleases:         int(env.int64("ORCH_APK_KEEP_RELEASES", 5, 0)),
 		TLS:                     env.bool("ORCH_TLS", true),
-		RealityFallbackProfiles: env.bool("ORCH_REALITY_FALLBACK_PROFILES", false),
 		ClientSeqFloor:          env.int64("ORCH_CLIENT_SEQ_FLOOR", 0, 0),
 		ClientBundleTTL:         env.duration("ORCH_CLIENT_BUNDLE_TTL", 24*time.Hour, time.Hour),
 		AllowNewMasterKey:       env.bool("ORCH_ALLOW_NEW_MASTER_KEY", false),
