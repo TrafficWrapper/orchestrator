@@ -99,7 +99,7 @@ func (s *server) handleAdminBootstrapTokenCreate(w http.ResponseWriter, r *http.
 		writeStoreError(w, http.StatusBadRequest, err)
 		return
 	}
-	limits, err := parseJSONObjectRaw(string(req.Limits))
+	limits, err := parseBootstrapLimits(string(req.Limits))
 	if err != nil {
 		writeStoreError(w, http.StatusBadRequest, err)
 		return
@@ -391,6 +391,9 @@ func (s *server) handleAdminConfigEdit(w http.ResponseWriter, r *http.Request) {
 	if !decodeJSON(w, r, &req) {
 		return
 	}
+	// The whole set is validated and applied in one transaction with one seq
+	// bump: a bad entry leaves every worker unchanged (ORC-L14).
+	updates := make([]workerPolicyUpdate, 0, len(req.Workers))
 	for _, item := range req.Workers {
 		id := item.WorkerID
 		if id == "" {
@@ -401,16 +404,19 @@ func (s *server) handleAdminConfigEdit(w http.ResponseWriter, r *http.Request) {
 			enabled := value
 			protocols[key] = &enabled
 		}
-		if err := s.store.updateWorkerPolicy(id, workerPolicyPatch{
+		updates = append(updates, workerPolicyUpdate{ID: id, Patch: workerPolicyPatch{
 			Enabled:   item.Enabled,
 			Priority:  item.Priority,
 			Weight:    item.Weight,
 			Protocols: protocols,
-		}); err != nil {
-			writeStoreError(w, http.StatusBadRequest, err)
-			return
-		}
-		s.auditEvent(auditEntry{Event: "worker_config_edit", IP: clientIP(r), Result: "ok", Fields: map[string]string{"worker_id": id}})
+		}})
+	}
+	if err := s.store.updateWorkerPolicies(updates); err != nil {
+		writeStoreError(w, http.StatusBadRequest, err)
+		return
+	}
+	for _, update := range updates {
+		s.auditEvent(auditEntry{Event: "worker_config_edit", IP: clientIP(r), Result: "ok", Fields: map[string]string{"worker_id": update.ID}})
 	}
 	// An operator edit is published at once, without the confirmation delay.
 	if _, err := s.refreshClientBundle(true); err != nil {

@@ -82,7 +82,7 @@ func (s *server) workerTelemetry(peer []byte, raw []byte) (any, error) {
 	if err := verifyTelemetryFreshness(claims.Timestamp, time.Now().UTC()); err != nil {
 		return map[string]any{"ok": false, "error": err.Error()}, nil
 	}
-	if !s.consumeTelemetryNonce(device.ID, claims.Nonce) {
+	if !s.consumeTelemetryNonce(device.ID, claims.Nonce, time.Now().UTC()) {
 		return map[string]any{"ok": false, "error": "telemetry replay detected"}, nil
 	}
 	snapshot, err := summarizeTelemetryPayload(device.ID, rec.ID, payload, req.ReceivedAt)
@@ -90,6 +90,10 @@ func (s *server) workerTelemetry(peer []byte, raw []byte) (any, error) {
 		return map[string]any{"ok": false, "error": err.Error()}, nil
 	}
 	if err := s.store.recordTelemetry(snapshot); err != nil {
+		if errors.Is(err, errDeviceNotFound) {
+			// Deleted while this report was in flight (ORC-I7).
+			return map[string]any{"ok": false, "error": "unknown device"}, nil
+		}
 		return nil, err
 	}
 	return map[string]any{"ok": true}, nil
@@ -177,43 +181,110 @@ func verifyTelemetryFreshness(ts, now time.Time) error {
 	return nil
 }
 
-func (s *server) consumeTelemetryNonce(deviceID, nonce string) bool {
+// telemetryNonceTTL is how long a nonce is remembered: a report outside the
+// freshness window is refused anyway, so 2x the allowed skew covers every
+// timestamp that could still pass.
+const telemetryNonceTTL = 2 * telemetryMaxClockSkew
+
+// telemetryNonceSet holds one device's recent nonces and when it last sent.
+type telemetryNonceSet struct {
+	seen   map[string]time.Time
+	newest time.Time
+}
+
+// consumeTelemetryNonce records nonce for deviceID and reports whether it is
+// new. Entries expire after telemetryNonceTTL and the whole cache is swept
+// periodically; when a bound is reached the oldest entries are evicted
+// first (ORC-L19).
+func (s *server) consumeTelemetryNonce(deviceID, nonce string, now time.Time) bool {
 	deviceID = strings.TrimSpace(deviceID)
 	nonce = strings.TrimSpace(nonce)
 	if deviceID == "" || nonce == "" {
 		return false
 	}
-	now := time.Now().UTC()
 	s.telemetryNonceMu.Lock()
 	defer s.telemetryNonceMu.Unlock()
 	if s.telemetryNonces == nil {
-		s.telemetryNonces = map[string]map[string]time.Time{}
+		s.telemetryNonces = map[string]*telemetryNonceSet{}
 	}
-	deviceNonces := s.telemetryNonces[deviceID]
-	if deviceNonces == nil {
+	if since := now.Sub(s.telemetryNoncePrunedAt); since >= telemetryMaxClockSkew || since < 0 {
+		s.pruneTelemetryNoncesLocked(now)
+	}
+	set := s.telemetryNonces[deviceID]
+	if set == nil {
 		if len(s.telemetryNonces) >= telemetryNonceDeviceMax {
-			for key := range s.telemetryNonces {
-				delete(s.telemetryNonces, key)
-				break
-			}
+			s.pruneTelemetryNoncesLocked(now)
 		}
-		deviceNonces = map[string]time.Time{}
-		s.telemetryNonces[deviceID] = deviceNonces
+		if len(s.telemetryNonces) >= telemetryNonceDeviceMax {
+			s.evictOldestTelemetryNonceDeviceLocked()
+		}
+		set = &telemetryNonceSet{seen: map[string]time.Time{}}
+		s.telemetryNonces[deviceID] = set
 	}
-	if seenAt, exists := deviceNonces[nonce]; exists {
-		if now.Sub(seenAt) <= 2*telemetryMaxClockSkew {
+	if seenAt, exists := set.seen[nonce]; exists {
+		if now.Sub(seenAt) <= telemetryNonceTTL {
 			return false
 		}
-		delete(deviceNonces, nonce)
+		delete(set.seen, nonce)
 	}
-	if len(deviceNonces) >= telemetryNonceLRUMax {
-		for key := range deviceNonces {
-			delete(deviceNonces, key)
-			break
+	if len(set.seen) >= telemetryNonceLRUMax {
+		set.dropExpired(now)
+	}
+	if len(set.seen) >= telemetryNonceLRUMax {
+		set.dropOldest()
+	}
+	set.seen[nonce] = now
+	if now.After(set.newest) {
+		set.newest = now
+	}
+	return true
+}
+
+// pruneTelemetryNoncesLocked drops expired nonces and devices left empty.
+func (s *server) pruneTelemetryNoncesLocked(now time.Time) {
+	for id, set := range s.telemetryNonces {
+		set.dropExpired(now)
+		if len(set.seen) == 0 {
+			delete(s.telemetryNonces, id)
 		}
 	}
-	deviceNonces[nonce] = now
-	return true
+	s.telemetryNoncePrunedAt = now
+}
+
+// evictOldestTelemetryNonceDeviceLocked drops the device that reported least
+// recently.
+func (s *server) evictOldestTelemetryNonceDeviceLocked() {
+	oldestID := ""
+	var oldest time.Time
+	for id, set := range s.telemetryNonces {
+		if oldestID == "" || set.newest.Before(oldest) {
+			oldestID, oldest = id, set.newest
+		}
+	}
+	delete(s.telemetryNonces, oldestID)
+}
+
+func (set *telemetryNonceSet) dropExpired(now time.Time) {
+	for nonce, at := range set.seen {
+		if now.Sub(at) > telemetryNonceTTL {
+			delete(set.seen, nonce)
+		}
+	}
+}
+
+// dropOldest evicts the nonce seen longest ago.
+func (set *telemetryNonceSet) dropOldest() {
+	oldestNonce := ""
+	var oldest time.Time
+	first := true
+	for nonce, at := range set.seen {
+		if first || at.Before(oldest) {
+			oldestNonce, oldest, first = nonce, at, false
+		}
+	}
+	if !first {
+		delete(set.seen, oldestNonce)
+	}
 }
 
 func summarizeTelemetryPayload(deviceID, workerID string, payload []byte, receivedAtRaw string) (telemetrySnapshotRecord, error) {

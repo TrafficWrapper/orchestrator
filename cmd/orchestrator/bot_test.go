@@ -501,7 +501,10 @@ func TestBotProblemRecoveryRetryWhenStarvedBySendCap(t *testing.T) {
 	}
 	problems := map[string]botProblemEntry{}
 	for i := 0; i < botProblemMaxNoticesPerPoll+2; i++ {
-		entry := botProblemEntry{Scope: "device", ID: fmt.Sprintf("twpk_%02d", i), Kind: "device_offline", Label: fmt.Sprintf("twpk_%02d", i)}
+		// ORC-I4: device_offline is announced once per episode, so the
+		// repeating problems that fill the send cap are worker problems,
+		// which keep their reminders after the cooldown.
+		entry := botProblemEntry{Scope: "worker", ID: fmt.Sprintf("worker-active-%02d", i), Kind: "worker_degraded", Label: fmt.Sprintf("worker-active-%02d", i)}
 		key := botProblemKey(entry)
 		prev.Active[key] = entry
 		prev.PendingPolls[key] = botProblemPollsBeforeAlert
@@ -558,7 +561,10 @@ func TestBotProblemRecoveryForceDropsAfterGrace(t *testing.T) {
 	}
 	problems := map[string]botProblemEntry{}
 	for i := 0; i < botProblemMaxNoticesPerPoll+2; i++ {
-		entry := botProblemEntry{Scope: "device", ID: fmt.Sprintf("twpk_%02d", i), Kind: "device_offline", Label: fmt.Sprintf("twpk_%02d", i)}
+		// ORC-I4: device_offline is announced once per episode, so the
+		// repeating problems that fill the send cap are worker problems,
+		// which keep their reminders after the cooldown.
+		entry := botProblemEntry{Scope: "worker", ID: fmt.Sprintf("worker-active-%02d", i), Kind: "worker_degraded", Label: fmt.Sprintf("worker-active-%02d", i)}
 		key := botProblemKey(entry)
 		prev.Active[key] = entry
 		prev.PendingPolls[key] = botProblemPollsBeforeAlert
@@ -592,7 +598,9 @@ func TestBotProblemRecoveryForceDropsAfterGrace(t *testing.T) {
 
 func TestBotProblemCooldownAllowsRepeatAfterWindow(t *testing.T) {
 	now := time.Date(2026, 7, 8, 12, 0, 0, 0, time.UTC)
-	entry := botProblemEntry{Scope: "device", ID: "twpk_a", Kind: "device_offline", Label: "twpk_a"}
+	// ORC-I4: repeat reminders remain for worker problems; device_offline is
+	// covered by TestBotProblemOfflineAlertOncePerEpisode.
+	entry := botProblemEntry{Scope: "worker", ID: "worker-a", Kind: "worker_down", Label: "worker-a"}
 	key := botProblemKey(entry)
 	prev := botProblemState{
 		Active:        map[string]botProblemEntry{key: entry},

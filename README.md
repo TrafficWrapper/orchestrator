@@ -167,6 +167,9 @@ curl -ksS -H "authorization: Bearer $SESSION_TOKEN" \
   "$ORCH_URL/admin/v1/bootstrap-token/create"
 ```
 
+`limits` accepts only `traffic_quota_bytes`, `rate_limit`, `expires_at`
+(RFC3339) and `note`; any other field is refused.
+
 Use `WORKER_TOKEN` as the worker `ENROLL_TOKEN`. If the orchestrator server is
 stopped and you are operating directly on local state, the safe CLI path is also
 available:

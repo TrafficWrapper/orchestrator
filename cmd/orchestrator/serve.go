@@ -207,18 +207,88 @@ func (s *server) runWorkerJanitor(ctx context.Context) {
 			} else if n > 0 {
 				log.Printf("worker stale janitor marked inactive count=%d", n)
 			}
-			// Expiry-based blocks need no usage report, so they are swept here
-			// instead of scanning every device on every worker ack.
-			if _, err := s.store.pruneDeadTokens(time.Now().UTC()); err != nil {
-				log.Printf("token prune failed: %v", err)
-			}
-			if blocked, err := s.store.applyDeviceUsageAndBlocks("", nil, time.Now().UTC()); err != nil {
-				log.Printf("device expiry janitor failed: %v", err)
-			} else if blocked > 0 {
-				log.Printf("device expiry janitor blocked count=%d", blocked)
-			}
+			now := time.Now()
+			s.expiryJanitorPass(now.Round(0).UTC(), s.expiryClock.monotonic(now))
 		}
 	}
+}
+
+// expiryJanitorPass prunes dead tokens and applies or lifts expiry blocks.
+// Expiry-based blocks need no usage report, so they are swept here instead
+// of scanning every device on every worker ack. These actions follow the
+// wall clock, so a pass is skipped while the wall clock has just jumped
+// relative to the monotonic clock (ORC-L33).
+func (s *server) expiryJanitorPass(wall time.Time, mono time.Duration) {
+	if !s.expiryClock.stable(wall, mono) {
+		return
+	}
+	if _, err := s.store.pruneDeadTokens(wall); err != nil {
+		log.Printf("token prune failed: %v", err)
+	}
+	if blocked, err := s.store.applyDeviceUsageAndBlocks("", nil, wall); err != nil {
+		log.Printf("device expiry janitor failed: %v", err)
+	} else if blocked > 0 {
+		log.Printf("device expiry janitor blocked count=%d", blocked)
+	}
+	// Expiry blocks can also be applied on worker acks; lift any whose
+	// expiry has not been reached (e.g. applied during a clock jump).
+	if restored, err := s.store.restoreUnexpiredDevices(wall); err != nil {
+		log.Printf("device expiry review failed: %v", err)
+	} else if restored > 0 {
+		log.Printf("device expiry janitor restored count=%d", restored)
+	}
+}
+
+const (
+	// wallClockJumpTolerance is how far the wall clock may drift from the
+	// monotonic clock between two janitor passes before it counts as a jump.
+	wallClockJumpTolerance = time.Minute
+	// wallClockSettle is how long (monotonic) the wall clock must stay
+	// steady after a jump before wall-clock expiry actions resume.
+	wallClockSettle = 10 * time.Minute
+)
+
+// wallClockGuard detects wall-clock jumps by comparing wall-time progress
+// with monotonic progress between observations (ORC-L33).
+type wallClockGuard struct {
+	mu        sync.Mutex
+	base      time.Time
+	observed  bool
+	lastWall  time.Time
+	lastMono  time.Duration
+	holdUntil time.Duration
+}
+
+// monotonic returns now's monotonic offset from the guard's first call.
+func (g *wallClockGuard) monotonic(now time.Time) time.Duration {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.base.IsZero() {
+		g.base = now
+	}
+	return now.Sub(g.base)
+}
+
+// stable records an observation (wall time, monotonic offset) and reports
+// whether wall-clock driven actions may run: false on a jump in either
+// direction and until wallClockSettle of monotonic time has passed since.
+func (g *wallClockGuard) stable(wall time.Time, mono time.Duration) bool {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	wall = wall.Round(0)
+	if !g.observed {
+		g.observed = true
+		g.lastWall, g.lastMono = wall, mono
+		return true
+	}
+	drift := wall.Sub(g.lastWall) - (mono - g.lastMono)
+	g.lastWall, g.lastMono = wall, mono
+	if drift > wallClockJumpTolerance || drift < -wallClockJumpTolerance {
+		g.holdUntil = mono + wallClockSettle
+		log.Printf("ALERT wall clock jumped by %s; expiry janitor paused for %s", drift.Round(time.Second), wallClockSettle)
+		return false
+	}
+	return mono >= g.holdUntil
 }
 
 func loadOrCreateStaticKey(cfg orchConfig) (noise.DHKey, error) {
