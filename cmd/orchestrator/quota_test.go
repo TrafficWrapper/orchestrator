@@ -90,7 +90,7 @@ func TestApplyDeviceUsageQuotaZeroDoesNotBlock(t *testing.T) {
 	}
 }
 
-func TestApplyDeviceUsageSumsPerWorkerAndHandlesCounterReset(t *testing.T) {
+func TestApplyDeviceUsageSumsPerWorkerAndRebasesOnReset(t *testing.T) {
 	s := newTestServer(t)
 	putQuotaDevice(t, s, deviceRecord{
 		ID:           "device-a",
@@ -149,8 +149,10 @@ func TestApplyDeviceUsageSumsPerWorkerAndHandlesCounterReset(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if rec.UsageRxBytes != 110 || rec.UsageTxBytes != 11 {
-		t.Fatalf("usage=(%d,%d), want (110,11)", rec.UsageRxBytes, rec.UsageTxBytes)
+	// Each worker: baseline 0, then +50/5; worker-a going back to 10 is a
+	// counter reset and only rebases instead of charging 10 again.
+	if rec.UsageRxBytes != 100 || rec.UsageTxBytes != 10 {
+		t.Fatalf("usage=(%d,%d), want (100,10)", rec.UsageRxBytes, rec.UsageTxBytes)
 	}
 }
 
@@ -166,6 +168,13 @@ func TestApplyDeviceUsageCountsRealityAndBlocksAtQuota(t *testing.T) {
 		CreatedAt:    time.Now().UTC(),
 		ConfigSeq:    1,
 	})
+	// The first report is a baseline; growth after it is charged.
+	if _, err := s.store.applyDeviceUsageAndBlocks("worker-a", []deviceUsage{{
+		DeviceID: "device-a",
+		Source:   "reality",
+	}}, time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
 	blocked, err := s.store.applyDeviceUsageAndBlocks("worker-a", []deviceUsage{{
 		DeviceID: "device-a",
 		Source:   "reality",
@@ -221,12 +230,13 @@ func TestApplyDeviceUsageSumsAWGAndRealitySources(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if rec.UsageRxBytes != 80 || rec.UsageTxBytes != 20 {
-		t.Fatalf("usage=(%d,%d), want (80,20)", rec.UsageRxBytes, rec.UsageTxBytes)
+	// AWG grew by 50/5; the first REALITY report is only a baseline.
+	if rec.UsageRxBytes != 50 || rec.UsageTxBytes != 5 {
+		t.Fatalf("usage=(%d,%d), want (50,5)", rec.UsageRxBytes, rec.UsageTxBytes)
 	}
 }
 
-func TestApplyDeviceUsageRealityCounterResetAddsNewInterval(t *testing.T) {
+func TestApplyDeviceUsageRealityCounterResetRebases(t *testing.T) {
 	s := newTestServer(t)
 	putQuotaDevice(t, s, deviceRecord{
 		ID:          "device-a",
@@ -264,8 +274,21 @@ func TestApplyDeviceUsageRealityCounterResetAddsNewInterval(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if rec.UsageRxBytes != 125 || rec.UsageTxBytes != 60 {
-		t.Fatalf("reset usage=(%d,%d), want (125,60)", rec.UsageRxBytes, rec.UsageTxBytes)
+	// Baseline 100/50, no growth, then a smaller value: rebase, no charge.
+	if rec.UsageRxBytes != 0 || rec.UsageTxBytes != 0 {
+		t.Fatalf("reset usage=(%d,%d), want (0,0)", rec.UsageRxBytes, rec.UsageTxBytes)
+	}
+	if _, err := s.store.applyDeviceUsageAndBlocks("worker-a", []deviceUsage{{
+		DeviceID: "device-a",
+		Source:   "reality",
+		RxBytes:  40,
+		TxBytes:  20,
+	}}, now.Add(2*time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	rec, _ = s.store.device("device-a")
+	if rec.UsageRxBytes != 15 || rec.UsageTxBytes != 10 {
+		t.Fatalf("growth after rebase=(%d,%d), want (15,10)", rec.UsageRxBytes, rec.UsageTxBytes)
 	}
 }
 
