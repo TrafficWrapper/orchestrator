@@ -72,6 +72,32 @@ or applying it. The signer private key is not held by the web/admin process.
    The worker verifies minisign, materializes local Xray/AWG state, and sends
    `/w/v1/ack`.
 
+## Worker self_describe contract
+
+Everything a worker reports in `self_describe` is untrusted. It is sanitized
+once on intake (enroll, nudge, ack) and only the sanitized copy is stored:
+
+- Allowed top-level keys: `schema`, `hostname`, `egress_ip`, `orch_url`,
+  `agent_url`, `distributor_url`, `standalone`, `dialect_id`, `capacity`,
+  `protocols`, `reality`, `reality_profiles`, `awg`, `awg_profiles`, `health`,
+  `orchestrator`, `distributed_apk`, `capabilities`. Unknown keys are dropped
+  without rejecting the worker. `priority`, `weight`, `label` and `region` are
+  operator policy and never taken from a worker (defaults 10/100).
+- Limits: strings up to 256 bytes, up to 32 profiles per list, 64 KiB in total
+  (a larger report is ignored and the previous one stays in effect).
+- REALITY keys must be 32-byte base64 (RawURL or padded), AWG keys 32-byte
+  standard base64, ports 1..65535, addresses a hostname or IP. A malformed
+  field is kept and raises an alert rather than silently dropping a route.
+- A secret-looking key (`private_key`, `psk2`, `internal_ip`, ...) anywhere is
+  stripped and keeps that worker out of client bundles and discovery until it
+  reports a clean description; other workers are unaffected. Client bundles
+  are validated per worker, and routes without `type`, `address` and `port` or
+  carrying `discovery_url(s)` are not published.
+- AWG profiles for device credentials are the union over approved, enabled
+  workers; for each profile the subnet most workers agree on wins. A worker
+  whose subnet differs (or is not a private /16../26 pool) keeps its AWG out
+  of client bundles and raises an alert.
+
 ## Device Enrollment and Connect
 
 ```mermaid

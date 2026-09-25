@@ -71,7 +71,7 @@ func TestDeviceEnrollConsumesBootstrapOnceAndReturnsClientConfig(t *testing.T) {
 	if resp.ClientBundle.ConfigJSON == "" || resp.ClientBundle.Minisig == "" || resp.ClientBundle.ConfigSHA256 == "" {
 		t.Fatalf("incomplete client bundle: %+v", resp.ClientBundle)
 	}
-	if resp.RealityUUID == "" || resp.InternalIP == "" || resp.PSK2 == "" || resp.ServerAWGPublic != "awgpub" {
+	if resp.RealityUUID == "" || resp.InternalIP == "" || resp.PSK2 == "" || resp.ServerAWGPublic != testAWGPublicKey {
 		t.Fatalf("missing per-device credentials: %+v", resp)
 	}
 	if want := deviceID("identity-pub", ""); resp.DeviceID != want {

@@ -71,6 +71,8 @@ type telegramBot struct {
 	approver *botAuthApprover
 	limitMu  sync.Mutex
 	limits   map[int64]telegramLimitState
+	// pendingRetry holds send backoff for pending-worker notices (limitMu).
+	pendingRetry map[string]pendingNoticeRetry
 	// apkUploading guards the single background /get_apk upload.
 	apkUploading atomic.Bool
 }
@@ -470,6 +472,13 @@ func (b *telegramBot) handleWorkerCallback(ctx context.Context, cb telegramCallb
 		}
 		b.audit("worker_approve", "ok", map[string]string{"worker_id": id})
 		_ = b.client.answerCallback(ctx, cb.ID, "Worker одобрен")
+	case "reject":
+		if err := b.server.store.deletePendingWorker(id); err != nil {
+			_ = b.client.answerCallback(ctx, cb.ID, err.Error())
+			return
+		}
+		b.audit("worker_reject", "ok", map[string]string{"worker_id": id})
+		_ = b.client.answerCallback(ctx, cb.ID, "Pending worker удалён")
 	default:
 		_ = b.client.answerCallback(ctx, cb.ID, "Неверная команда")
 	}
@@ -764,6 +773,7 @@ func (b *telegramBot) notifyPendingWorkers(ctx context.Context) {
 		log.Printf("telegram pending worker notify list failed: %v", err)
 		return
 	}
+	now := time.Now()
 	for _, worker := range workers {
 		if worker.Status != "pending" {
 			continue
@@ -772,23 +782,75 @@ func (b *telegramBot) notifyPendingWorkers(ctx context.Context) {
 		if err != nil || notified {
 			continue
 		}
-		if err := b.sendPendingWorkerNotice(ctx, worker); err != nil {
-			log.Printf("telegram pending worker notify send failed: %v", err)
+		if !b.pendingNoticeDue(worker.ID, now) {
 			continue
 		}
+		if err := b.sendPendingWorkerNotice(ctx, worker); err != nil {
+			log.Printf("telegram pending worker notify send failed: %v", err)
+			b.pendingNoticeFailed(worker.ID, now)
+			continue
+		}
+		b.pendingNoticeSent(worker.ID)
 		_ = b.server.store.markBotPendingWorkerNotified(worker.ID)
 	}
 }
 
+// Pending-worker notices back off after a failed send (1 min doubling to
+// 1 h) so a failing notice cannot keep the bot busy every tick.
+const (
+	pendingNoticeBackoffMin = time.Minute
+	pendingNoticeBackoffMax = time.Hour
+)
+
+type pendingNoticeRetry struct {
+	next    time.Time
+	backoff time.Duration
+}
+
+func (b *telegramBot) pendingNoticeDue(id string, now time.Time) bool {
+	b.limitMu.Lock()
+	defer b.limitMu.Unlock()
+	retry, ok := b.pendingRetry[id]
+	return !ok || !now.Before(retry.next)
+}
+
+func (b *telegramBot) pendingNoticeFailed(id string, now time.Time) {
+	b.limitMu.Lock()
+	defer b.limitMu.Unlock()
+	if b.pendingRetry == nil {
+		b.pendingRetry = map[string]pendingNoticeRetry{}
+	}
+	retry := b.pendingRetry[id]
+	retry.backoff = min(max(retry.backoff*2, pendingNoticeBackoffMin), pendingNoticeBackoffMax)
+	retry.next = now.Add(retry.backoff)
+	b.pendingRetry[id] = retry
+}
+
+func (b *telegramBot) pendingNoticeSent(id string) {
+	b.limitMu.Lock()
+	defer b.limitMu.Unlock()
+	delete(b.pendingRetry, id)
+}
+
 func (b *telegramBot) sendPendingWorkerNotice(ctx context.Context, worker workerRecord) error {
+	address := "-"
+	if reality, ok := mapFromAny(worker.SelfDescribe["reality"]); ok {
+		if value := stringFromMap(reality, "address"); value != "" {
+			address = "(invalid)"
+			if validHostOrIP(value) {
+				address = botSafeText(value, 64)
+			}
+		}
+	}
 	text := fmt.Sprintf(
 		"Новый pending worker\nid: %s\ncreated: %s\naddress: %s",
 		worker.ID,
 		worker.CreatedAt.UTC().Format(time.RFC3339),
-		firstNotBlank(stringFromMap(worker.SelfDescribe, "public_address"), "-"),
+		address,
 	)
 	keyboard := &telegramInlineKeyboard{InlineKeyboard: [][]telegramInlineButton{{
 		{Text: "Approve " + shortString(worker.ID, 8), CallbackData: "worker:approve:" + worker.ID},
+		{Text: "Reject", CallbackData: "worker:reject:" + worker.ID},
 	}}}
 	return b.sendOwnerMessage(ctx, text, keyboard)
 }
