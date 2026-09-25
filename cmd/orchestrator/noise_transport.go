@@ -308,7 +308,7 @@ func (s *server) handleNoiseContext(fn func(context.Context, []byte, []byte) (an
 		if strings.HasPrefix(r.URL.Path, "/w/") {
 			cookie = s.cookieForPeer(protocol.KeyToBase64(peer), time.Now())
 		}
-		resp, err := fn(r.Context(), peer, plain)
+		resp, err := fn(withSourceIP(r.Context(), clientIP(r)), peer, plain)
 		if err != nil {
 			resp = map[string]any{"ok": false, "error": err.Error()}
 		}

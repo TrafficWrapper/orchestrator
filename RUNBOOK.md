@@ -193,6 +193,15 @@ is signed with it in the same change, so apps that received the new bundle
 accept the feed. Apps still offline until then reject new feeds until they
 fetch a bundle; do this only after the monotonic client seq is live, as a
 planned operator action.
+## Rotate the orchestrator TLS certificate
+
+Bootstrap QR codes carry `orch_tls_spki_sha256`, the SHA-256 of the
+certificate's public key, which apps check only during first enrollment
+within the token's lifetime. Re-enrollment of installed apps is unaffected.
+To rotate without breaking outstanding QR codes, either renew with the same
+key (`certbot renew --reuse-key` or equivalent), or publish the next key's pin
+as a backup in `ORCH_PUBLIC_TLS_SPKI_SHA256` before switching and wait until
+old tokens expire.
 
 ## Worker compromise
 

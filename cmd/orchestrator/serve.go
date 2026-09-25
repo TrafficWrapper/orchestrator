@@ -356,7 +356,7 @@ func (s *server) apiRoutes() []apiRoute {
 		{"/w/v1/enroll", s.handleNoise(s.handleEnroll)},
 		{"/w/v1/config/pull", s.handleNoise(s.handlePull)},
 		{"/w/v1/nudge/wait", s.handleNoiseContext(s.handleNudge)},
-		{"/w/v1/ack", s.handleNoise(s.handleAck)},
+		{"/w/v1/ack", s.handleNoiseContext(s.handleAckContext)},
 		{"/w/v1/telemetry", s.handleNoise(s.handleWorkerTelemetry)},
 		{"/w/v1/apk/chunk", s.handleNoiseContext(s.handleAPKChunk)},
 		{"/d/v1/handshake/start", s.handleHandshakeStart},

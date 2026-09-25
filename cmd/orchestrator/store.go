@@ -104,19 +104,24 @@ type workerRecord struct {
 	RevokeFinal bool       `json:"revoke_final,omitempty"`
 	// AutoDetectEmptySince is when the worker first reported an empty
 	// auto-detected address it used to report (see keepAutoDetected).
-	AutoDetectEmptySince *time.Time      `json:"auto_detect_empty_since,omitempty"`
-	CreatedAt            time.Time       `json:"created_at"`
-	ApprovedAt           *time.Time      `json:"approved_at,omitempty"`
-	DesiredSeq           int64           `json:"desired_seq"`
-	AppliedSeq           int64           `json:"applied_seq"`
-	LastAckAt            *time.Time      `json:"last_ack_at,omitempty"`
-	EgressIPObserved     string          `json:"egress_ip_observed,omitempty"`
-	EgressIPProbe        string          `json:"egress_ip_probe,omitempty"`
-	LastError            string          `json:"last_error,omitempty"`
-	Disabled             bool            `json:"disabled,omitempty"`
-	ConfigPriority       *int            `json:"config_priority,omitempty"`
-	ConfigWeight         *int            `json:"config_weight,omitempty"`
-	ProtocolEnabled      map[string]bool `json:"protocol_enabled,omitempty"`
+	AutoDetectEmptySince *time.Time `json:"auto_detect_empty_since,omitempty"`
+	CreatedAt            time.Time  `json:"created_at"`
+	ApprovedAt           *time.Time `json:"approved_at,omitempty"`
+	DesiredSeq           int64      `json:"desired_seq"`
+	AppliedSeq           int64      `json:"applied_seq"`
+	LastAckAt            *time.Time `json:"last_ack_at,omitempty"`
+	EgressIPObserved     string     `json:"egress_ip_observed,omitempty"`
+	EgressIPProbe        string     `json:"egress_ip_probe,omitempty"`
+	// EgressIPSeen is the source address of the worker's last ack and
+	// EgressCheck the result of comparing its declared egress with what the
+	// orchestrator observed: match, mismatch or n/a (X-L12).
+	EgressIPSeen    string          `json:"egress_ip_seen,omitempty"`
+	EgressCheck     string          `json:"egress_check,omitempty"`
+	LastError       string          `json:"last_error,omitempty"`
+	Disabled        bool            `json:"disabled,omitempty"`
+	ConfigPriority  *int            `json:"config_priority,omitempty"`
+	ConfigWeight    *int            `json:"config_weight,omitempty"`
+	ProtocolEnabled map[string]bool `json:"protocol_enabled,omitempty"`
 	// APK delivery tracking: the release seq last shipped in a pull, the
 	// worker config seq it shipped with, and the release seq the worker has
 	// acknowledged applying. Lets pulls skip re-sending an unchanged APK.
