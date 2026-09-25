@@ -127,9 +127,13 @@ func (s *server) handleDiscoveryEndpointsMinisig(w http.ResponseWriter, r *http.
 func (s *server) handleAdminDiscoveryBump(w http.ResponseWriter, r *http.Request) {
 	seq, err := s.bumpDiscoverySeq()
 	if err != nil {
+		s.auditEvent(auditEntry{Event: "discovery_bump", IP: clientIP(r), Result: "failed"})
 		writeStoreError(w, http.StatusInternalServerError, err)
 		return
 	}
+	// A bump changes what every client is served; audit it like other
+	// admin changes (ORC-L16).
+	s.auditEvent(auditEntry{Event: "discovery_bump", IP: clientIP(r), Result: "ok", Fields: map[string]string{"seq": strconv.FormatInt(seq, 10)}})
 	writeJSON(w, map[string]any{"ok": true, "seq": seq})
 }
 

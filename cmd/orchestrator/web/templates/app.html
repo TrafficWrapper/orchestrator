@@ -5,7 +5,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="csrf-token" content="{{.CSRFToken}}">
-  <title>{{.Title}} · TrafficWrapper ORCH</title>
+  <title>{{.Title}}{{if .Authenticated}} · TrafficWrapper ORCH{{end}}</title>
   <style>
     :root { color-scheme: light; --bg:#f6f7f9; --panel:#fff; --text:#15202b; --muted:#627386; --line:#d8e0e8; --accent:#1f6feb; --bad:#b42318; --ok:#067647; }
     * { box-sizing: border-box; }
@@ -52,6 +52,7 @@
     .login { max-width:420px; margin:72px auto; }
     .notice { padding:10px 12px; border-radius:6px; background:#eef6ff; color:#174ea6; margin-bottom:12px; display:none; }
     .error { background:#fff2f0; color:#b42318; }
+    .banner { background:#fef3f2; border:1px solid var(--bad); color:var(--bad); padding:10px 16px; margin:12px 24px 0; border-radius:8px; }
     code { background:#eef3f8; padding:2px 5px; border-radius:5px; }
     @media (max-width: 760px) { table { display:block; overflow-x:auto; } header { align-items:flex-start; flex-direction:column; gap:10px; } .bootstrap-result-grid { grid-template-columns:1fr; } }
   </style>
@@ -68,6 +69,9 @@
       <a href="/settings" class="{{if eq .Path "/settings"}}active{{end}}">Настройки</a>
     </nav>
   </header>
+  {{if .PlaintextPublicListener}}
+  <div class="banner" role="alert">Встроенный TLS выключен (ORCH_TLS=0), а оркестратор слушает не только loopback ({{.Listen}}): admin-сессии и секреты идут открытым текстом, если перед ним нет TLS-прокси. См. RUNBOOK.ru «Plain HTTP на публичном адресе».</div>
+  {{end}}
 {{end}}
   <main>
     {{if eq .Template "login"}}
@@ -86,7 +90,7 @@
       {{template "settings" .}}
     {{end}}
   </main>
-  <script>
+  <script nonce="{{.CSPNonce}}">
     let csrfToken = document.querySelector('meta[name="csrf-token"]')?.content || '';
     let apkServerSigningAvailable = false;
     // Admin API errors are JSON {"ok":false,"error":"..."}; fall back to the
@@ -321,14 +325,14 @@
         "'": '&#39;'
       }[ch]));
     }
-    function downloadBootstrapJSON() {
+    function downloadBootstrapJSON(filename) {
       const text = document.getElementById('bootstrap-json').value;
       if (!text) return;
       const blob = new Blob([text + '\n'], {type: 'application/json'});
       const url = URL.createObjectURL(blob);
       const a = document.createElement('a');
       a.href = url;
-      a.download = 'trafficwrapper-bootstrap.json';
+      a.download = filename || 'bootstrap.json';
       a.click();
       URL.revokeObjectURL(url);
     }
@@ -522,6 +526,39 @@
       const totp_code = document.getElementById('bot-totp-code').value;
       postJSON('/admin/v1/bot/set-token', {token, owner_id, current_secret, totp_code}, '');
     }
+    // Handlers are bound from data-on-* attributes instead of inline on*
+    // attributes, so the page runs under a nonce-based script-src (ORC-L15).
+    const pageActions = {
+      loginOwner: (el, ev) => loginOwner(ev),
+      changePassword: (el, ev) => changePassword(ev),
+      createBootstrap: (el, ev) => createBootstrap(ev),
+      saveBotSettings: (el, ev) => saveBotSettings(ev),
+      changeAdminPassword: (el, ev) => changeAdminPassword(ev),
+      enableTOTP: (el, ev) => enableTOTP(ev),
+      disableTOTP: (el, ev) => disableTOTP(ev),
+      setProtocol: (el) => setProtocol(el.dataset.id, el.dataset.protocol, el.checked),
+      setWorkerEnabled: (el) => setWorkerEnabled(el.dataset.id, el.dataset.enabled === 'true'),
+      toggleBootstrapForm: () => toggleBootstrapForm(),
+      setBootstrapExpiryPreset: (el) => setBootstrapExpiryPreset(el.value),
+      copyText: (el) => copyText(el.dataset.target),
+      downloadBootstrapJSON: (el) => downloadBootstrapJSON(el.dataset.filename),
+      setDeviceAlias: (el) => setDeviceAlias(el, el.dataset.id),
+      revokeDevice: (el) => revokeDevice(el.dataset.id),
+      deleteDevice: (el) => deleteDevice(el.dataset.id, el.dataset.status),
+      applyConfig: () => applyConfig(),
+      inspectSelectedApk: () => inspectSelectedApk(),
+      syncApkSigningMode: () => syncApkSigningMode(),
+      publishApk: () => publishApk(),
+      draftApkManifest: () => draftApkManifest(),
+      startTOTPEnrollment: () => startTOTPEnrollment(),
+    };
+    for (const type of ['click', 'change', 'submit']) {
+      document.addEventListener(type, (event) => {
+        const el = event.target instanceof Element ? event.target.closest('[data-on-' + type + ']') : null;
+        const action = el ? pageActions[el.getAttribute('data-on-' + type)] : null;
+        if (action) action(el, event);
+      });
+    }
     document.addEventListener('DOMContentLoaded', () => {
       setBootstrapExpiryPreset('30');
       loadApkStatus();
@@ -534,9 +571,9 @@
 {{define "login"}}
 <section class="panel login">
   <h1>Вход владельца</h1>
-  <p class="muted">Введите admin-секрет оркестратора. После входа будет создана временная сессия.</p>
+  <p class="muted">Введите admin-секрет. После входа будет создана временная сессия.</p>
   <div id="login-notice" class="notice"></div>
-  <form onsubmit="loginOwner(event)">
+  <form data-on-submit="loginOwner">
     <label>Admin-секрет</label>
     <input id="owner-secret" type="password" autocomplete="current-password" required autofocus>
     <label>Код TOTP (если включён)</label>
@@ -551,7 +588,7 @@
   <h1>Смена пароля</h1>
   <p class="muted">Начальный пароль действителен только для первого входа. Задайте новый admin-пароль, после этого будет создана обычная сессия.</p>
   <div id="change-password-notice" class="notice"></div>
-  <form onsubmit="changePassword(event)">
+  <form data-on-submit="changePassword">
     <label>Текущий пароль</label>
     <input id="current-secret" type="password" autocomplete="current-password" required autofocus>
     <label>Новый пароль</label>
@@ -597,14 +634,14 @@
       <td>{{dash .Egress}}</td>
       <td>priority {{.Priority}}<br>weight {{.Weight}}</td>
       <td>
-        <label class="check"><input type="checkbox" {{if .Reality}}checked{{end}} onchange="setProtocol('{{.ID}}','reality',this.checked)"> REALITY</label>
-        <label class="check"><input type="checkbox" {{if .AWG}}checked{{end}} onchange="setProtocol('{{.ID}}','awg',this.checked)"> AWG</label>
+        <label class="check"><input type="checkbox" {{if .Reality}}checked{{end}} data-on-change="setProtocol" data-id="{{.ID}}" data-protocol="reality"> REALITY</label>
+        <label class="check"><input type="checkbox" {{if .AWG}}checked{{end}} data-on-change="setProtocol" data-id="{{.ID}}" data-protocol="awg"> AWG</label>
       </td>
       <td class="actions">
         {{if .Enabled}}
-          <button class="secondary" onclick="setWorkerEnabled('{{.ID}}', false)">Отключить</button>
+          <button class="secondary" data-on-click="setWorkerEnabled" data-id="{{.ID}}" data-enabled="false">Отключить</button>
         {{else}}
-          <button onclick="setWorkerEnabled('{{.ID}}', true)">Включить</button>
+          <button data-on-click="setWorkerEnabled" data-id="{{.ID}}" data-enabled="true">Включить</button>
         {{end}}
       </td>
     </tr>
@@ -623,12 +660,12 @@
       <h2>Новое устройство</h2>
       <p class="muted">Создаёт одноразовый bootstrap payload для импорта в Android-приложение.</p>
     </div>
-    <button onclick="toggleBootstrapForm()">＋ Новое устройство</button>
+    <button data-on-click="toggleBootstrapForm">＋ Новое устройство</button>
   </div>
-  <form id="bootstrap-form" style="display:none; margin-top:12px" onsubmit="createBootstrap(event)">
+  <form id="bootstrap-form" style="display:none; margin-top:12px" data-on-submit="createBootstrap">
     <div class="grid">
       <label>Срок действия
-        <select id="bootstrap-expiry-preset" onchange="setBootstrapExpiryPreset(this.value)">
+        <select id="bootstrap-expiry-preset" data-on-change="setBootstrapExpiryPreset">
           <option value="7">7 дней</option>
           <option value="30" selected>30 дней</option>
           <option value="365">1 год</option>
@@ -659,14 +696,14 @@
         <label>Base64</label>
         <div class="copy-row">
           <textarea id="bootstrap-base64" rows="4" readonly></textarea>
-          <button class="secondary" onclick="copyText('bootstrap-base64')">Копировать</button>
+          <button class="secondary" data-on-click="copyText" data-target="bootstrap-base64">Копировать</button>
         </div>
         <label>JSON</label>
         <div class="copy-row">
           <textarea id="bootstrap-json" rows="10" readonly></textarea>
           <div class="actions">
-            <button class="secondary" onclick="copyText('bootstrap-json')">Копировать</button>
-            <button class="secondary" onclick="downloadBootstrapJSON()">Скачать .json</button>
+            <button class="secondary" data-on-click="copyText" data-target="bootstrap-json">Копировать</button>
+            <button class="secondary" data-on-click="downloadBootstrapJSON" data-filename="trafficwrapper-bootstrap.json">Скачать .json</button>
           </div>
         </div>
       </div>
@@ -714,13 +751,13 @@
       <td>{{dash .EnrolledAt}}</td>
       <td class="actions">
         <input data-device-alias type="text" maxlength="64" placeholder="Имя устройства" value="{{.Alias}}">
-        <button class="secondary" onclick="setDeviceAlias(this,'{{.ID}}')">Задать имя</button>
+        <button class="secondary" data-on-click="setDeviceAlias" data-id="{{.ID}}">Задать имя</button>
         {{if ne .Status "revoked"}}
-          <button class="danger" onclick="revokeDevice('{{.ID}}')">Отозвать</button>
-          <button class="secondary" onclick="deleteDevice('{{.ID}}','{{.Status}}')">Удалить</button>
+          <button class="danger" data-on-click="revokeDevice" data-id="{{.ID}}">Отозвать</button>
+          <button class="secondary" data-on-click="deleteDevice" data-id="{{.ID}}" data-status="{{.Status}}">Удалить</button>
         {{else}}
           <span class="muted">отозвано</span>
-          <button class="secondary" onclick="deleteDevice('{{.ID}}','{{.Status}}')">Удалить</button>
+          <button class="secondary" data-on-click="deleteDevice" data-id="{{.ID}}" data-status="{{.Status}}">Удалить</button>
         {{end}}
       </td>
     </tr>
@@ -758,14 +795,14 @@
   </tbody>
 </table>
 <div class="actions" style="margin-top:14px">
-  <button onclick="applyConfig()">Применить и запушить</button>
+  <button data-on-click="applyConfig">Применить и запушить</button>
 </div>
 <section class="panel" style="margin-top:16px">
   <h2>Публикация APK</h2>
   <p class="muted">Загрузите уже подписанный APK. ORCH публикует APK и подписанный update-manifest; сам APK-signing key остаётся вне ORCH.</p>
   <div id="apk-current-release" class="notice"></div>
   <div class="apk-grid">
-    <label>APK <input id="apk-file" type="file" accept=".apk" onchange="inspectSelectedApk()"></label>
+    <label>APK <input id="apk-file" type="file" accept=".apk" data-on-change="inspectSelectedApk"></label>
     <label>version code <input id="apk-version-code" type="number" min="1" placeholder="из APK"></label>
     <label>version name <input id="apk-version-name" type="text" placeholder="из APK"></label>
     <label>min version
@@ -776,21 +813,21 @@
   <p id="apk-inspect-note" class="muted">Выберите APK, чтобы ORCH прочитал versionCode/versionName из AndroidManifest.xml.</p>
   <label>Заметки<br><textarea id="apk-notes" rows="2" style="width:100%"></textarea></label>
   <div class="actions" style="margin-top:10px">
-    <label class="check"><input id="apk-server-signing" type="checkbox" onchange="syncApkSigningMode()"> Подписать на сервере (update.key на сервере)</label>
+    <label class="check"><input id="apk-server-signing" type="checkbox" data-on-change="syncApkSigningMode"> Подписать на сервере (update.key на сервере)</label>
   </div>
   <p id="apk-signing-mode-note" class="muted"></p>
   <div id="apk-auto-publish-block" class="actions" style="margin-top:10px; display:none">
-    <button onclick="publishApk()">Опубликовать APK</button>
+    <button data-on-click="publishApk">Опубликовать APK</button>
   </div>
   <div id="apk-offline-publish-block" style="display:none">
     <div class="actions" style="margin-top:10px">
-      <button class="secondary" onclick="draftApkManifest()">Сформировать manifest для подписи</button>
+      <button class="secondary" data-on-click="draftApkManifest">Сформировать manifest для подписи</button>
     </div>
     <p id="apk-publish-note" class="muted"></p>
     <label>manifest_json<br><textarea id="apk-manifest-json" rows="6" style="width:100%; font-family:monospace"></textarea></label>
     <label>manifest minisig<br><textarea id="apk-manifest-minisig" rows="4" style="width:100%; font-family:monospace"></textarea></label>
     <div class="actions" style="margin-top:10px">
-      <button onclick="publishApk()">Опубликовать APK</button>
+      <button data-on-click="publishApk">Опубликовать APK</button>
     </div>
   </div>
 </section>
@@ -808,7 +845,7 @@
       <span class="bad">не настроен</span>
     {{end}}
   </p>
-  <form onsubmit="saveBotSettings(event)">
+  <form data-on-submit="saveBotSettings">
     <label>Bot token</label>
     <input id="bot-token" type="password" autocomplete="off" required>
     <label>Owner Telegram ID</label>
@@ -823,7 +860,7 @@
 <section class="panel">
   <h2>Admin-пароль</h2>
   <div id="admin-password-notice" class="notice"></div>
-  <form onsubmit="changeAdminPassword(event)">
+  <form data-on-submit="changeAdminPassword">
     <label>Текущий пароль</label>
     <input id="admin-current-secret" type="password" autocomplete="current-password" required>
     <label>Новый пароль</label>
@@ -837,15 +874,15 @@
 <section class="panel">
   <h2>Двухфакторная аутентификация (TOTP)</h2>
   <div id="totp-notice" class="notice"></div>
-  <div class="actions"><button type="button" class="secondary" onclick="startTOTPEnrollment()">Создать новый секрет</button></div>
-  <form onsubmit="enableTOTP(event)">
+  <div class="actions"><button type="button" class="secondary" data-on-click="startTOTPEnrollment">Создать новый секрет</button></div>
+  <form data-on-submit="enableTOTP">
     <label>Код из приложения для нового секрета</label>
     <input id="totp-new-code" type="text" inputmode="numeric" autocomplete="one-time-code" required>
     <label>Код текущего секрета (если TOTP уже включён)</label>
     <input id="totp-current-code" type="text" inputmode="numeric" autocomplete="one-time-code">
     <div style="margin-top:12px"><button type="submit">Включить / заменить TOTP</button></div>
   </form>
-  <form onsubmit="disableTOTP(event)">
+  <form data-on-submit="disableTOTP">
     <label>Код текущего секрета</label>
     <input id="totp-disable-code" type="text" inputmode="numeric" autocomplete="one-time-code" required>
     <div style="margin-top:12px"><button type="submit" class="secondary">Отключить TOTP</button></div>
