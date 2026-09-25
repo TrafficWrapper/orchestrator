@@ -282,6 +282,8 @@ func enrollErrorCode(text string) string {
 		return "noise_mismatch"
 	case strings.Contains(text, "awg public key mismatch"):
 		return "awg_key_mismatch"
+	case strings.Contains(text, "awg public key already in use"):
+		return "awg_key_in_use"
 	case strings.Contains(text, "retry"):
 		return "retry"
 	}

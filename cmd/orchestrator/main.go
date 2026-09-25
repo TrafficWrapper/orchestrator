@@ -90,12 +90,14 @@ type server struct {
 	handshakePending   map[string]int
 	handshakePrune     time.Time
 	telemetryNonceMu   sync.Mutex
-	telemetryNonces    map[string]map[string]time.Time
-	loginLimiterMu     sync.Mutex
-	loginLimiter       *loginLimiter
-	audit              *auditLog
-	discoverySeqMu     sync.Mutex
-	discoveryCacheMu   sync.Mutex
+	telemetryNonces    map[string]*telemetryNonceSet
+	// telemetryNoncePrunedAt is when the nonce cache was last swept.
+	telemetryNoncePrunedAt time.Time
+	loginLimiterMu         sync.Mutex
+	loginLimiter           *loginLimiter
+	audit                  *auditLog
+	discoverySeqMu         sync.Mutex
+	discoveryCacheMu       sync.Mutex
 	// discoveryBuildMu serializes bundle rebuilds; the fields below it are
 	// guarded by it.
 	discoveryBuildMu    sync.Mutex
@@ -120,6 +122,8 @@ type server struct {
 	apkRef              *updateRef
 	apkChunkOnce        sync.Once
 	apkChunkSem         chan struct{}
+	// expiryClock pauses wall-clock expiry actions after a clock jump.
+	expiryClock wallClockGuard
 	// startedAt is when this process started serving (ORC-L34).
 	startedAt           time.Time
 	apkArtifactMu       sync.Mutex

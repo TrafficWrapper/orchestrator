@@ -85,6 +85,9 @@ type tokenRecord struct {
 	// Lookup is a keyed HMAC of the secret used to find the record without
 	// running PBKDF2 against every stored token. Legacy records lack it.
 	Lookup string `json:"lookup,omitempty"`
+	// UsedAt is when the token was last consumed; the retention of an
+	// exhausted token counts from it (ORC-I2). Older records lack it.
+	UsedAt *time.Time `json:"used_at,omitempty"`
 }
 
 type workerRecord struct {
@@ -194,8 +197,13 @@ type deviceRecord struct {
 	UsageUpdatedAt     *time.Time                    `json:"usage_updated_at,omitempty"`
 	BlockedAt          *time.Time                    `json:"blocked_at,omitempty"`
 	BlockedReason      string                        `json:"blocked_reason,omitempty"`
-	CreatedAt          time.Time                     `json:"created_at"`
-	ConfigSeq          int64                         `json:"config_seq"`
+	// BlockOrigin says who set BlockedReason: "auto" for a quota/expiry
+	// block this code applied, "unverified" for an auto reason on a record
+	// written by older code, which may hide a later manual revoke (ORC-I6).
+	// Only "auto" blocks are ever lifted automatically.
+	BlockOrigin string    `json:"block_origin,omitempty"`
+	CreatedAt   time.Time `json:"created_at"`
+	ConfigSeq   int64     `json:"config_seq"`
 }
 
 type deviceUsageCounter struct {
@@ -334,6 +342,11 @@ func openOrchStoreDB(cfg orchConfig, db *bolt.DB) (*orchStore, error) {
 	}
 	if !cfg.AllowUnreadableRecords && !s.masterKeyOpensStore() {
 		return nil, fmt.Errorf("%s does not decrypt the existing database: wrong key? (ORCH_STORE_ALLOW_UNREADABLE=1 starts anyway)", keyPath)
+	}
+	if n, err := s.markAmbiguousDeviceBlocks(); err != nil {
+		return nil, fmt.Errorf("mark ambiguous device blocks: %w", err)
+	} else if n > 0 {
+		log.Printf("store: %d revoked devices carry an automatic block reason from older code; they stay revoked until the operator acts", n)
 	}
 	return s, nil
 }
@@ -801,6 +814,11 @@ func (s *orchStore) createBootstrapToken(secret string, expiresAt time.Time, lim
 	if !time.Now().UTC().Before(rec.ExpiresAt) {
 		return tokenRecord{}, errors.New("bootstrap token expiry must be in the future")
 	}
+	// Enrollment parses the limits with parseDeviceLimitsRaw; a token whose
+	// limits it would refuse must not be issued (ORC-L10).
+	if _, err := parseDeviceLimitsRaw(rec.Limits); err != nil {
+		return tokenRecord{}, fmt.Errorf("limits: %w", err)
+	}
 	raw, _ := json.Marshal(rec)
 	err = s.db.Update(func(tx *bolt.Tx) error {
 		return tx.Bucket(bucketTokens).Put([]byte(rec.ID), raw)
@@ -834,6 +852,7 @@ func (s *orchStore) consumeToken(secret string, workerStaticPub string) (string,
 			return errors.New("invalid or exhausted enroll token")
 		}
 		rec.Uses++
+		rec.UsedAt = &now
 		raw, _ = json.Marshal(rec)
 		return b.Put([]byte(rec.ID), raw)
 	})
@@ -863,6 +882,12 @@ func (s *orchStore) consumeBootstrapToken(secret string, device deviceRecord, pr
 		if db.Get([]byte(device.ID)) != nil {
 			return errors.New("device already enrolled; retry enrollment")
 		}
+		// Checked before the token is spent, so a refused enrollment keeps it.
+		if taken, err := ipIndex.awgKeyOwnedByOther(device.AWGPublicKey, device.ID); err != nil {
+			return err
+		} else if taken {
+			return errAWGKeyInUse
+		}
 		raw := tb.Get([]byte(matchedID))
 		if raw == nil {
 			return errors.New("invalid, expired, or exhausted bootstrap token")
@@ -875,6 +900,7 @@ func (s *orchStore) consumeBootstrapToken(secret string, device deviceRecord, pr
 			return errors.New("invalid, expired, or exhausted bootstrap token")
 		}
 		rec.Uses++
+		rec.UsedAt = &now
 		raw, _ = json.Marshal(rec)
 		if err := tb.Put([]byte(rec.ID), raw); err != nil {
 			return err
@@ -1014,7 +1040,13 @@ const tokenRetentionAfterUse = 7 * 24 * time.Hour
 
 func tokenDead(rec tokenRecord, now time.Time) bool {
 	expiredLongAgo := now.Sub(rec.ExpiresAt) > tokenRetentionAfterUse
-	exhaustedLongAgo := rec.MaxUses > 0 && rec.Uses >= rec.MaxUses && now.Sub(rec.CreatedAt) > tokenRetentionAfterUse
+	// An exhausted token is kept for the retention period after its last
+	// use; records written before UsedAt existed count from creation.
+	spentAt := rec.CreatedAt
+	if rec.UsedAt != nil && !rec.UsedAt.IsZero() {
+		spentAt = *rec.UsedAt
+	}
+	exhaustedLongAgo := rec.MaxUses > 0 && rec.Uses >= rec.MaxUses && now.Sub(spentAt) > tokenRetentionAfterUse
 	return expiredLongAgo || exhaustedLongAgo
 }
 
@@ -1248,16 +1280,19 @@ func (s *orchStore) recordTelemetry(rec telemetrySnapshotRecord) error {
 	}
 	version := strings.TrimSpace(rec.ClientVersion)
 	return s.db.Batch(func(tx *bolt.Tx) error {
+		// The device may have been deleted since the caller looked it up;
+		// check in this transaction so no orphan snapshot is written
+		// (ORC-I7).
+		b := tx.Bucket(bucketDevices)
+		raw := b.Get([]byte(rec.DeviceID))
+		if raw == nil {
+			return errDeviceNotFound
+		}
 		if err := tx.Bucket(bucketTelemetry).Put([]byte(rec.DeviceID), sealed); err != nil {
 			return err
 		}
 		if version == "" {
 			return nil
-		}
-		b := tx.Bucket(bucketDevices)
-		raw := b.Get([]byte(rec.DeviceID))
-		if raw == nil {
-			return errDeviceNotFound
 		}
 		var device deviceRecord
 		if err := s.openJSON(bucketDevices, []byte(rec.DeviceID), raw, &device); err != nil {
@@ -1300,25 +1335,148 @@ func clientVersionWouldRollback(current, next string) bool {
 // traffic quota restarts usage accounting, so the quota counts from the moment
 // it is set instead of blocking immediately on lifetime usage. A device that
 // was blocked automatically (quota or expiry) is restored when the new limits
-// no longer trip; a manual revoke is never undone here.
+// no longer trip; a manual revoke, or a block whose origin is not known to be
+// automatic, is never undone here.
 func applyDeviceLimitsChange(rec *deviceRecord, limits deviceLimits, now time.Time) {
 	if limits == (deviceLimits{}) || limits.TrafficQuotaBytes != rec.Limits.TrafficQuotaBytes {
 		rec.UsageRxBytes = 0
 		rec.UsageTxBytes = 0
 	}
 	rec.Limits = limits
-	if rec.Status != "revoked" || !deviceAutoBlockReason(rec.BlockedReason) {
-		return
+	restoreAutoBlockedDevice(rec, now)
+}
+
+// restoreAutoBlockedDevice re-approves rec when it was blocked automatically
+// and its current limits no longer trip at now. It reports whether rec
+// changed.
+func restoreAutoBlockedDevice(rec *deviceRecord, now time.Time) bool {
+	if rec.Status != "revoked" || !deviceAutoBlockReason(rec.BlockedReason) || rec.BlockOrigin != deviceBlockOriginAuto {
+		return false
 	}
 	if deviceLimitsExpired(rec.Limits, now) {
-		return
+		return false
 	}
 	if rec.Limits.TrafficQuotaBytes > 0 && saturatingAddUint64(rec.UsageRxBytes, rec.UsageTxBytes) >= rec.Limits.TrafficQuotaBytes {
-		return
+		return false
 	}
 	rec.Status = "approved"
 	rec.BlockedReason = ""
+	rec.BlockOrigin = ""
 	rec.BlockedAt = nil
+	return true
+}
+
+const (
+	deviceBlockOriginAuto       = "auto"
+	deviceBlockOriginUnverified = "unverified"
+)
+
+// deviceBlockOriginAmbiguous reports a revoked record with an automatic
+// block reason but no origin: older code kept the auto reason when the
+// device was later revoked by hand, so it may be a manual revoke (ORC-I6).
+func deviceBlockOriginAmbiguous(rec deviceRecord) bool {
+	return rec.Status == "revoked" && deviceAutoBlockReason(rec.BlockedReason) && rec.BlockOrigin == ""
+}
+
+// markAmbiguousDeviceBlocks tags records from deviceBlockOriginAmbiguous as
+// "unverified" so nothing lifts them automatically; the operator decides.
+// Records it cannot decrypt are left alone.
+func (s *orchStore) markAmbiguousDeviceBlocks() (int, error) {
+	var ids [][]byte
+	if err := s.db.View(func(tx *bolt.Tx) error {
+		return tx.Bucket(bucketDevices).ForEach(func(k, raw []byte) error {
+			var rec deviceRecord
+			if s.openJSON(bucketDevices, k, raw, &rec) == nil && deviceBlockOriginAmbiguous(rec) {
+				ids = append(ids, append([]byte(nil), k...))
+			}
+			return nil
+		})
+	}); err != nil || len(ids) == 0 {
+		return 0, err
+	}
+	marked := 0
+	err := s.db.Update(func(tx *bolt.Tx) error {
+		marked = 0
+		b := tx.Bucket(bucketDevices)
+		for _, k := range ids {
+			raw := b.Get(k)
+			var rec deviceRecord
+			if raw == nil || s.openJSON(bucketDevices, k, raw, &rec) != nil || !deviceBlockOriginAmbiguous(rec) {
+				continue
+			}
+			rec.BlockOrigin = deviceBlockOriginUnverified
+			sealed, err := s.sealJSON(bucketDevices, k, rec)
+			if err != nil {
+				return err
+			}
+			if err := b.Put(k, sealed); err != nil {
+				return err
+			}
+			marked++
+		}
+		return nil
+	})
+	return marked, err
+}
+
+// restoreUnexpiredDevices lifts automatic expiry blocks whose expiry is not
+// reached at now, e.g. applied while the wall clock was briefly ahead
+// (ORC-L33). Quota blocks stay: usage does not shrink by itself.
+func (s *orchStore) restoreUnexpiredDevices(now time.Time) (int, error) {
+	candidate := func(rec deviceRecord) bool {
+		if strings.TrimSpace(rec.BlockedReason) != "expires_at" {
+			return false
+		}
+		probe := rec
+		return restoreAutoBlockedDevice(&probe, now)
+	}
+	var ids [][]byte
+	if err := s.db.View(func(tx *bolt.Tx) error {
+		return tx.Bucket(bucketDevices).ForEach(func(k, raw []byte) error {
+			var rec deviceRecord
+			if err := s.openJSON(bucketDevices, k, raw, &rec); err != nil {
+				return err
+			}
+			if candidate(rec) {
+				ids = append(ids, append([]byte(nil), k...))
+			}
+			return nil
+		})
+	}); err != nil || len(ids) == 0 {
+		return 0, err
+	}
+	restored := 0
+	err := s.db.Update(func(tx *bolt.Tx) error {
+		restored = 0
+		b := tx.Bucket(bucketDevices)
+		for _, k := range ids {
+			rec, err := getSealedTx[deviceRecord](s, tx, bucketDevices, string(k), errDeviceNotFound)
+			if errors.Is(err, errDeviceNotFound) {
+				continue
+			}
+			if err != nil {
+				return err
+			}
+			if !candidate(rec) {
+				continue
+			}
+			restoreAutoBlockedDevice(&rec, now)
+			log.Printf("device expiry block lifted id=%s: expiry not reached", rec.ID)
+			sealed, err := s.sealJSON(bucketDevices, k, rec)
+			if err != nil {
+				return err
+			}
+			if err := b.Put(k, sealed); err != nil {
+				return err
+			}
+			restored++
+		}
+		if restored > 0 {
+			return s.bumpWorkerSeqsTx(tx)
+		}
+		return nil
+	})
+	return restored, err
 }
 
 func deviceAutoBlockReason(reason string) bool {
@@ -1405,6 +1563,7 @@ func applyUsageToDevice(rec *deviceRecord, workerID string, grouped deviceUsageR
 	if reason != "" {
 		rec.Status = "revoked"
 		rec.BlockedReason = reason
+		rec.BlockOrigin = deviceBlockOriginAuto
 		blockedAt := now.UTC()
 		rec.BlockedAt = &blockedAt
 		if rec.ConfigSeq < 1 {
@@ -1726,6 +1885,7 @@ func (s *orchStore) revokeDevice(id string) error {
 		// A manual revoke overrides any automatic block so that later limit
 		// changes cannot silently restore the device.
 		rec.BlockedReason = "manual"
+		rec.BlockOrigin = ""
 		now := time.Now().UTC()
 		rec.BlockedAt = &now
 		return nil
@@ -1870,77 +2030,123 @@ type workerPolicyPatch struct {
 }
 
 func (s *orchStore) updateWorkerPolicy(id string, patch workerPolicyPatch) error {
+	return s.updateWorkerPolicies([]workerPolicyUpdate{{ID: id, Patch: patch}})
+}
+
+// workerPolicyUpdate is one worker's patch in a batch edit.
+type workerPolicyUpdate struct {
+	ID    string
+	Patch workerPolicyPatch
+}
+
+// validateWorkerPolicyPatch checks the values of a patch that do not depend
+// on the stored record.
+func validateWorkerPolicyPatch(patch workerPolicyPatch) error {
+	if patch.Priority != nil && *patch.Priority < 0 {
+		return errors.New("priority must be >= 0")
+	}
+	if patch.Weight != nil && (*patch.Weight < 0 || *patch.Weight > 100) {
+		return errors.New("weight must be 0..100")
+	}
+	for key := range patch.Protocols {
+		if normalizeProtocolName(key) == "" {
+			return fmt.Errorf("unsupported protocol %q", key)
+		}
+	}
+	return nil
+}
+
+// updateWorkerPolicies validates every patch first and then applies them in
+// one transaction with a single seq bump, so a batch edit is either applied
+// in full or not at all (ORC-L14).
+func (s *orchStore) updateWorkerPolicies(updates []workerPolicyUpdate) error {
+	if len(updates) == 0 {
+		return nil
+	}
+	for _, update := range updates {
+		if err := validateWorkerPolicyPatch(update.Patch); err != nil {
+			return err
+		}
+	}
 	s.clientContentForced.Store(true)
 	changed := false
 	err := s.db.Update(func(tx *bolt.Tx) error {
+		changed = false
 		b := tx.Bucket(bucketWorkers)
-		raw := b.Get([]byte(strings.TrimSpace(id)))
-		if raw == nil {
-			return errWorkerNotFound
-		}
-		var rec workerRecord
-		if err := s.openJSON(bucketWorkers, []byte(strings.TrimSpace(id)), raw, &rec); err != nil {
-			return err
-		}
-		before := workerDiscoveryFingerprint(rec, time.Now().UTC())
-		if patch.Enabled != nil {
-			if rec.Disabled == *patch.Enabled {
-				// Enable/disable transition: this worker needs a new
-				// config (with or without devices) even while disabled.
-				rec.DesiredSeq = max(rec.DesiredSeq, 0) + 1
+		for _, update := range updates {
+			id := strings.TrimSpace(update.ID)
+			raw := b.Get([]byte(id))
+			if raw == nil {
+				return errWorkerNotFound
 			}
-			rec.Disabled = !*patch.Enabled
-		}
-		if patch.Priority != nil {
-			value := *patch.Priority
-			if value < 0 {
-				return errors.New("priority must be >= 0")
+			var rec workerRecord
+			if err := s.openJSON(bucketWorkers, []byte(id), raw, &rec); err != nil {
+				return err
 			}
-			rec.ConfigPriority = &value
-		}
-		if patch.Weight != nil {
-			value := *patch.Weight
-			if value < 0 || value > 100 {
-				return errors.New("weight must be 0..100")
+			before := workerDiscoveryFingerprint(rec, time.Now().UTC())
+			if err := applyWorkerPolicyPatch(&rec, update.Patch); err != nil {
+				return err
 			}
-			rec.ConfigWeight = &value
-		}
-		if patch.ShortIDRevoked != nil {
-			rec.RevokedShortIDs = toggleString(normalizeShortIDs(rec.RevokedShortIDs), strings.ToLower(patch.ShortID), *patch.ShortIDRevoked)
-		}
-		if patch.AWGProfileDraining != nil {
-			rec.DrainingAWGProfiles = toggleString(rec.DrainingAWGProfiles, patch.AWGProfile, *patch.AWGProfileDraining)
-		}
-		if len(patch.Protocols) > 0 {
-			if rec.ProtocolEnabled == nil {
-				rec.ProtocolEnabled = map[string]bool{}
+			sealed, err := s.sealJSON(bucketWorkers, []byte(rec.ID), rec)
+			if err != nil {
+				return err
 			}
-			for key, enabled := range patch.Protocols {
-				normalized := normalizeProtocolName(key)
-				if normalized == "" {
-					return fmt.Errorf("unsupported protocol %q", key)
-				}
-				if enabled == nil {
-					delete(rec.ProtocolEnabled, normalized)
-				} else {
-					rec.ProtocolEnabled[normalized] = *enabled
-				}
+			if err := b.Put([]byte(rec.ID), sealed); err != nil {
+				return err
+			}
+			if before != workerDiscoveryFingerprint(rec, time.Now().UTC()) {
+				changed = true
 			}
 		}
-		sealed, err := s.sealJSON(bucketWorkers, []byte(rec.ID), rec)
-		if err != nil {
-			return err
-		}
-		if err := b.Put([]byte(rec.ID), sealed); err != nil {
-			return err
-		}
-		changed = before != workerDiscoveryFingerprint(rec, time.Now().UTC())
 		return s.bumpWorkerSeqsTx(tx)
 	})
 	if err == nil && changed {
 		s.touchDiscoveryWorkerRevision()
 	}
 	return err
+}
+
+// applyWorkerPolicyPatch applies a validated patch to rec.
+func applyWorkerPolicyPatch(rec *workerRecord, patch workerPolicyPatch) error {
+	if err := validateWorkerPolicyPatch(patch); err != nil {
+		return err
+	}
+	if patch.Enabled != nil {
+		if rec.Disabled == *patch.Enabled {
+			// Enable/disable transition: this worker needs a new
+			// config (with or without devices) even while disabled.
+			rec.DesiredSeq = max(rec.DesiredSeq, 0) + 1
+		}
+		rec.Disabled = !*patch.Enabled
+	}
+	if patch.Priority != nil {
+		value := *patch.Priority
+		rec.ConfigPriority = &value
+	}
+	if patch.Weight != nil {
+		value := *patch.Weight
+		rec.ConfigWeight = &value
+	}
+	if patch.ShortIDRevoked != nil {
+		rec.RevokedShortIDs = toggleString(normalizeShortIDs(rec.RevokedShortIDs), strings.ToLower(patch.ShortID), *patch.ShortIDRevoked)
+	}
+	if patch.AWGProfileDraining != nil {
+		rec.DrainingAWGProfiles = toggleString(rec.DrainingAWGProfiles, patch.AWGProfile, *patch.AWGProfileDraining)
+	}
+	if len(patch.Protocols) > 0 {
+		if rec.ProtocolEnabled == nil {
+			rec.ProtocolEnabled = map[string]bool{}
+		}
+		for key, enabled := range patch.Protocols {
+			normalized := normalizeProtocolName(key)
+			if enabled == nil {
+				delete(rec.ProtocolEnabled, normalized)
+			} else {
+				rec.ProtocolEnabled[normalized] = *enabled
+			}
+		}
+	}
+	return nil
 }
 
 func (s *orchStore) currentAPKRelease() (apkReleaseRecord, bool, error) {
@@ -2398,6 +2604,9 @@ type deviceIPIndex struct {
 	store *orchStore
 	tx    *bolt.Tx
 	used  map[string]map[netip.Addr]struct{}
+	// awgOwners maps every AWG public key in use to the device holding it
+	// (ORC-L2), collected in the same pass.
+	awgOwners map[string]string
 }
 
 func (s *orchStore) newDeviceIPIndex(tx *bolt.Tx) *deviceIPIndex {
@@ -2409,6 +2618,7 @@ func (x *deviceIPIndex) load() error {
 		return nil
 	}
 	used := map[string]map[netip.Addr]struct{}{}
+	owners := map[string]string{}
 	add := func(pool, value string) {
 		addr, err := netip.ParseAddr(strings.TrimSuffix(strings.TrimSpace(value), "/32"))
 		if err != nil {
@@ -2430,12 +2640,32 @@ func (x *deviceIPIndex) load() error {
 				add(pool, creds.InternalIP)
 			}
 		}
+		for _, key := range deviceAWGKeys(rec) {
+			if key != "" {
+				owners[key] = string(k)
+			}
+		}
 		return nil
 	}); err != nil {
 		return err
 	}
 	x.used = used
+	x.awgOwners = owners
 	return nil
+}
+
+// errAWGKeyInUse refuses an enrollment whose AWG public key already belongs
+// to another device: workers key AWG peers by public key, so two devices
+// cannot share one (ORC-L2).
+var errAWGKeyInUse = errors.New("awg public key already in use by another device")
+
+// awgKeyOwnedByOther reports whether key is held by a device other than id.
+func (x *deviceIPIndex) awgKeyOwnedByOther(key, id string) (bool, error) {
+	if err := x.load(); err != nil {
+		return false, err
+	}
+	owner, ok := x.awgOwners[strings.TrimSpace(key)]
+	return ok && owner != id, nil
 }
 
 // allocate returns the first free /32 in cidr (IPv4) for the profile pool,

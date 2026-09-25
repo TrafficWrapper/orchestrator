@@ -7,9 +7,12 @@ import (
 
 func TestDeviceLimitsChangeRestoresQuotaBlockedDevice(t *testing.T) {
 	now := time.Now().UTC()
+	// ORC-I6: only blocks this code applied (BlockOrigin "auto") are lifted
+	// automatically, so the fixture carries the origin an auto-block sets.
 	rec := deviceRecord{
 		Status:        "revoked",
 		BlockedReason: "traffic_quota_bytes",
+		BlockOrigin:   deviceBlockOriginAuto,
 		BlockedAt:     &now,
 		UsageRxBytes:  8 << 30,
 		UsageTxBytes:  4 << 30,
@@ -26,7 +29,8 @@ func TestDeviceLimitsChangeRestoresQuotaBlockedDevice(t *testing.T) {
 
 func TestDeviceLimitsResetClearsUsageAndUnblocks(t *testing.T) {
 	now := time.Now().UTC()
-	rec := deviceRecord{Status: "revoked", BlockedReason: "expires_at", UsageRxBytes: 5}
+	// ORC-I6: the fixture is an auto-block written by this code.
+	rec := deviceRecord{Status: "revoked", BlockedReason: "expires_at", BlockOrigin: deviceBlockOriginAuto, UsageRxBytes: 5}
 	applyDeviceLimitsChange(&rec, deviceLimits{}, now)
 	if rec.Status != "approved" || rec.UsageRxBytes != 0 {
 		t.Fatalf("reset did not restore device: %+v", rec)
@@ -49,7 +53,7 @@ func TestDeviceLimitsChangeKeepsManualRevoke(t *testing.T) {
 func TestDeviceLimitsChangeKeepsBlockWhenStillExpired(t *testing.T) {
 	now := time.Now().UTC()
 	past := now.Add(-time.Hour).Format(time.RFC3339)
-	rec := deviceRecord{Status: "revoked", BlockedReason: "expires_at"}
+	rec := deviceRecord{Status: "revoked", BlockedReason: "expires_at", BlockOrigin: deviceBlockOriginAuto}
 	applyDeviceLimitsChange(&rec, deviceLimits{ExpiresAt: &past}, now)
 	if rec.Status != "revoked" {
 		t.Fatal("device must stay blocked while the new expiry is in the past")

@@ -128,7 +128,8 @@ applying. Signer private key не хранится в web/admin process.
 - Коды отказов и время платформы. Отказы сохраняют прежние тексты error
   (по ним сверяются старые приложения и воркеры) и получают `code`: в
   `/d/v1/enroll` — token_invalid, device_not_approved, device_revoked,
-  identity_mismatch, noise_mismatch, awg_key_mismatch, no_worker, retry; в
+  identity_mismatch, noise_mismatch, awg_key_mismatch, awg_key_in_use,
+  no_worker, retry; в
   `/w/v1/telemetry` — stale_timestamp, replay, bad_signature,
   unknown_device, device_not_approved, invalid_payload, worker_revoked,
   worker_pending. Каждый Noise-ответ воркеру содержит `server_time` (часы
