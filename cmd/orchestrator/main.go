@@ -29,8 +29,13 @@ type orchConfig struct {
 	RealityFallbackProfiles bool
 	// ClientSeqFloor is the lowest client bundle seq ever published
 	// (ORCH_CLIENT_SEQ_FLOOR); ClientBundleTTL sets expires_at.
-	ClientSeqFloor          int64
-	ClientBundleTTL         time.Duration
+	ClientSeqFloor  int64
+	ClientBundleTTL time.Duration
+	// AllowNewMasterKey lets the store create master.key over a database
+	// that already holds encrypted records (discarding them);
+	// AllowUnreadableRecords starts even if some records do not decrypt.
+	AllowNewMasterKey       bool
+	AllowUnreadableRecords  bool
 	PublicURL               string
 	EgressProbeURL          string
 	AdminSecret             string
@@ -205,6 +210,24 @@ func runMain() error {
 		return st.approveWorker(os.Args[2])
 	case "status":
 		return statusCommand(cfg)
+	case "store-clear-sealed-marker":
+		// Recovery after a start with the wrong master.key: legacy records
+		// are accepted and migrated again on the next start. Stop the
+		// orchestrator first.
+		if err := clearSealedFormatMarker(cfg.StateDir); err != nil {
+			return err
+		}
+		fmt.Println("sealed format marker cleared")
+		return nil
+	case "signer-accept-key":
+		// After an intentional signer key rotation: forget the pinned
+		// config-signing public key so the next start pins the new one.
+		// Stop the orchestrator first.
+		if err := clearSignerPin(cfg.StateDir); err != nil {
+			return err
+		}
+		fmt.Println("pinned signer public key cleared")
+		return nil
 	default:
 		return fmt.Errorf("unknown command %q", cmd)
 	}
@@ -237,6 +260,8 @@ func readConfig() (orchConfig, error) {
 		RealityFallbackProfiles: env.bool("ORCH_REALITY_FALLBACK_PROFILES", false),
 		ClientSeqFloor:          env.int64("ORCH_CLIENT_SEQ_FLOOR", 0, 0),
 		ClientBundleTTL:         env.duration("ORCH_CLIENT_BUNDLE_TTL", 24*time.Hour, time.Hour),
+		AllowNewMasterKey:       env.bool("ORCH_ALLOW_NEW_MASTER_KEY", false),
+		AllowUnreadableRecords:  env.bool("ORCH_STORE_ALLOW_UNREADABLE", false),
 	}
 	return cfg, errors.Join(env.errs...)
 }

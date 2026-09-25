@@ -249,9 +249,44 @@ func openOrchStore(cfg orchConfig) (*orchStore, error) {
 	if err := os.MkdirAll(cfg.StateDir, 0o700); err != nil {
 		return nil, err
 	}
-	key, err := loadOrCreateMasterKey(filepath.Join(cfg.StateDir, "master.key"))
+	db, err := bolt.Open(filepath.Join(cfg.StateDir, "orchestrator.db"), 0o600, &bolt.Options{Timeout: time.Second})
 	if err != nil {
 		return nil, err
+	}
+	s, err := openOrchStoreDB(cfg, db)
+	if err != nil {
+		_ = db.Close()
+		return nil, err
+	}
+	return s, nil
+}
+
+func openOrchStoreDB(cfg orchConfig, db *bolt.DB) (*orchStore, error) {
+	err := db.Update(func(tx *bolt.Tx) error {
+		for _, b := range [][]byte{bucketWorkers, bucketTokens, bucketDevices, bucketTelemetry, bucketMeta} {
+			if _, err := tx.CreateBucketIfNotExists(b); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	keyPath := filepath.Join(cfg.StateDir, "master.key")
+	key, err := loadMasterKey(keyPath)
+	if err != nil {
+		return nil, err
+	}
+	if key == nil {
+		// A new key over existing ciphertexts would make every record
+		// unreadable (and, after migration, permanently rejected).
+		if n := countSealedRecords(db); n > 0 && !cfg.AllowNewMasterKey {
+			return nil, fmt.Errorf("%s is missing but the database holds %d encrypted records: restore master.key (or set ORCH_ALLOW_NEW_MASTER_KEY=1 to discard them)", keyPath, n)
+		}
+		if key, err = createMasterKey(keyPath); err != nil {
+			return nil, err
+		}
 	}
 	block, err := aes.NewCipher(key)
 	if err != nil {
@@ -261,30 +296,19 @@ func openOrchStore(cfg orchConfig) (*orchStore, error) {
 	if err != nil {
 		return nil, err
 	}
-	db, err := bolt.Open(filepath.Join(cfg.StateDir, "orchestrator.db"), 0o600, &bolt.Options{Timeout: time.Second})
-	if err != nil {
-		return nil, err
-	}
 	s := &orchStore{db: db, aead: aead, tokenLookupKey: deriveTokenLookupKey(key)}
-	err = db.Update(func(tx *bolt.Tx) error {
-		for _, b := range [][]byte{bucketWorkers, bucketTokens, bucketDevices, bucketTelemetry, bucketMeta} {
-			if _, err := tx.CreateBucketIfNotExists(b); err != nil {
-				return err
-			}
-		}
-		return nil
-	})
+	migrated, unreadable, err := s.migrateSealedRecords(cfg.AllowUnreadableRecords)
 	if err != nil {
-		_ = db.Close()
-		return nil, err
-	}
-	migrated, err := s.migrateSealedRecords()
-	if err != nil {
-		_ = db.Close()
 		return nil, fmt.Errorf("migrate sealed records: %w", err)
 	}
 	if migrated > 0 {
 		log.Printf("store: bound %d legacy sealed records to their keys", migrated)
+	}
+	if unreadable > 0 {
+		log.Printf("ALERT store: %d sealed records cannot be decrypted with master.key; format marker not written", unreadable)
+	}
+	if !cfg.AllowUnreadableRecords && !s.masterKeyOpensStore() {
+		return nil, fmt.Errorf("%s does not decrypt the existing database: wrong key? (ORCH_STORE_ALLOW_UNREADABLE=1 starts anyway)", keyPath)
 	}
 	return s, nil
 }
@@ -293,27 +317,118 @@ func (s *orchStore) close() error {
 	return s.db.Close()
 }
 
-func loadOrCreateMasterKey(path string) ([]byte, error) {
-	if raw, err := os.ReadFile(path); err == nil {
-		key, err := base64.StdEncoding.DecodeString(strings.TrimSpace(string(raw)))
-		if err != nil {
-			return nil, err
-		}
-		if len(key) != 32 {
-			return nil, fmt.Errorf("master key has %d bytes", len(key))
-		}
-		return key, nil
-	} else if !errors.Is(err, os.ErrNotExist) {
+// loadMasterKey returns nil (no error) when the key file does not exist.
+func loadMasterKey(path string) ([]byte, error) {
+	raw, err := os.ReadFile(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, nil
+	}
+	if err != nil {
 		return nil, err
 	}
+	key, err := base64.StdEncoding.DecodeString(strings.TrimSpace(string(raw)))
+	if err != nil {
+		return nil, err
+	}
+	if len(key) != 32 {
+		return nil, fmt.Errorf("master key has %d bytes", len(key))
+	}
+	return key, nil
+}
+
+func createMasterKey(path string) ([]byte, error) {
 	key := make([]byte, 32)
 	if _, err := rand.Read(key); err != nil {
 		return nil, err
 	}
-	if err := os.WriteFile(path, []byte(base64.StdEncoding.EncodeToString(key)+"\n"), 0o600); err != nil {
+	if err := writeFileAtomic(path, []byte(base64.StdEncoding.EncodeToString(key)+"\n"), 0o600); err != nil {
 		return nil, err
 	}
 	return key, nil
+}
+
+// sealedBuckets hold records encrypted with the master key.
+var sealedBuckets = [][]byte{bucketWorkers, bucketDevices, bucketTelemetry, bucketMeta}
+
+// looksSealed reports whether v is a sealed record (v2 or legacy form)
+// rather than plain JSON or a marker value.
+func looksSealed(v []byte) bool {
+	text := string(v)
+	if strings.HasPrefix(text, sealedRecordV2Prefix) {
+		return true
+	}
+	nonce, ciphertext, ok := strings.Cut(text, ".")
+	if !ok {
+		return false
+	}
+	n, err := base64.RawStdEncoding.DecodeString(nonce)
+	if err != nil || len(n) != 12 {
+		return false
+	}
+	_, err = base64.RawStdEncoding.DecodeString(ciphertext)
+	return err == nil
+}
+
+func countSealedRecords(db *bolt.DB) int {
+	n := 0
+	_ = db.View(func(tx *bolt.Tx) error {
+		for _, name := range sealedBuckets {
+			if b := tx.Bucket(name); b != nil {
+				_ = b.ForEach(func(_, v []byte) error {
+					if looksSealed(v) {
+						n++
+					}
+					return nil
+				})
+			}
+		}
+		return nil
+	})
+	return n
+}
+
+// masterKeyOpensStore checks the key against the first sealed record found:
+// a wrong key must stop startup, not surface as a broken service.
+func (s *orchStore) masterKeyOpensStore() bool {
+	ok := true
+	_ = s.db.View(func(tx *bolt.Tx) error {
+		for _, name := range sealedBuckets {
+			b := tx.Bucket(name)
+			if b == nil {
+				continue
+			}
+			c := b.Cursor()
+			for k, v := c.First(); k != nil; k, v = c.Next() {
+				if !strings.HasPrefix(string(v), sealedRecordV2Prefix) {
+					continue
+				}
+				_, err := s.openSealed(name, k, v)
+				ok = err == nil
+				return nil
+			}
+		}
+		return nil
+	})
+	return ok
+}
+
+// clearSealedFormatMarker removes the "every record is bound" marker so
+// legacy records are accepted (and migrated) again on the next start. For
+// recovering from a start with the wrong master.key; run it with the
+// orchestrator stopped.
+func clearSealedFormatMarker(stateDir string) error {
+	db, err := bolt.Open(filepath.Join(stateDir, "orchestrator.db"), 0o600, &bolt.Options{Timeout: time.Second})
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+	return db.Update(func(tx *bolt.Tx) error {
+		b := tx.Bucket(bucketMeta)
+		if b == nil {
+			return nil
+		}
+		return b.Delete(metaSealedFormat)
+	})
 }
 
 func workerID(staticPub string) string {
@@ -2406,8 +2521,8 @@ func (s *orchStore) openJSON(bucket, key, raw []byte, v any) error {
 // migrateSealedRecords rewrites legacy sealed records (no associated data)
 // into the bound v2 format. Values that are not legacy ciphertexts (v2
 // records, plain JSON such as tokens or the APK release) are left untouched.
-func (s *orchStore) migrateSealedRecords() (int, error) {
-	migrated := 0
+func (s *orchStore) migrateSealedRecords(allowUnreadable bool) (int, int, error) {
+	migrated, unreadable := 0, 0
 	done := false
 	err := s.db.Update(func(tx *bolt.Tx) error {
 		// Once every record is bound, never accept (and rebind) legacy
@@ -2417,13 +2532,18 @@ func (s *orchStore) migrateSealedRecords() (int, error) {
 			done = true
 			return nil
 		}
-		for _, name := range [][]byte{bucketWorkers, bucketDevices, bucketTelemetry, bucketMeta} {
+		// Batch may retry: count from zero each attempt.
+		migrated, unreadable = 0, 0
+		for _, name := range sealedBuckets {
 			err := rewriteBucket(tx.Bucket(name), func(k, v []byte) ([]byte, error) {
 				if strings.HasPrefix(string(v), sealedRecordV2Prefix) {
 					return nil, nil
 				}
 				plain, err := s.openSealed(name, k, v)
 				if err != nil {
+					if looksSealed(v) {
+						unreadable++
+					}
 					return nil, nil
 				}
 				migrated++
@@ -2433,12 +2553,20 @@ func (s *orchStore) migrateSealedRecords() (int, error) {
 				return err
 			}
 		}
+		// Records this key cannot open may belong to the right key: never
+		// seal the format over them (the marker would reject them forever).
+		if unreadable > 0 {
+			if !allowUnreadable {
+				return fmt.Errorf("%d legacy sealed records cannot be decrypted with master.key (wrong key?); set ORCH_STORE_ALLOW_UNREADABLE=1 to start without them", unreadable)
+			}
+			return nil
+		}
 		return tx.Bucket(bucketMeta).Put(metaSealedFormat, []byte("2"))
 	})
-	if err == nil || done {
+	if done || (err == nil && unreadable == 0) {
 		s.rejectLegacySealed.Store(true)
 	}
-	return migrated, err
+	return migrated, unreadable, err
 }
 
 // openSealed decrypts a v2 record bound to bucket/key, or a legacy record.

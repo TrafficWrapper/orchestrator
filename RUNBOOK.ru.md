@@ -51,6 +51,20 @@ signer автоматически переносят config-signing key из `./
 новый формат не читают, поэтому перед обновлением сделайте бэкап
 `./orch-state`; откат возможен только восстановлением этого бэкапа.
 
+Мастер-ключ (`orch-state/master.key`) и база данных неразделимы:
+
+- Если `master.key` отсутствует, а в базе есть зашифрованные записи,
+  orchestrator не стартует и не создаёт новый ключ. Восстановите ключ из того
+  же бэкапа, что и базу. `ORCH_ALLOW_NEW_MASTER_KEY=1` запускает с новым
+  ключом, и все существующие зашифрованные записи становятся нечитаемыми.
+- Если `master.key` не расшифровывает базу (не тот бэкап), старт падает.
+  `ORCH_STORE_ALLOW_UNREADABLE=1` запускает всё равно, не запечатывая формат,
+  чтобы правильный ключ можно было вернуть позже.
+- Если старый бинарник уже запечатал формат с неверным ключом, остановите
+  orchestrator, верните правильный `master.key`, выполните
+  `orchestrator store-clear-sealed-marker` и запустите снова: legacy-записи
+  будут мигрированы правильным ключом.
+
 ## Ротация config-signing key
 
 Config-signing key хранится signer process и доступен через
@@ -62,6 +76,8 @@ Config-signing key хранится signer process и доступен чере�
    rotation window.
 2. Сделайте backup текущего orchestrator state.
 3. Сгенерируйте или установите новый signer key в signer state location.
+   При остановленном orchestrator выполните `orchestrator signer-accept-key`,
+   чтобы он закрепил новый ключ, а не отверг его.
 4. Перезапустите `signer` и `orchestrator`.
 5. Опубликуйте свежие `worker-config-v1` и `client-config-v1`.
 6. Re-issue client config/bootstrap material, чтобы devices pin'или новый config
@@ -180,8 +196,13 @@ Seq клиентского бандла — персистентный счёт�
 
 Если config signer private key потерян:
 
-1. Восстановите его из private backup, если он есть.
-2. Если backup отсутствует, создайте новый config-signing key.
+1. Восстановите его из private backup, если он есть. Signer никогда не
+   заменяет потерянный ключ сам: если рядом с файлом ключа есть
+   `<key>.initialized`, отсутствие ключа останавливает signer.
+2. Если backup отсутствует, удалите `<key>.initialized`, чтобы signer создал
+   новый config-signing key, затем остановите orchestrator и выполните
+   `orchestrator signer-accept-key`: orchestrator закрепляет публичный ключ
+   signer и отказывается подписывать другим, пока закрепление не снято.
 3. Рассматривайте это как config key rotation.
 4. Re-enroll или re-bootstrap devices, pin'ившие старый config public key.
 

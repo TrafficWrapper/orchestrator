@@ -48,7 +48,7 @@ func (s *server) buildBundles(rec workerRecord) (signedConfig, signedConfig, err
 	if err != nil {
 		return signedConfig{}, signedConfig{}, err
 	}
-	workerSigned, err := s.signer.sign(workerJSON)
+	workerSigned, err := s.sign(workerJSON)
 	if err != nil {
 		return signedConfig{}, signedConfig{}, err
 	}
