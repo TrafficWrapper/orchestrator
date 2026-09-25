@@ -17,6 +17,10 @@ const (
 	// IPv6 /48, so rotating addresses inside one network does not multiply
 	// the per-address budget.
 	adminLoginPrefixFailureLimit = 25
+	// adminLoginPrefixMinSources is how many distinct failing addresses a
+	// network needs before it is locked as a whole: one noisy neighbour
+	// locks only itself, not the owner in the same /24 (ORC-L29).
+	adminLoginPrefixMinSources = 4
 )
 
 type loginLimiter struct {
@@ -30,6 +34,8 @@ type loginLimitState struct {
 	Failures    int
 	WindowStart time.Time
 	LockedUntil time.Time
+	// Sources counts distinct failing addresses (network keys only).
+	Sources map[string]struct{}
 }
 
 type loginAttemptReservation struct {
@@ -55,6 +61,9 @@ func (s *server) adminLoginLimiter() *loginLimiter {
 type loginLimiterKey struct {
 	key   string
 	limit int
+	// source is the address charged to a network key; empty for the
+	// per-address key.
+	source string
 }
 
 // loginLimiterKeys charges an attempt to the address (IPv4 or IPv6 /64) and
@@ -62,7 +71,7 @@ type loginLimiterKey struct {
 func loginLimiterKeys(ip string) []loginLimiterKey {
 	return []loginLimiterKey{
 		{key: rateLimitKey(ip), limit: adminLoginFailureLimit},
-		{key: loginPrefixKey(ip), limit: adminLoginPrefixFailureLimit},
+		{key: loginPrefixKey(ip), limit: adminLoginPrefixFailureLimit, source: rateLimitKey(ip)},
 	}
 }
 
@@ -94,7 +103,13 @@ func (l *loginLimiter) reserveAttempt(key string) loginAttemptReservation {
 			l.states[k.key] = state
 		}
 		state.Failures++
-		if state.Failures >= k.limit {
+		if k.source != "" && len(state.Sources) < adminLoginPrefixMinSources {
+			if state.Sources == nil {
+				state.Sources = map[string]struct{}{}
+			}
+			state.Sources[k.source] = struct{}{}
+		}
+		if state.Failures >= k.limit && (k.source == "" || len(state.Sources) >= adminLoginPrefixMinSources) {
 			state.LockedUntil = now.Add(adminLoginLockoutTTL)
 			if state.LockedUntil.After(lockedUntil) {
 				lockedUntil = state.LockedUntil
@@ -198,4 +213,11 @@ func retryAfterSeconds(until time.Time, now time.Time) string {
 // loginPrefixKey aggregates login failures by IPv4 /24 and IPv6 /48.
 func loginPrefixKey(ip string) string {
 	return networkPrefixKey(ip, 24, 48)
+}
+
+// chargeFailure counts a failure that happened after the credentials were
+// accepted (owner denied or did not answer the approval), so approval
+// requests cannot be repeated without limit.
+func (l *loginLimiter) chargeFailure(key string) {
+	_ = l.reserveAttempt(key)
 }

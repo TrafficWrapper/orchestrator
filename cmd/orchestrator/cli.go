@@ -215,13 +215,14 @@ func adminCommand(cfg orchConfig, args []string) error {
 	if err != nil {
 		return err
 	}
+	if err := validateAdminPassword(secret); err != nil {
+		return err
+	}
 	st, err := openOrchStore(cfg)
 	if err != nil {
-		if err := adminPost(cfg, "/admin/v1/password/force-set", map[string]string{"new_secret": secret}, os.Stdout); !errors.Is(err, errAdminServerUnreachable) {
-			// Reached the server: report its answer instead of bypassing it.
-			return err
-		}
-		return err
+		// A running orchestrator holds the database; setting the password
+		// through the API needs the current one (change it in the admin UI).
+		return fmt.Errorf("%w (stop the orchestrator to set the password directly, or change it in the admin UI)", err)
 	}
 	defer st.close()
 	if err := st.setAdminPassword(secret); err != nil {

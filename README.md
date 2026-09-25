@@ -195,7 +195,7 @@ provided Compose file:
 | `ORCH_APK_PACKAGE` | App package every published APK must carry. | Optional | package of the current release | Rejects an APK from another app. |
 | `ORCH_CLIENT_BUNDLE_TTL` | Client bundle `expires_at` horizon; content older than 2/3 of it is republished under a new seq. | Optional | `24h` | Go duration, at least `1h`. |
 | `ORCH_CLIENT_SEQ_FLOOR` | Lowest client bundle seq ever published (used on first start and after restoring an older DB). | Optional | `0` | See RUNBOOK "Client config seq after restore or rollback". |
-| `ORCH_CLIENT_IP_HEADER` | Which proxy header carries the client IP when the peer is loopback: `x-real-ip`, `x-forwarded-for`, `none`, or `auto`. | Optional | `auto` | Set it to the header your reverse proxy overwrites; see Production TLS. |
+| `ORCH_CLIENT_IP_HEADER` | Which proxy header carries the client IP when the peer is loopback: `x-real-ip`, `x-forwarded-for`, `none`, or `auto`. | Optional | `auto` | `auto` trusts no header (same as `none`); set it to the header your reverse proxy overwrites; see Production TLS. |
 | `ORCH_UID` / `ORCH_GID` | Unprivileged uid/gid the container entrypoint drops to after fixing state-directory ownership. | Optional | `10001` | Keep the default unless host policy requires a specific uid. |
 | `ORCH_PUBLIC_URL` | Public URL embedded into bootstrap payloads and used by workers/devices. | Required for real deployments | `https://127.0.0.1:9091` | `https://orch.example.com` or your LAN URL for dev. |
 | `ORCH_EGRESS_PROBE_URL` | Optional worker egress probe URL. | Optional | empty | Usually `http://127.0.0.1:9090/self-describe` in local dev. |

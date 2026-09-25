@@ -206,27 +206,30 @@ func (s *server) restartOptionalBot(ctx context.Context) error {
 	s.botRestartMu.Lock()
 	defer s.botRestartMu.Unlock()
 	s.botMu.Lock()
-	if s.botCancel != nil {
-		s.botCancel()
-		s.botCancel = nil
-	}
-	s.bot = nil
-	s.authApprover = nil
 	factory := s.botFactory
 	s.botMu.Unlock()
+	// Build the new bot first and swap it in one step: there is never a
+	// window with no approver while settings exist (ORC-I3). On a settings
+	// read error the old bot stays, and approvals fail closed if none.
 	settings, ok, err := s.store.botSettings()
 	if err != nil {
 		return err
 	}
-	if !ok {
+	if !ok || factory == nil {
+		s.botMu.Lock()
+		if s.botCancel != nil {
+			s.botCancel()
+		}
+		s.bot, s.botCancel, s.authApprover = nil, nil, nil
+		s.botMu.Unlock()
 		return nil
 	}
-	if factory == nil {
-		return nil
-	}
-	botCtx, cancel := context.WithCancel(ctx)
 	bot := newTelegramBot(s, settings, factory(settings.Token))
+	botCtx, cancel := context.WithCancel(ctx)
 	s.botMu.Lock()
+	if s.botCancel != nil {
+		s.botCancel()
+	}
 	s.bot = bot
 	s.botCancel = cancel
 	s.authApprover = bot.approver
@@ -1291,4 +1294,19 @@ func (c *telegramHTTPClient) call(ctx context.Context, method string, payload an
 		return nil
 	}
 	return json.Unmarshal(body, out)
+}
+
+// notifyBotOwner sends a best-effort notice to the current bot owner.
+func (s *server) notifyBotOwner(text string) {
+	s.botMu.Lock()
+	bot := s.bot
+	s.botMu.Unlock()
+	if bot == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(s.baseContext(), 10*time.Second)
+	defer cancel()
+	if err := bot.sendOwnerMessage(ctx, text, nil); err != nil {
+		log.Printf("telegram owner notice failed: %v", err)
+	}
 }

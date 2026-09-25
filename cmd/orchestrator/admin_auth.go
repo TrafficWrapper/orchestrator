@@ -5,9 +5,11 @@ import (
 	"crypto/subtle"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 )
@@ -22,6 +24,12 @@ type adminSession struct {
 func (s *server) handleAdminLogin(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		writeError(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	// A cross-site "simple" POST could otherwise burn the owner's login
+	// budget from any web page (ORC-L18).
+	if !loginRequestSameSite(r) {
+		writeError(w, "login requires a same-site JSON request", http.StatusForbidden)
 		return
 	}
 	ip := clientIP(r)
@@ -61,7 +69,7 @@ func (s *server) handleAdminLogin(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		s.auditEvent(auditEntry{Event: "admin_login", IP: ip, Result: "failed", Fields: fields})
-		writeError(w, "invalid admin secret", http.StatusForbidden)
+		writeError(w, "invalid credentials", http.StatusForbidden)
 		return
 	}
 	if enabled, totpOK, err := s.store.verifyAdminTOTP(req.TOTPCode, time.Now().UTC()); err != nil {
@@ -78,32 +86,32 @@ func (s *server) handleAdminLogin(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		s.auditEvent(auditEntry{Event: "admin_login", IP: ip, Result: "failed", Fields: fields})
-		writeError(w, "invalid totp code", http.StatusForbidden)
+		writeError(w, "invalid credentials", http.StatusForbidden)
+		return
+	}
+	if mustChange {
+		limiter.recordSuccess(ip)
+		s.auditEvent(auditEntry{Event: "admin_login", IP: ip, Result: "ok", Fields: map[string]string{"must_change": "true"}})
+		s.createAdminSession(w, r, true)
+		return
+	}
+	// Credentials are right; the login only counts as a success once the
+	// owner approves, and denials or timeouts count as failures (ORC-L4).
+	approved, err := s.ownerApproval(r, "")
+	if err != nil {
+		limiter.chargeFailure(ip)
+		s.auditEvent(auditEntry{Event: "admin_login_approval", IP: ip, Result: "failed", Fields: map[string]string{"reason": "approval_error"}})
+		writeStoreError(w, http.StatusForbidden, err)
+		return
+	}
+	if !approved {
+		limiter.chargeFailure(ip)
+		s.auditEvent(auditEntry{Event: "admin_login_approval", IP: ip, Result: "denied"})
+		writeError(w, "admin login approval denied", http.StatusForbidden)
 		return
 	}
 	limiter.recordSuccess(ip)
 	s.auditEvent(auditEntry{Event: "admin_login", IP: ip, Result: "ok"})
-	if mustChange {
-		s.createAdminSession(w, r, true)
-		return
-	}
-	if approver := s.currentAuthApprover(); approver != nil && approver.enabled() {
-		approved, err := approver.requestLoginApproval(r.Context(), loginApprovalRequest{
-			RemoteAddr: ip,
-			UserAgent:  r.UserAgent(),
-			CreatedAt:  time.Now().UTC(),
-		})
-		if err != nil {
-			s.auditEvent(auditEntry{Event: "admin_login_approval", IP: ip, Result: "failed", Fields: map[string]string{"reason": "approval_error"}})
-			writeStoreError(w, http.StatusForbidden, err)
-			return
-		}
-		if !approved {
-			s.auditEvent(auditEntry{Event: "admin_login_approval", IP: ip, Result: "denied"})
-			writeError(w, "admin login approval denied", http.StatusForbidden)
-			return
-		}
-	}
 	s.createAdminSession(w, r, false)
 }
 
@@ -193,8 +201,21 @@ func (s *server) handleAdminTOTPEnroll(w http.ResponseWriter, r *http.Request) {
 func (s *server) handleAdminTOTPEnable(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Code string `json:"code"`
+		// CurrentCode proves possession of the factor being replaced; it
+		// is required when 2FA is already on (ORC-M4).
+		CurrentCode string `json:"current_code,omitempty"`
 	}
 	if !decodeJSON(w, r, &req) {
+		return
+	}
+	enabled, currentOK, err := s.store.verifyAdminTOTP(req.CurrentCode, time.Now().UTC())
+	if err != nil {
+		writeStoreError(w, http.StatusInternalServerError, err)
+		return
+	}
+	if enabled && !currentOK {
+		s.auditEvent(auditEntry{Event: "admin_totp_enable", IP: clientIP(r), Result: "failed", Fields: map[string]string{"reason": "bad_current_totp"}})
+		writeError(w, "a valid code of the current authenticator (current_code) is required", http.StatusForbidden)
 		return
 	}
 	if err := s.store.enableAdminTOTP(req.Code, time.Now().UTC()); err != nil {
@@ -203,6 +224,13 @@ func (s *server) handleAdminTOTPEnable(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.auditEvent(auditEntry{Event: "admin_totp_enable", IP: clientIP(r), Result: "ok"})
+	if enabled {
+		// The second factor changed: end every other session, like a
+		// password change, and keep the caller logged in.
+		s.revokeAdminSessions()
+		s.createAdminSession(w, r, false)
+		return
+	}
 	writeJSON(w, map[string]any{"ok": true})
 }
 
@@ -334,24 +362,23 @@ func (s *server) handleAdminPasswordChange(w http.ResponseWriter, r *http.Reques
 		writeError(w, "invalid current admin secret", http.StatusForbidden)
 		return
 	}
+	if err := validateAdminPassword(req.NewSecret); err != nil {
+		writeError(w, err.Error(), http.StatusBadRequest)
+		return
+	}
 	// Ask for the out-of-band approval before touching the credential: a denial
 	// must leave the old password and sessions intact, not lock the owner out.
-	if approver := s.currentAuthApprover(); approver != nil && approver.enabled() {
-		approved, err := approver.requestLoginApproval(r.Context(), loginApprovalRequest{
-			RemoteAddr: ip,
-			UserAgent:  r.UserAgent(),
-			CreatedAt:  time.Now().UTC(),
-		})
-		if err != nil {
-			s.auditEvent(auditEntry{Event: "admin_password_change", IP: ip, Result: "failed", Fields: map[string]string{"reason": "approval_error"}})
-			writeStoreError(w, http.StatusForbidden, err)
-			return
-		}
-		if !approved {
-			s.auditEvent(auditEntry{Event: "admin_password_change", IP: ip, Result: "denied"})
-			writeError(w, "admin login approval denied", http.StatusForbidden)
-			return
-		}
+	// The owner sees what is being approved (ORC-L4).
+	approved, err := s.ownerApproval(r, "change the admin password")
+	if err != nil {
+		s.auditEvent(auditEntry{Event: "admin_password_change", IP: ip, Result: "failed", Fields: map[string]string{"reason": "approval_error"}})
+		writeStoreError(w, http.StatusForbidden, err)
+		return
+	}
+	if !approved {
+		s.auditEvent(auditEntry{Event: "admin_password_change", IP: ip, Result: "denied"})
+		writeError(w, "admin login approval denied", http.StatusForbidden)
+		return
 	}
 	if err := s.store.setAdminPassword(req.NewSecret); err != nil {
 		s.auditEvent(auditEntry{Event: "admin_password_change", IP: ip, Result: "failed", Fields: map[string]string{"reason": "set_failed"}})
@@ -370,11 +397,23 @@ func csrfTokenMatches(expected, provided string) bool {
 	return expected != "" && subtle.ConstantTimeCompare(expectedHash[:], providedHash[:]) == 1
 }
 
+// handleAdminPasswordForceSet sets the password with the same proof as a
+// change (current secret, TOTP, owner approval): a stolen session alone must
+// not take the account over (ORC-M3). With the orchestrator stopped, the CLI
+// sets it directly in the database.
 func (s *server) handleAdminPasswordForceSet(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		NewSecret string `json:"new_secret"`
+		stepUpProof
 	}
 	if !decodeJSON(w, r, &req) {
+		return
+	}
+	if err := validateAdminPassword(req.NewSecret); err != nil {
+		writeError(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	if !s.stepUp(w, r, "admin_password_force_set", "set a new admin password", req.stepUpProof) {
 		return
 	}
 	if err := s.store.setAdminPassword(req.NewSecret); err != nil {
@@ -391,4 +430,34 @@ func (s *server) handleAdminPasswordForceSet(w http.ResponseWriter, r *http.Requ
 // proxy in front, the recommended production setup; ORC-M10).
 func (s *server) secureCookies(r *http.Request) bool {
 	return s.cfg.TLS || r.TLS != nil || strings.HasPrefix(strings.ToLower(strings.TrimSpace(s.cfg.PublicURL)), "https://")
+}
+
+// minAdminPasswordLength is enforced wherever a new admin password is set
+// (ORC-L13).
+const minAdminPasswordLength = 12
+
+func validateAdminPassword(secret string) error {
+	if len([]rune(strings.TrimSpace(secret))) < minAdminPasswordLength {
+		return fmt.Errorf("admin password must be at least %d characters", minAdminPasswordLength)
+	}
+	return nil
+}
+
+// loginRequestSameSite accepts a login only as a JSON request that browsers
+// do not send cross-site without CORS (and not flagged cross-site).
+func loginRequestSameSite(r *http.Request) bool {
+	mediaType := strings.ToLower(strings.TrimSpace(strings.Split(r.Header.Get("Content-Type"), ";")[0]))
+	if mediaType != "application/json" {
+		return false
+	}
+	switch strings.ToLower(r.Header.Get("Sec-Fetch-Site")) {
+	case "cross-site", "same-site":
+		return false
+	}
+	if origin := r.Header.Get("Origin"); origin != "" && origin != "null" {
+		if u, err := url.Parse(origin); err != nil || !strings.EqualFold(u.Host, r.Host) {
+			return false
+		}
+	}
+	return true
 }

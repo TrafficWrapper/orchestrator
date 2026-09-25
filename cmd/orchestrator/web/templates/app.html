@@ -120,11 +120,12 @@
       notice.style.display = 'block';
       notice.textContent = 'Проверяем пароль...';
       const secret = document.getElementById('owner-secret').value;
+      const totp_code = document.getElementById('owner-totp').value.trim();
       const response = await fetch('/admin/v1/login', {
         method: 'POST',
         credentials: 'same-origin',
         headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({secret})
+        body: JSON.stringify(totp_code ? {secret, totp_code} : {secret})
       });
       if (!response.ok) {
         notice.className = 'notice error';
@@ -483,11 +484,43 @@
         '<br><span class="muted">' + created + '</span>' +
         '<div class="actions" style="margin-top:10px"><a class="button secondary" href="/admin/v1/apk/download">Скачать APK</a></div>';
     }
+    async function startTOTPEnrollment() {
+      const notice = document.getElementById('totp-notice');
+      const response = await fetch('/admin/v1/totp/enroll', {
+        method: 'POST',
+        credentials: 'same-origin',
+        headers: {'Content-Type': 'application/json', 'X-CSRF-Token': csrfToken},
+        body: '{}'
+      });
+      notice.style.display = 'block';
+      if (!response.ok) {
+        notice.className = 'notice error';
+        notice.textContent = await errorText(response);
+        return;
+      }
+      const result = await response.json();
+      notice.className = 'notice';
+      notice.innerHTML = 'Добавьте секрет в приложение-аутентификатор и введите код ниже.<br><code>' +
+        escapeHTML(result.secret) + '</code><br><code>' + escapeHTML(result.otpauth_url) + '</code>';
+    }
+    function enableTOTP(event) {
+      event.preventDefault();
+      const code = document.getElementById('totp-new-code').value.trim();
+      const current_code = document.getElementById('totp-current-code').value.trim();
+      postJSON('/admin/v1/totp/enable', current_code ? {code, current_code} : {code}, '');
+    }
+    function disableTOTP(event) {
+      event.preventDefault();
+      const code = document.getElementById('totp-disable-code').value.trim();
+      postJSON('/admin/v1/totp/disable', {code}, 'Отключить второй фактор?');
+    }
     function saveBotSettings(event) {
       event.preventDefault();
       const token = document.getElementById('bot-token').value;
       const owner_id = Number(document.getElementById('bot-owner-id').value);
-      postJSON('/admin/v1/bot/set-token', {token, owner_id}, '');
+      const current_secret = document.getElementById('bot-current-secret').value;
+      const totp_code = document.getElementById('bot-totp-code').value;
+      postJSON('/admin/v1/bot/set-token', {token, owner_id, current_secret, totp_code}, '');
     }
     document.addEventListener('DOMContentLoaded', () => {
       setBootstrapExpiryPreset('30');
@@ -506,6 +539,8 @@
   <form onsubmit="loginOwner(event)">
     <label>Admin-секрет</label>
     <input id="owner-secret" type="password" autocomplete="current-password" required autofocus>
+    <label>Код TOTP (если включён)</label>
+    <input id="owner-totp" type="text" inputmode="numeric" autocomplete="one-time-code">
     <div style="margin-top:12px"><button type="submit">Войти</button></div>
   </form>
 </section>
@@ -778,6 +813,10 @@
     <input id="bot-token" type="password" autocomplete="off" required>
     <label>Owner Telegram ID</label>
     <input id="bot-owner-id" type="number" min="1" required>
+    <label>Текущий admin-пароль</label>
+    <input id="bot-current-secret" type="password" autocomplete="current-password" required>
+    <label>Код TOTP (если включён)</label>
+    <input id="bot-totp-code" type="text" inputmode="numeric" autocomplete="one-time-code">
     <div style="margin-top:12px"><button type="submit">Сохранить токен</button></div>
   </form>
 </section>
@@ -794,5 +833,22 @@
     <div style="margin-top:12px"><button type="submit">Сменить пароль</button></div>
   </form>
   <p class="muted">Для headless-сценариев используйте CLI только через stdin/env/file. Не передавайте секреты открытым аргументом командной строки.</p>
+</section>
+<section class="panel">
+  <h2>Двухфакторная аутентификация (TOTP)</h2>
+  <div id="totp-notice" class="notice"></div>
+  <div class="actions"><button type="button" class="secondary" onclick="startTOTPEnrollment()">Создать новый секрет</button></div>
+  <form onsubmit="enableTOTP(event)">
+    <label>Код из приложения для нового секрета</label>
+    <input id="totp-new-code" type="text" inputmode="numeric" autocomplete="one-time-code" required>
+    <label>Код текущего секрета (если TOTP уже включён)</label>
+    <input id="totp-current-code" type="text" inputmode="numeric" autocomplete="one-time-code">
+    <div style="margin-top:12px"><button type="submit">Включить / заменить TOTP</button></div>
+  </form>
+  <form onsubmit="disableTOTP(event)">
+    <label>Код текущего секрета</label>
+    <input id="totp-disable-code" type="text" inputmode="numeric" autocomplete="one-time-code" required>
+    <div style="margin-top:12px"><button type="submit" class="secondary">Отключить TOTP</button></div>
+  </form>
 </section>
 {{end}}
