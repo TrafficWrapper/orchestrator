@@ -210,7 +210,7 @@ func runMain() error {
 			// Reached the server: report its answer instead of bypassing it.
 			return err
 		}
-		st, err := openOrchStore(cfg)
+		st, err := openOrchStoreForCLIFallback(cfg)
 		if err != nil {
 			return err
 		}
@@ -224,7 +224,7 @@ func runMain() error {
 			// Reached the server: report its answer instead of bypassing it.
 			return err
 		}
-		st, err := openOrchStore(cfg)
+		st, err := openOrchStoreForCLIFallback(cfg)
 		if err != nil {
 			return err
 		}

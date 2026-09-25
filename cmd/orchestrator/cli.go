@@ -14,6 +14,8 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/netip"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -44,7 +46,7 @@ func tokenCommand(cfg orchConfig, args []string) error {
 		// Reached the server: report its answer instead of bypassing it.
 		return err
 	}
-	st, err := openOrchStore(cfg)
+	st, err := openOrchStoreForCLIFallback(cfg)
 	if err != nil {
 		return err
 	}
@@ -85,7 +87,7 @@ func bootstrapTokenCommand(cfg orchConfig, args []string) error {
 		// Reached the server: report its answer instead of bypassing it.
 		return err
 	}
-	st, err := openOrchStore(cfg)
+	st, err := openOrchStoreForCLIFallback(cfg)
 	if err != nil {
 		return err
 	}
@@ -121,7 +123,7 @@ func statusCommand(cfg orchConfig) error {
 		// Reached the server: report its answer instead of bypassing it.
 		return err
 	}
-	st, err := openOrchStore(cfg)
+	st, err := openOrchStoreForCLIFallback(cfg)
 	if err != nil {
 		return err
 	}
@@ -444,7 +446,12 @@ func adminRequest(cfg orchConfig, method, path string, body io.Reader, out io.Wr
 	if err != nil {
 		var opErr *net.OpError
 		if errors.As(err, &opErr) && opErr.Op == "dial" {
-			return fmt.Errorf("%w: %v", errAdminServerUnreachable, err)
+			if adminURLAllowsLocalFallback(req.URL) {
+				return fmt.Errorf("%w: %v", errAdminServerUnreachable, err)
+			}
+			// A remote admin API that cannot be reached is an error: the
+			// local state directory is not that orchestrator's database.
+			return fmt.Errorf("admin API %s unreachable: %v", req.URL.Host, err)
 		}
 		return err
 	}
@@ -460,6 +467,39 @@ func adminRequest(cfg orchConfig, method, path string, body io.Reader, out io.Wr
 	}
 	_, _ = out.Write(raw)
 	return nil
+}
+
+// adminURLAllowsLocalFallback reports whether an unreachable admin API may be
+// replaced by opening the local database: only when the CLI targets this
+// host, i.e. ORCH_ADMIN_URL is unset (the URL is derived from the local
+// listen address) or names localhost or a loopback address.
+func adminURLAllowsLocalFallback(target *url.URL) bool {
+	if strings.TrimSpace(os.Getenv("ORCH_ADMIN_URL")) == "" {
+		return true
+	}
+	if target == nil {
+		return false
+	}
+	host := strings.TrimSuffix(strings.ToLower(target.Hostname()), ".")
+	if host == "localhost" {
+		return true
+	}
+	addr, err := netip.ParseAddr(host)
+	return err == nil && addr.Unmap().IsLoopback()
+}
+
+// openOrchStoreForCLIFallback opens the local database for a CLI command
+// whose admin API request could not be delivered. It never creates a new
+// state: without an existing database there is nothing to fall back to.
+func openOrchStoreForCLIFallback(cfg orchConfig) (*orchStore, error) {
+	dbPath := filepath.Join(cfg.StateDir, "orchestrator.db")
+	if _, err := os.Stat(dbPath); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, fmt.Errorf("%w and no local database exists at %s", errAdminServerUnreachable, dbPath)
+		}
+		return nil, err
+	}
+	return openOrchStore(cfg)
 }
 
 func adminBaseURL(cfg orchConfig) string {

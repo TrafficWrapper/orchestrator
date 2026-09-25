@@ -461,7 +461,18 @@ func adminWorkerPayload(worker workerRecord) map[string]any {
 		"revoked_short_ids":       normalizeShortIDs(worker.RevokedShortIDs),
 		"draining_awg":            worker.DrainingAWGProfiles,
 		"static_public_key8":      shortString(worker.StaticPublicKey, 8),
+		// capabilities is what self_describe declares; pull_capabilities is
+		// what the running worker sent in its latest pull (known values).
+		"capabilities":      nonNilStrings(sanitizeWorkerCapabilities(workerCapabilities(worker, nil))),
+		"pull_capabilities": nonNilStrings(worker.PullCapabilities),
 	}
+}
+
+func nonNilStrings(values []string) []string {
+	if values == nil {
+		return []string{}
+	}
+	return values
 }
 
 func adminTelemetryPayload(rec telemetrySnapshotRecord, ok bool) map[string]any {

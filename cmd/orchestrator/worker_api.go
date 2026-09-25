@@ -7,6 +7,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"slices"
 	"strings"
 	"time"
 
@@ -167,6 +168,12 @@ func (s *server) handlePull(peer []byte, raw []byte) (any, error) {
 	}
 	if workerRevokeFinal(rec, req.WorkerCapabilities, time.Now().UTC()) {
 		return workerRevokedResponse(), nil
+	}
+	if caps := sanitizeWorkerCapabilities(req.WorkerCapabilities); !slices.Equal(caps, rec.PullCapabilities) {
+		if err := s.store.setWorkerPullCapabilities(rec.ID, caps); err != nil {
+			return nil, err
+		}
+		rec.PullCapabilities = caps
 	}
 	if req.HaveSeq > rec.DesiredSeq {
 		// The worker is ahead of us (restored DB): move past it so it

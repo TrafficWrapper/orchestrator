@@ -31,6 +31,8 @@ const (
 	botAPKUploadTimeout       = 15 * time.Minute
 	botProblemNoticeMaxRunes  = 512
 	botMessageMaxDevices      = 12
+	botDeviceIDDisplayLen     = 13
+	botDeviceIDMinPrefix      = 8
 	botMessageMaxWorkers      = 12
 	botPendingNotifyInterval  = 30 * time.Second
 	botLimitStateTTL          = 2 * time.Minute
@@ -366,7 +368,13 @@ func (b *telegramBot) handleMessage(ctx context.Context, msg telegramMessage) {
 		text, keyboard := b.workersText()
 		_ = b.sendOwnerMessage(ctx, text, keyboard)
 	case "/devices":
-		text, keyboard := b.devicesText()
+		page := 1
+		if len(command) > 1 {
+			if n, err := strconv.Atoi(command[1]); err == nil && n > 0 {
+				page = n
+			}
+		}
+		text, keyboard := b.devicesPageText(page)
 		_ = b.sendOwnerMessage(ctx, text, keyboard)
 	case "/config":
 		_ = b.sendOwnerMessage(ctx, b.configText(), nil)
@@ -606,21 +614,31 @@ func (b *telegramBot) workersText() (string, *telegramInlineKeyboard) {
 	return out.String(), keyboard
 }
 
-func (b *telegramBot) devicesText() (string, *telegramInlineKeyboard) {
+// devicesPageText lists one page of devices. IDs are shown with enough
+// characters to be typed back into /limit, which accepts a unique prefix.
+func (b *telegramBot) devicesPageText(page int) (string, *telegramInlineKeyboard) {
 	devices, err := b.server.store.devices()
 	if err != nil {
 		return "Devices: " + err.Error(), nil
 	}
+	pages := (len(devices) + botMessageMaxDevices - 1) / botMessageMaxDevices
+	if pages < 1 {
+		pages = 1
+	}
+	if page < 1 {
+		page = 1
+	}
+	if page > pages {
+		page = pages
+	}
+	start := (page - 1) * botMessageMaxDevices
+	end := min(start+botMessageMaxDevices, len(devices))
 	var out strings.Builder
-	out.WriteString("Devices\n")
+	fmt.Fprintf(&out, "Devices (%d) · page %d/%d\n", len(devices), page, pages)
 	keyboard := &telegramInlineKeyboard{}
-	for i, device := range devices {
-		if i >= botMessageMaxDevices {
-			out.WriteString("…\n")
-			break
-		}
+	for _, device := range devices[start:end] {
 		fmt.Fprintf(&out, "%s · %s · %s · %s\n",
-			shortString(device.ID, 8),
+			botShortDeviceID(device.ID),
 			device.Status,
 			firstNotBlank(device.ClientVersion, "-"),
 			firstNotBlank(device.InternalIP, "-"),
@@ -630,20 +648,68 @@ func (b *telegramBot) devicesText() (string, *telegramInlineKeyboard) {
 		}
 		if device.Status != "revoked" {
 			keyboard.InlineKeyboard = append(keyboard.InlineKeyboard, []telegramInlineButton{{
-				Text:         "Revoke " + shortString(device.ID, 8),
+				Text:         "Revoke " + botShortDeviceID(device.ID),
 				CallbackData: fmt.Sprintf("device:revoke:%s", device.ID),
 			}})
 		}
 	}
+	if page < pages {
+		fmt.Fprintf(&out, "Next: /devices %d\n", page+1)
+	}
 	return out.String(), keyboard
+}
+
+// botShortDeviceID keeps the "twpk_" prefix plus eight hex characters, so the
+// listed form is normally a unique prefix accepted by /limit.
+func botShortDeviceID(id string) string {
+	return shortString(id, botDeviceIDDisplayLen)
+}
+
+// resolveBotDeviceID maps an exact device ID or a unique ID prefix to the
+// full ID. An ambiguous or too short prefix is refused with a message that
+// says what to type instead.
+func resolveBotDeviceID(devices []deviceRecord, input string) (string, error) {
+	input = strings.TrimSpace(input)
+	if input == "" {
+		return "", errors.New("укажите device_id")
+	}
+	var matches []string
+	for _, device := range devices {
+		if device.ID == input {
+			return device.ID, nil
+		}
+		if strings.HasPrefix(device.ID, input) {
+			matches = append(matches, device.ID)
+		}
+	}
+	switch {
+	case len(matches) == 0:
+		return "", errDeviceNotFound
+	case len(input) < botDeviceIDMinPrefix:
+		return "", fmt.Errorf("префикс %q слишком короткий: нужно не меньше %d символов", input, botDeviceIDMinPrefix)
+	case len(matches) > 1:
+		shown := matches
+		if len(shown) > 3 {
+			shown = shown[:3]
+		}
+		for i := range shown {
+			shown[i] = shortString(shown[i], botDeviceIDDisplayLen+4)
+		}
+		return "", fmt.Errorf("префикс %q неоднозначен: подходит устройств — %d (%s…); укажите больше символов", input, len(matches), strings.Join(shown, ", "))
+	}
+	return matches[0], nil
 }
 
 func (b *telegramBot) handleLimitCommand(ctx context.Context, command []string) error {
 	if len(command) < 2 {
 		return b.sendOwnerMessage(ctx, "Формат: /limit <device_id> <quota|-|reset> <rate|-|0> <expiry|-|нет>\nПример: /limit twpk_abcd 10GB 20mbit 30d", nil)
 	}
-	deviceID := strings.TrimSpace(command[1])
-	if _, err := b.server.store.device(deviceID); err != nil {
+	devices, err := b.server.store.devices()
+	if err != nil {
+		return b.sendOwnerMessage(ctx, "Device: "+err.Error(), nil)
+	}
+	deviceID, err := resolveBotDeviceID(devices, command[1])
+	if err != nil {
 		return b.sendOwnerMessage(ctx, "Device: "+err.Error(), nil)
 	}
 	if len(command) == 2 {
@@ -865,12 +931,12 @@ func botHelpText() string {
 		"Команды:",
 		"/status — обзор",
 		"/workers — workers и протоколы",
-		"/devices — устройства",
+		"/devices [страница] — устройства",
 		"/config — priority/weight",
 		"/publish_apk — статус APK",
 		"/get_apk — отправить текущий APK",
 		"/approve — pending approvals",
-		"/limit <device_id> <quota> <rate> <expiry> — задать лимиты",
+		"/limit <device_id|префикс> <quota> <rate> <expiry> — задать лимиты",
 	}, "\n")
 }
 

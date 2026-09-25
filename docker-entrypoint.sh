@@ -33,7 +33,11 @@ fi
 if [ -n "${ORCH_SIGNER_KEY_PATH:-}" ]; then
 	own_dir "$(dirname "$ORCH_SIGNER_KEY_PATH")"
 fi
-if [ -n "${ORCH_SIGNER_LEGACY_KEY_PATH:-}" ] && [ -d "$(dirname "$ORCH_SIGNER_LEGACY_KEY_PATH")" ]; then
+# The legacy key directory is only needed until the signer has recorded its
+# one-time migration marker; after that it is left untouched (it may then be
+# mounted read-only or not at all).
+if [ -n "${ORCH_SIGNER_LEGACY_KEY_PATH:-}" ] && [ -d "$(dirname "$ORCH_SIGNER_LEGACY_KEY_PATH")" ] \
+	&& [ ! -e "${ORCH_SIGNER_KEY_PATH:-}.legacy-migrated" ]; then
 	own_dir "$(dirname "$ORCH_SIGNER_LEGACY_KEY_PATH")"
 fi
 

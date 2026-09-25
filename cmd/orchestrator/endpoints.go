@@ -1,6 +1,7 @@
 package main
 
 import (
+	"cmp"
 	"crypto/sha256"
 	"encoding/hex"
 	"log"
@@ -8,6 +9,7 @@ import (
 	"net/netip"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -22,6 +24,12 @@ const (
 	discoveryRateWindow     = time.Minute
 	discoveryRateLimit      = 1200
 	maxDiscoveryRateKeys    = 16 * 1024
+	discoveryRateEvictBatch = maxDiscoveryRateKeys / 64
+	// discoveryIPv6AggregateBits and discoveryAggregateRateLimit bound one
+	// IPv6 provider allocation as a whole. The limit is generous because a
+	// mobile carrier can place many subscribers inside one /32.
+	discoveryIPv6AggregateBits  = 32
+	discoveryAggregateRateLimit = 16 * discoveryRateLimit
 )
 
 type discoveryBundleSnapshot struct {
@@ -46,6 +54,8 @@ type discoveryRequestRate struct {
 	PairCount       int
 	PendingUntil    time.Time
 	PendingRevision string
+	// LastSeen orders eviction when the table is full.
+	LastSeen time.Time
 }
 
 func (s *server) handleDiscoveryEndpointsJSON(w http.ResponseWriter, r *http.Request) {
@@ -261,14 +271,20 @@ func (s *server) reserveDiscoveryJSONForKey(
 ) (string, int, bool) {
 	s.discoveryRateMu.Lock()
 	defer s.discoveryRateMu.Unlock()
-	rate, ok, retryAfter := s.discoveryRateForKeyLocked(key, now)
-	if !ok {
-		return "", retryAfter, false
+	aggregateKey := discoveryRateAggregateKey(key)
+	var aggregate discoveryRequestRate
+	if aggregateKey != "" {
+		aggregate = s.discoveryRateForKeyLocked(aggregateKey, now)
+		if aggregate.PairCount >= discoveryAggregateRateLimit {
+			return "", discoveryRetryAfterSeconds(aggregate.WindowStart.Add(discoveryRateWindow), now), false
+		}
 	}
+	rate := s.discoveryRateForKeyLocked(key, now)
 	if rate.PairCount >= discoveryRateLimit {
 		return "", discoveryRetryAfterSeconds(rate.WindowStart.Add(discoveryRateWindow), now), false
 	}
 	rate.PairCount++
+	rate.LastSeen = now
 	// Old clients issue two independent GETs without carrying an ETag back.
 	// Pin this source to one immutable revision for a grace window. Minisig
 	// requests cannot consume the pin because a CGNAT key represents many
@@ -277,7 +293,12 @@ func (s *server) reserveDiscoveryJSONForKey(
 		rate.PendingRevision = revision
 		rate.PendingUntil = now.Add(discoveryPairTTL)
 	}
-	s.discoveryRates[key] = rate
+	s.storeDiscoveryRateLocked(key, rate, now)
+	if aggregateKey != "" {
+		aggregate.PairCount++
+		aggregate.LastSeen = now
+		s.storeDiscoveryRateLocked(aggregateKey, aggregate, now)
+	}
 	return rate.PendingRevision, 0, true
 }
 
@@ -295,6 +316,7 @@ func (s *server) discoveryMinisigRevisionForKey(
 		return requestedRevision, true
 	}
 	rate = normalizeDiscoveryRequestRate(rate, now)
+	rate.LastSeen = now
 	s.discoveryRates[key] = rate
 	if rate.PendingRevision != "" && !rate.PendingUntil.IsZero() && now.Before(rate.PendingUntil) {
 		if requestedRevision != "" && requestedRevision != rate.PendingRevision {
@@ -305,31 +327,69 @@ func (s *server) discoveryMinisigRevisionForKey(
 	return requestedRevision, true
 }
 
-func (s *server) discoveryRateForKeyLocked(key string, now time.Time) (discoveryRequestRate, bool, int) {
+// discoveryRateForKeyLocked returns the current window for key without
+// storing it. A new source always gets a fresh window: capacity is made by
+// storeDiscoveryRateLocked, never by refusing unknown sources.
+func (s *server) discoveryRateForKeyLocked(key string, now time.Time) discoveryRequestRate {
+	if rate, exists := s.discoveryRates[key]; exists {
+		return normalizeDiscoveryRequestRate(rate, now)
+	}
+	return discoveryRequestRate{WindowStart: now, LastSeen: now}
+}
+
+// storeDiscoveryRateLocked saves rate under key. When a new key would exceed
+// the table bound, expired windows are dropped first; if the table is still
+// full, the least valuable live entries are evicted: the lowest pair count
+// first, then the least recently seen. A busy source's counter is therefore
+// the last thing to go, while a stream of one-off sources recycles its own
+// slots instead of locking every new source out.
+func (s *server) storeDiscoveryRateLocked(key string, rate discoveryRequestRate, now time.Time) {
 	if s.discoveryRates == nil {
 		s.discoveryRates = make(map[string]discoveryRequestRate)
 	}
-	if rate, exists := s.discoveryRates[key]; exists {
-		rate = normalizeDiscoveryRequestRate(rate, now)
-		return rate, true, 0
+	if _, exists := s.discoveryRates[key]; !exists && len(s.discoveryRates) >= maxDiscoveryRateKeys {
+		s.evictDiscoveryRatesLocked(now)
 	}
-	if len(s.discoveryRates) >= maxDiscoveryRateKeys {
-		retryAfter := int(discoveryRateWindow / time.Second)
-		for existingKey, rate := range s.discoveryRates {
-			if discoveryRequestRateExpired(rate, now) {
-				delete(s.discoveryRates, existingKey)
-				continue
-			}
-			candidate := discoveryRequestRateRetryAfter(rate, now)
-			if candidate < retryAfter {
-				retryAfter = candidate
-			}
-		}
-		if len(s.discoveryRates) >= maxDiscoveryRateKeys {
-			return discoveryRequestRate{}, false, retryAfter
+	s.discoveryRates[key] = rate
+}
+
+func (s *server) evictDiscoveryRatesLocked(now time.Time) {
+	for existingKey, rate := range s.discoveryRates {
+		if discoveryRequestRateExpired(rate, now) {
+			delete(s.discoveryRates, existingKey)
 		}
 	}
-	return discoveryRequestRate{WindowStart: now}, true, 0
+	if len(s.discoveryRates) < maxDiscoveryRateKeys {
+		return
+	}
+	type candidate struct {
+		key      string
+		pairs    int
+		lastSeen time.Time
+	}
+	candidates := make([]candidate, 0, len(s.discoveryRates))
+	for existingKey, rate := range s.discoveryRates {
+		lastSeen := rate.LastSeen
+		if lastSeen.IsZero() {
+			lastSeen = rate.WindowStart
+		}
+		candidates = append(candidates, candidate{key: existingKey, pairs: rate.PairCount, lastSeen: lastSeen})
+	}
+	slices.SortFunc(candidates, func(a, b candidate) int {
+		if a.pairs != b.pairs {
+			return cmp.Compare(a.pairs, b.pairs)
+		}
+		return a.lastSeen.Compare(b.lastSeen)
+	})
+	// Evict a batch so a flood of new sources pays for the sort once per
+	// batch rather than once per request.
+	evict := len(s.discoveryRates) - maxDiscoveryRateKeys + discoveryRateEvictBatch
+	if evict > len(candidates) {
+		evict = len(candidates)
+	}
+	for _, c := range candidates[:evict] {
+		delete(s.discoveryRates, c.key)
+	}
 }
 
 func normalizeDiscoveryRequestRate(rate discoveryRequestRate, now time.Time) discoveryRequestRate {
@@ -363,14 +423,6 @@ func discoveryRequestRateExpired(rate discoveryRequestRate, now time.Time) bool 
 	return now.Sub(rate.WindowStart) >= discoveryRateWindow && !pending
 }
 
-func discoveryRequestRateRetryAfter(rate discoveryRequestRate, now time.Time) int {
-	deadline := rate.WindowStart.Add(discoveryRateWindow)
-	if rate.PendingRevision != "" && now.Before(rate.PendingUntil) && deadline.Before(rate.PendingUntil) {
-		deadline = rate.PendingUntil
-	}
-	return discoveryRetryAfterSeconds(deadline, now)
-}
-
 func discoveryRetryAfterSeconds(deadline time.Time, now time.Time) int {
 	remaining := deadline.Sub(now)
 	if remaining <= 0 {
@@ -399,6 +451,18 @@ func discoveryRateKey(value string) string {
 	// routed IPv6 allocation from rotating through 65,536 independent /64 keys.
 	addr = addr.WithZone("")
 	return netip.PrefixFrom(addr, 48).Masked().String()
+}
+
+// discoveryRateAggregateKey returns the second-level bucket for an IPv6 /48
+// source key, or "" when the key has no parent bucket. A single provider
+// allocation (/32) holds 65,536 /48 keys; the parent bucket bounds the
+// combined rate of one allocation without shrinking the per-/48 budget.
+func discoveryRateAggregateKey(key string) string {
+	prefix, err := netip.ParsePrefix(key)
+	if err != nil || !prefix.Addr().Is6() || prefix.Bits() < discoveryIPv6AggregateBits {
+		return ""
+	}
+	return "agg6:" + netip.PrefixFrom(prefix.Addr(), discoveryIPv6AggregateBits).Masked().String()
 }
 
 func requestedDiscoveryRevision(r *http.Request) string {

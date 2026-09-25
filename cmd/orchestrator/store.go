@@ -143,6 +143,9 @@ type workerRecord struct {
 	// clients (dialect rotation).
 	RevokedShortIDs     []string `json:"revoked_short_ids,omitempty"`
 	DrainingAWGProfiles []string `json:"draining_awg_profiles,omitempty"`
+	// PullCapabilities is the sanitized worker_capabilities of the worker's
+	// latest pull (known values only; empty for workers that send none).
+	PullCapabilities []string `json:"pull_capabilities,omitempty"`
 }
 
 type adminTOTPRecord struct {
