@@ -123,7 +123,8 @@ docker compose logs orchestrator | grep -i 'initial admin password'
 docker compose exec orchestrator orchestrator public-key
 ```
 
-Open the web UI at `ORCH_PUBLIC_URL`, log in with the initial password from the
+Open the web UI at `ORCH_PUBLIC_URL/login` (without a session `/` answers 404
+like any unknown path), log in with the initial password from the
 container log, and change it immediately. The initial password is stored only as
 a hash and cannot create a full admin session until it is changed.
 
@@ -190,6 +191,7 @@ provided Compose file:
 | `ORCH_SIGNER_SOCKET` | Unix socket used by the config signer sidecar. | Optional | `./orch-state/signer.sock` | Compose uses `/run/tw-signer/signer.sock` mounted from `./signer-run`. |
 | `ORCH_SIGNER_KEY_PATH` | Config-signing key path read by the `signer` command. | Optional | `$ORCH_STATE_DIR/orch-config.key` | Compose uses `/signer-state/orch-config.key` from `./signer-state`, which only the signer container mounts. |
 | `ORCH_SIGNER_LEGACY_KEY_PATH` | One-time migration source: a key found here is moved to `ORCH_SIGNER_KEY_PATH` and deleted. | Optional | empty | Compose uses `/orch-state/orch-config.key` so older deployments keep their pinned key. |
+| `ORCH_DISCOVERY_SIGNER` | Sign the discovery feed with the isolated signer's discovery key (announced as `discovery_pubkey`) instead of the update key. Switch only after the monotonic client seq is live (see RUNBOOK). | Optional | `0` | Boolean. |
 | `ORCH_DISCOVERY_PUBLIC` | Public discovery feed mode: `reduced` (AWG entries only), `off` (feed only through workers' `/tw/endpoints.json`) or `full` (old format with REALITY). | Optional | `reduced` | `reduced`, `off`, `full`. |
 | `ORCH_APK_MANIFEST_TTL` | Update manifest `expires_at` horizon; server-signed manifests are re-signed under a new seq when less than a third is left. | Optional | `2160h` (90 days) | Go duration, at least `24h`. |
 | `ORCH_APK_INLINE_MAX_BYTES` | Largest APK shipped inside config pull to workers without `apk_fetch_v1`. | Optional | `41943040` (40 MiB) | Bytes, at most `67108864` (64 MiB). |
@@ -207,7 +209,10 @@ provided Compose file:
 | `ORCH_ADMIN_SESSION_TOKEN` | Optional bearer session token used by local CLI admin requests while the server is running. | Optional | empty | Get it from `/admin/v1/login`; do not put it in shell history or git. |
 | `ORCH_UPDATE_PUBKEY` | Update minisign public key for APK update manifests. | Optional | empty | For a managed update channel, set this from your offline `update.pub` before the first start. Leaving it empty lets seed-on-first-run generate a demo key in local state. |
 | `ORCH_DNS_SERVERS` | Optional comma-separated DNS servers embedded into client configs. | Optional | empty | Example: `1.1.1.1,1.0.0.1`. Empty lets clients use their built-in in-tunnel defaults. |
-| `ORCH_TLS` | Enables the built-in self-signed TLS listener. Accepts `1/0`, `true/false`, `yes/no`, `on/off`; anything else fails startup. | Optional | `1` | Use `0` only for local dev behind trusted transport. |
+| `ORCH_TLS` | Enables the built-in self-signed TLS listener. Accepts `1/0`, `true/false`, `yes/no`, `on/off`; anything else fails startup. | Optional | `1` | Use `0` only for local dev behind trusted transport. With `0` on a non-loopback `ORCH_LISTEN` the log shows an `ERROR` and the admin UI a banner. |
+| `ORCH_TLS_STRICT` | Refuse to start when `ORCH_TLS=0` and `ORCH_LISTEN` is not a loopback address. | Optional | `0` | Set `1` once TLS terminates at a proxy in front of `127.0.0.1:9091`. |
+| `ORCH_AUDIT_MAX_BYTES` | Size at which `audit.log` in the state directory is rotated to `audit.log.1`. | Optional | `67108864` (64 MiB) | Bytes, at least `1048576`. |
+| `ORCH_AUDIT_KEEP` | Number of rotated audit files kept (`audit.log.1` is the newest). | Optional | `5` | At least `1`. |
 | `SEED_APK_PATH` | APK path used by seed-on-first-run. | Optional | `./seed/app.apk` | Compose mounts `./seed` and defaults to `/seed/app.apk`. |
 | `SEED_APK_VERSION_CODE` | Version code written into the generated seed update manifest. | Optional | `1` | Match the seed APK version code. |
 | `SEED_APK_VERSION_NAME` | Version name written into the generated seed update manifest. | Optional | `seed` | Example: `0.1.0`. |
@@ -234,7 +239,9 @@ insecure-TLS overrides.
 Recommended setup:
 
 1. Run the orchestrator on loopback without built-in TLS:
-   `ORCH_LISTEN=127.0.0.1:9091`, `ORCH_TLS=0`.
+   `ORCH_LISTEN=127.0.0.1:9091`, `ORCH_TLS=0`, and `ORCH_TLS_STRICT=1` so
+   plain HTTP is never served on a public address (RUNBOOK "Plain HTTP on a
+   public address").
 2. Put Caddy, nginx, or another reverse proxy in front of it.
 3. Issue a Let's Encrypt certificate for your `ORCH_PUBLIC_URL`.
 4. Proxy HTTPS traffic to `http://127.0.0.1:9091`.
