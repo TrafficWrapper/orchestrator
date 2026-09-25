@@ -230,6 +230,23 @@ client config, APK update artifacts и telemetry forwarding paths для enrolle
 clients. Public clearnet distribution намеренно не используется, чтобы
 deployment metadata не рекламировались generic web endpoint'ом.
 
+Доставка APK воркерам отделена от config pull. Воркер, указавший
+`apk_fetch_v1` в `worker_capabilities` запроса pull, получает `update_ref`
+(`apk_seq`, `apk_name`, `apk_sha256`, `apk_size`, `manifest_json`,
+`manifest_minisig`) вместо inline `update` и качает APK через Noise
+`POST /w/v1/apk/chunk` (`{worker_id, apk_seq, apk_sha256, offset,
+length ≤ 4 MiB}` → `{ok, total_size, data_base64}`; коды
+`release_superseded`, `bad_range`, `worker_revoked`). Перевыпущенный манифест
+сохраняет sha256, поэтому загрузка, начатая под старым seq, продолжается.
+Остальным воркерам APK идёт inline только до `ORCH_APK_INLINE_MAX_BYTES`,
+иначе поля `update` в pull нет. Воркер, который после inline-попыток того же
+APK снова тянет pull с тем же `have_seq`, получает только конфиг, с растущим
+backoff и алертом. Релиз считается применённым, если `distributed_apk`
+воркера сообщает тот же sha256 и `seq`, иначе — по legacy-маркеру ack; pull
+без APK сбрасывает маркер отправки. У ответов с APK есть дедлайн записи, у
+воркера не больше одного inline-слота. Живость воркеров считается от старта
+оркестратора: рестарт не переводит их в inactive и не шлёт алерты.
+
 APK trust отделён от config trust:
 
 - Android проверяет APK package signatures по pinned signing certificate

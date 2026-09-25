@@ -12,8 +12,11 @@ import (
 const (
 	defaultRequestBodyMaxBytes = 1 << 20
 	noiseRequestBodyMaxBytes   = 2 << 20
-	loginRequestBodyMaxBytes   = 64 << 10
-	uploadRequestBodyMaxBytes  = 256 << 20
+	// ackRequestBodyMaxBytes fits an ack with maxAckUsageReports usage
+	// entries (ORC-L27).
+	ackRequestBodyMaxBytes    = 16 << 20
+	loginRequestBodyMaxBytes  = 64 << 10
+	uploadRequestBodyMaxBytes = 256 << 20
 
 	bufferedBodyReadTimeout = 30 * time.Second
 	uploadBodyReadTimeout   = 30 * time.Minute
@@ -31,6 +34,8 @@ func requestBodyPolicyFor(path string) requestBodyPolicy {
 		return requestBodyPolicy{maxBytes: uploadRequestBodyMaxBytes, readTimeout: uploadBodyReadTimeout, stream: true}
 	case path == "/admin/v1/login" || path == "/login":
 		return requestBodyPolicy{maxBytes: loginRequestBodyMaxBytes, readTimeout: bufferedBodyReadTimeout}
+	case path == "/w/v1/ack":
+		return requestBodyPolicy{maxBytes: ackRequestBodyMaxBytes, readTimeout: bufferedBodyReadTimeout}
 	case strings.HasPrefix(path, "/w/") || strings.HasPrefix(path, "/d/"):
 		return requestBodyPolicy{maxBytes: noiseRequestBodyMaxBytes, readTimeout: bufferedBodyReadTimeout}
 	default:

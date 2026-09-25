@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -81,29 +82,29 @@ func TestPullShipsAPKOnlyUntilWorkerAcksRelease(t *testing.T) {
 // pullArtifactForTest mirrors a pull: take the artifact, then release the
 // shipment slot as handleNoiseContext does after writing the response.
 func pullArtifactForTest(s *server, rec workerRecord, haveSeq int64) (*updateArtifact, error) {
-	update, release, err := s.updateArtifactForPull(rec, haveSeq)
-	if release != nil {
-		release()
+	apk, err := s.apkDeliveryForPull(rec, haveSeq, nil)
+	if apk.release != nil {
+		apk.release()
 	}
-	return update, err
+	return apk.update, err
 }
 
 func TestAPKShipmentsAreBoundedAndSkippedWhenBusy(t *testing.T) {
 	s := newTestServer(t)
 	var releases []func()
 	for i := 0; i < maxConcurrentAPKShipments; i++ {
-		release, ok := s.acquireAPKShipment(time.Second)
+		release, ok := s.acquireAPKShipment(fmt.Sprintf("w%d", i), time.Second)
 		if !ok {
 			t.Fatalf("slot %d not granted", i)
 		}
 		releases = append(releases, release)
 	}
-	if _, ok := s.acquireAPKShipment(50 * time.Millisecond); ok {
+	if _, ok := s.acquireAPKShipment("w-extra", 50*time.Millisecond); ok {
 		t.Fatal("shipments beyond the bound must wait")
 	}
 	releases[0]()
 	releases[0]() // idempotent
-	if release, ok := s.acquireAPKShipment(time.Second); !ok {
+	if release, ok := s.acquireAPKShipment("w-extra", time.Second); !ok {
 		t.Fatal("released slot must be reusable")
 	} else {
 		release()

@@ -191,6 +191,8 @@ provided Compose file:
 | `ORCH_SIGNER_KEY_PATH` | Config-signing key path read by the `signer` command. | Optional | `$ORCH_STATE_DIR/orch-config.key` | Compose uses `/signer-state/orch-config.key` from `./signer-state`, which only the signer container mounts. |
 | `ORCH_SIGNER_LEGACY_KEY_PATH` | One-time migration source: a key found here is moved to `ORCH_SIGNER_KEY_PATH` and deleted. | Optional | empty | Compose uses `/orch-state/orch-config.key` so older deployments keep their pinned key. |
 | `ORCH_APK_MANIFEST_TTL` | Update manifest `expires_at` horizon; server-signed manifests are re-signed under a new seq when less than a third is left. | Optional | `2160h` (90 days) | Go duration, at least `24h`. |
+| `ORCH_APK_INLINE_MAX_BYTES` | Largest APK shipped inside config pull to workers without `apk_fetch_v1`. | Optional | `41943040` (40 MiB) | Bytes, at most `67108864` (64 MiB). |
+| `ORCH_APK_MAX_BYTES` | Largest APK accepted for publishing. | Optional | `209715200` (200 MiB) | Bytes, below the 256 MiB upload limit. |
 | `ORCH_APK_PACKAGE` | App package every published APK must carry. | Optional | package of the current release | Rejects an APK from another app. |
 | `ORCH_CLIENT_BUNDLE_TTL` | Client bundle `expires_at` horizon; content older than 2/3 of it is republished under a new seq. | Optional | `24h` | Go duration, at least `1h`. |
 | `ORCH_CLIENT_SEQ_FLOOR` | Lowest client bundle seq ever published (used on first start and after restoring an older DB). | Optional | `0` | See RUNBOOK "Client config seq after restore or rollback". |
