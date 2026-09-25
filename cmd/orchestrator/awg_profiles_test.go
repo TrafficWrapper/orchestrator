@@ -7,19 +7,6 @@ import (
 	"time"
 )
 
-func TestSelectAWGProfileForClientVersion(t *testing.T) {
-	profiles := []awgProfile{
-		{Name: "awg", MinVersionCode: 0, Params: map[string]any{"port": 51888}},
-		{Name: "next", MinVersionCode: 116, Params: map[string]any{"port": 52821}},
-	}
-	if got, ok := selectAWGProfileForClient(profiles, "0.1.15"); !ok || got.Name != "awg" {
-		t.Fatalf("old client got profile=%+v ok=%t want awg", got, ok)
-	}
-	if got, ok := selectAWGProfileForClient(profiles, "0.1.16"); !ok || got.Name != "next" {
-		t.Fatalf("new client got profile=%+v ok=%t want next", got, ok)
-	}
-}
-
 func TestDeviceEnrollAllocatesAWGProfilesAndSharedBundleUsesBase(t *testing.T) {
 	s := newTestServer(t)
 	rec, err := s.store.upsertPendingWorker("worker-static-profiles", map[string]any{

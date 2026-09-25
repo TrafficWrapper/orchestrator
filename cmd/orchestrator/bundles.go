@@ -117,26 +117,49 @@ func (s *server) clientWorkerPayload(rec workerRecord, clientVersion string, exc
 	routes := make([]any, 0, 2)
 	if workerProtocolEnabled(rec, "reality") {
 		if route, ok := clientRoutePayloadForClient("reality", rec.SelfDescribe["reality"], expected, configURL, clientVersion); ok {
+			params, _ := route["params"].(map[string]any)
+			if params == nil {
+				params = map[string]any{}
+				route["params"] = params
+			}
 			// Cohort short IDs with revoked slots blanked; the app picks
 			// realityCohortIndex(device_id) and falls back to short_id.
 			if cohorts := clientCohortShortIDs(rec); cohorts != nil {
-				if params, ok := route["params"].(map[string]any); ok {
-					params["cohort_short_ids"] = cohorts
-				}
+				params["cohort_short_ids"] = cohorts
 				route["cohort_short_ids"] = cohorts
 			}
-			route["vision"] = realityProfileSupportsVision(rec.SelfDescribe["reality"])
-			routes = append(routes, route)
-			if s.cfg.RealityFallbackProfiles {
-				routes = append(routes, realityFallbackRoutes(rec, route, expected, configURL, clientVersion)...)
+			primaryPort, _ := routePort(route["port"])
+			base := baseRealityProfile(rec, primaryPort)
+			// The legacy object has no IPv6 address; take it from the base
+			// profile (X-M2).
+			if v6 := stringFromMap(base, "address_v6"); v6 != "" && stringFromMap(params, "address_v6") == "" {
+				params["address_v6"] = v6
 			}
+			visionSource := base
+			if visionSource == nil {
+				visionSource, _ = rec.SelfDescribe["reality"].(map[string]any)
+			}
+			vision := realityVision(rec, visionSource)
+			route["vision"] = vision
+			params["vision"] = vision
+			// Other profiles only as nested alternatives: a separate route
+			// would take a REALITY slot from another worker in old apps (P1).
+			if nested := nestedRealityProfiles(rec, primaryPort, base); len(nested) > 0 {
+				params["reality_profiles"] = nested
+			}
+			routes = append(routes, route)
 		}
 	}
 	if workerProtocolEnabled(rec, "awg") && !excludeAWG {
-		if profile, ok := selectAWGProfileForClient(awgProfilesForClients(rec), clientVersion); ok {
+		if profile, ok := awgPrimaryProfile(rec); ok {
 			if route, ok := clientRoutePayload("awg", profile.Params, expected, configURL); ok {
 				route["profile"] = profile.Name
 				route["awg_profile"] = profile.Name
+				if nested := nestedAWGProfiles(rec, profile.Name); len(nested) > 0 {
+					if params, ok := route["params"].(map[string]any); ok {
+						params["awg_profiles"] = nested
+					}
+				}
 				routes = append(routes, route)
 			}
 		} else if route, ok := clientRoutePayload("awg", rec.SelfDescribe["awg"], expected, configURL); ok {
@@ -248,11 +271,14 @@ func canonicalClientRouteParamsForClient(routeType string, params map[string]any
 			delete(out, "flow")
 			normalizeClientXHTTPParams(out)
 		}
-		fingerprint := firstStringFromMap(params, "fingerprint")
-		if fingerprint == "" {
-			fingerprint = realityFingerprintForClientVersion(clientVersion)
+		// Fingerprint is orchestrator policy; the worker's value (always
+		// "chrome" today) is ignored (X-M2/ORC-M7). A modern variant is
+		// offered with the version code it needs; the bundle is shared.
+		out["fingerprint"] = realityFingerprintForClientVersion(clientVersion)
+		if modern, minVC := realityModernFingerprint(); modern != "" {
+			out["fingerprint_modern"] = modern
+			out["fingerprint_modern_min_version_code"] = minVC
 		}
-		out["fingerprint"] = clampRealityFingerprint(fingerprint)
 		if firstStringFromMap(params, "spiderX") == "" {
 			out["spiderX"] = "/"
 		}
@@ -273,7 +299,11 @@ func normalizeClientXHTTPParams(params map[string]any) {
 		return
 	}
 	xhttp := cloneMap(raw)
-	delete(xhttp, "host")
+	// Keep a host that differs from the server name: the inbound checks it
+	// (X-L11). An equal or invalid one is dropped as before.
+	if host := strings.TrimSpace(stringFromMap(xhttp, "host")); host == "" || strings.EqualFold(host, firstStringFromMap(params, "server_name", "serverName", "sni")) || !validHostname(host) {
+		delete(xhttp, "host")
+	}
 	mode := firstStringFromMap(xhttp, "mode")
 	if mode == "" || strings.EqualFold(mode, "auto") {
 		xhttp["mode"] = "stream-up"
@@ -310,8 +340,10 @@ func approvedDevicePayloads(devices []deviceRecord) []any {
 }
 
 func workerAWGPublicKeyFromProfiles(profiles []awgProfile) string {
-	if profile, ok := selectAWGProfileForClient(profiles, ""); ok && profile.ServerPublicKey != "" {
-		return profile.ServerPublicKey
+	for _, profile := range profiles {
+		if profile.Name == "awg" && profile.ServerPublicKey != "" {
+			return profile.ServerPublicKey
+		}
 	}
 	for _, profile := range profiles {
 		if profile.ServerPublicKey != "" {

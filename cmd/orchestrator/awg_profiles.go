@@ -143,33 +143,6 @@ func awgProfileFromParams(params map[string]any) awgProfile {
 	}
 }
 
-func selectAWGProfileForClient(profiles []awgProfile, clientVersion string) (awgProfile, bool) {
-	if len(profiles) == 0 {
-		return awgProfile{}, false
-	}
-	code := clientVersionCode(clientVersion)
-	var best awgProfile
-	found := false
-	for _, profile := range profiles {
-		if profile.MinVersionCode > code {
-			continue
-		}
-		if !found || profile.MinVersionCode > best.MinVersionCode {
-			best = profile
-			found = true
-		}
-	}
-	if found {
-		return best, true
-	}
-	for _, profile := range profiles {
-		if profile.MinVersionCode == 0 {
-			return profile, true
-		}
-	}
-	return profiles[0], true
-}
-
 func normalizeAWGProfileName(name string) string {
 	name = strings.ToLower(strings.TrimSpace(name))
 	if name == "" {

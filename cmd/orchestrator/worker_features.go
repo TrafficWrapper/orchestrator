@@ -136,25 +136,6 @@ func workerDegraded(rec workerRecord) (bool, string) {
 	return false, ""
 }
 
-// awgProfilesForClients drops profiles the owner is draining (e.g. an old
-// dialect being rotated out) unless nothing else is left.
-func awgProfilesForClients(rec workerRecord) []awgProfile {
-	all := awgProfilesFromWorker(rec)
-	if len(rec.DrainingAWGProfiles) == 0 {
-		return all
-	}
-	kept := make([]awgProfile, 0, len(all))
-	for _, p := range all {
-		if !slices.Contains(rec.DrainingAWGProfiles, p.Name) {
-			kept = append(kept, p)
-		}
-	}
-	if len(kept) == 0 {
-		return all
-	}
-	return kept
-}
-
 func toggleString(list []string, value string, on bool) []string {
 	value = strings.TrimSpace(value)
 	out := slices.DeleteFunc(slices.Clone(list), func(v string) bool { return v == value })
@@ -206,59 +187,4 @@ func (s *server) handleAdminWorkerAWGDrain(w http.ResponseWriter, r *http.Reques
 	}
 	s.auditEvent(auditEntry{Event: "worker_awg_drain", IP: clientIP(r), Result: "ok", Fields: map[string]string{"worker_id": req.ID, "profile": profile, "draining": strconv.FormatBool(*req.Draining)}})
 	writeJSON(w, map[string]any{"ok": true})
-}
-
-// realityFallbackRoutes turns the worker's other reality_profiles (XHTTP, or
-// TCP on another port) into extra REALITY routes placed right after its
-// primary route, so a client whose primary handshake is blocked can retry
-// before AWG. The bundle is shared, so no flow is sent: "vision" tells the app
-// whether the profile accepts xtls-rprx-vision, and only then does it apply its
-// enroll-negotiated reality_flow.
-func realityFallbackRoutes(rec workerRecord, primary map[string]any, expected, configURL, clientVersion string) []any {
-	raw, ok := rec.SelfDescribe["reality_profiles"].([]any)
-	if !ok {
-		return nil
-	}
-	primaryPort := intFromMap(primary, "port", 0)
-	var out []any
-	for _, item := range raw {
-		profile, ok := mapFromAny(item)
-		if !ok || intFromMap(profile, "port", 0) == primaryPort {
-			continue
-		}
-		vision := realityProfileSupportsVision(profile)
-		params := cloneMap(profile)
-		delete(params, "flows")
-		delete(params, "flow")
-		params["security"] = "reality"
-		if cohorts, ok := primary["cohort_short_ids"]; ok {
-			params["cohort_short_ids"] = cohorts
-		}
-		route, ok := clientRoutePayloadForClient("reality", params, expected, configURL, clientVersion)
-		if !ok {
-			continue
-		}
-		route["profile"] = stringFromMap(profile, "name")
-		route["vision"] = vision
-		out = append(out, route)
-	}
-	return out
-}
-
-// realityProfileSupportsVision reports whether a REALITY profile accepts the
-// Vision flow: from its advertised flows, else TCP (XHTTP never does).
-func realityProfileSupportsVision(raw any) bool {
-	profile, ok := mapFromAny(raw)
-	if !ok {
-		return false
-	}
-	if flows, ok := profile["flows"].([]any); ok {
-		return slices.Contains(flows, any(realityFlowVision))
-	}
-	switch strings.ToLower(firstStringFromMap(profile, "network")) {
-	case "", "tcp":
-		return true
-	default:
-		return false
-	}
 }
