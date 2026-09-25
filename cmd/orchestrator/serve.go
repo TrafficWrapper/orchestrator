@@ -66,7 +66,7 @@ func runServe(cfg orchConfig) error {
 		return err
 	}
 	defer audit.Close()
-	s := &server{cfg: cfg, store: st, signer: signerClient{socket: cfg.SignerSocket}, static: static, loginLimiter: newLoginLimiter(), audit: audit, rootCtx: ctx}
+	s := &server{cfg: cfg, store: st, signer: signerClient{socket: cfg.SignerSocket}, static: static, loginLimiter: newLoginLimiter(), audit: audit, rootCtx: ctx, startedAt: time.Now()}
 	if _, err := s.signer.publicKey(); err != nil {
 		return fmt.Errorf("signer unavailable: %w", err)
 	}
@@ -197,7 +197,10 @@ func (s *server) runWorkerJanitor(ctx context.Context) {
 			return
 		case <-ticker.C:
 			cutoff := time.Now().UTC().Add(-workerFreshTTL)
-			n, err := s.store.markStaleWorkersInactive(cutoff)
+			n, err := 0, error(nil)
+			if !s.startupGrace(time.Now()) {
+				n, err = s.store.markStaleWorkersInactive(cutoff)
+			}
 			if err != nil {
 				log.Printf("worker stale janitor failed: %v", err)
 			} else if n > 0 {
@@ -354,6 +357,7 @@ func (s *server) apiRoutes() []apiRoute {
 		{"/w/v1/nudge/wait", s.handleNoiseContext(s.handleNudge)},
 		{"/w/v1/ack", s.handleNoise(s.handleAck)},
 		{"/w/v1/telemetry", s.handleNoise(s.handleWorkerTelemetry)},
+		{"/w/v1/apk/chunk", s.handleNoiseContext(s.handleAPKChunk)},
 		{"/d/v1/handshake/start", s.handleHandshakeStart},
 		{"/d/v1/enroll", s.handleNoise(s.handleDeviceEnroll)},
 		{"/admin/v1/login", s.handleAdminLogin},

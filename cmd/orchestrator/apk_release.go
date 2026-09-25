@@ -17,7 +17,6 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"aead.dev/minisign"
@@ -157,6 +156,10 @@ func (s *server) handleAdminAPKPublish(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer apkFile.Close()
+	if apkHeader.Size > s.apkMaxBytes() {
+		writeError(w, fmt.Sprintf("apk is %d bytes; ORCH_APK_MAX_BYTES allows %d", apkHeader.Size, s.apkMaxBytes()), http.StatusRequestEntityTooLarge)
+		return
+	}
 	serverSigned := false
 	var manifest apkReleaseRecord
 	var inspected apkVersionInfo
@@ -469,6 +472,9 @@ func parseFormInt64(r *http.Request, key string) int64 {
 // are staged in a private directory that is renamed into place, so a racing or
 // stale publish can never overwrite the manifest of the live release.
 func (s *server) storeAPKRelease(manifest apkReleaseRecord, manifestJSON, minisig string, apk multipart.File, _ *multipart.FileHeader) (apkReleaseRecord, error) {
+	if manifest.APKSize > s.apkMaxBytes() {
+		return apkReleaseRecord{}, fmt.Errorf("apk is %d bytes; ORCH_APK_MAX_BYTES allows %d", manifest.APKSize, s.apkMaxBytes())
+	}
 	s.apkPublishMu.Lock()
 	defer s.apkPublishMu.Unlock()
 	if current, ok, err := s.store.currentAPKRelease(); err != nil {
@@ -540,60 +546,6 @@ const (
 // apkShipmentWait is how long a pull waits for a free APK shipment slot (a
 // var so tests can shorten it).
 var apkShipmentWait = 30 * time.Second
-
-// updateArtifactForPull returns the APK update only when the worker has not
-// yet acknowledged the current release (or reports no applied state), so
-// config-only bumps do not re-ship the whole APK. The returned release func
-// must run after the response is written. When all shipment slots stay busy
-// the pull goes out without the APK; since it is not marked sent, the next
-// pull ships it.
-func (s *server) updateArtifactForPull(worker workerRecord, haveSeq int64) (*updateArtifact, func(), error) {
-	rel, ok, err := s.store.currentAPKRelease()
-	if err != nil || !ok {
-		return nil, nil, err
-	}
-	if haveSeq > 0 && worker.APKAppliedSeq == rel.Seq {
-		return nil, nil, nil
-	}
-	release, acquired := s.acquireAPKShipment(apkShipmentWait)
-	if !acquired {
-		// The worker would otherwise stay on the old APK until an unrelated
-		// seq bump: bump its own seq so its next nudge pulls again.
-		log.Printf("apk shipment slots busy; worker %s will retry the update", worker.ID)
-		if err := s.store.updateWorker(worker.ID, func(rec *workerRecord) error {
-			if rec.DesiredSeq <= worker.DesiredSeq {
-				rec.DesiredSeq = worker.DesiredSeq + 1
-			}
-			return nil
-		}); err != nil {
-			return nil, nil, err
-		}
-		return nil, nil, nil
-	}
-	update, err := s.cachedUpdateArtifact(rel)
-	if err != nil {
-		release()
-		return nil, nil, err
-	}
-	if err := s.store.markWorkerAPKSent(worker.ID, rel.Seq, worker.DesiredSeq); err != nil {
-		release()
-		return nil, nil, err
-	}
-	return update, release, nil
-}
-
-func (s *server) acquireAPKShipment(wait time.Duration) (func(), bool) {
-	s.apkShipOnce.Do(func() { s.apkShipSem = make(chan struct{}, maxConcurrentAPKShipments) })
-	timer := time.NewTimer(wait)
-	defer timer.Stop()
-	select {
-	case s.apkShipSem <- struct{}{}:
-		var once sync.Once
-		return func() { once.Do(func() { <-s.apkShipSem }) }, true
-	case <-timer.C:
-		return nil, false
-	}
-}
 
 // cachedUpdateArtifact reads and base64-encodes a release once; the artifact
 // is shared read-only by all pulls of that release.

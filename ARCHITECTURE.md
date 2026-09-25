@@ -224,6 +224,24 @@ client config, APK update artifacts, and telemetry forwarding paths to enrolled
 clients. Public clearnet distribution is intentionally avoided so deployment
 metadata is not advertised by a generic web endpoint.
 
+APK delivery to workers is separate from config pull. A worker that lists
+`apk_fetch_v1` in `worker_capabilities` of a pull gets `update_ref`
+(`apk_seq`, `apk_name`, `apk_sha256`, `apk_size`, `manifest_json`,
+`manifest_minisig`) instead of the inline `update`. It fetches the APK over
+Noise `POST /w/v1/apk/chunk` (`{worker_id, apk_seq, apk_sha256, offset,
+length ≤ 4 MiB}` → `{ok, total_size, data_base64}`; codes
+`release_superseded`, `bad_range`, `worker_revoked`). A re-signed manifest keeps
+the sha256, so a download started under an older seq continues. Other workers
+get the APK inline only up to `ORCH_APK_INLINE_MAX_BYTES`, otherwise the pull
+has no `update` field at all. A worker that pulls again with the same
+`have_seq` after inline attempts of the same APK gets config only, with a
+growing backoff and an alert. A release counts as applied when the worker's
+`distributed_apk` reports the same sha256 and `seq`, else by the legacy ack
+marker; a pull without the APK clears the sent marker. APK responses get a
+write deadline, and each worker holds at most one inline slot. Worker liveness
+is counted from orchestrator start, so a restart does not mark workers
+inactive or raise down alerts.
+
 APK trust is separate from config trust:
 
 - Android verifies APK package signatures against the pinned signing certificate
