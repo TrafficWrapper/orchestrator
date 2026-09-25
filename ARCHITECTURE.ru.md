@@ -122,6 +122,15 @@ applying. Signer private key не хранится в web/admin process.
   client seq. `workers` — всегда массив; enroll без доступного воркера
   завершается ретраимой ошибкой «no approved worker» до траты токена. Воркер
   может сообщать `client_applied_seq` в ack.
+- Коды отказов и время платформы. Отказы сохраняют прежние тексты error
+  (по ним сверяются старые приложения и воркеры) и получают `code`: в
+  `/d/v1/enroll` — token_invalid, device_not_approved, device_revoked,
+  identity_mismatch, noise_mismatch, awg_key_mismatch, no_worker, retry; в
+  `/w/v1/telemetry` — stale_timestamp, replay, bad_signature,
+  unknown_device, device_not_approved, invalid_payload, worker_revoked,
+  worker_pending. Каждый Noise-ответ воркеру содержит `server_time` (часы
+  оркестратора, unix ms). Ответ enroll всегда содержит `reality_flow`, в том
+  числе пустой.
 
 ## Device Enrollment and Connect
 
