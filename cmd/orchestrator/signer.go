@@ -97,15 +97,48 @@ func signerKeyPath(cfg orchConfig) string {
 	return filepath.Join(cfg.StateDir, "orch-config.key")
 }
 
+// legacySignerKeyMarkerSuffix names the marker, kept next to the signer key,
+// that records a finished legacy-key check. Once it exists the signer never
+// reads or modifies the legacy location again.
+const legacySignerKeyMarkerSuffix = ".legacy-migrated"
+
+func legacySignerKeyMarkerPath(keyPath string) string {
+	return keyPath + legacySignerKeyMarkerSuffix
+}
+
 // migrateLegacySignerKey moves a config-signing key from the shared
 // orchestrator state directory into the signer-only key path, keeping the
 // pinned public key stable. The legacy copy is removed so the internet-facing
 // orchestrator process can no longer read it.
+//
+// The check runs once: after a successful move, or when no legacy key is
+// found, a marker is written next to the signer key and later starts skip
+// the legacy path entirely. A file that reappears there afterwards is only
+// reported; it neither replaces the signer key nor stops the signer.
 func migrateLegacySignerKey(keyPath, legacyPath string) error {
 	legacyPath = strings.TrimSpace(legacyPath)
 	if legacyPath == "" || filepath.Clean(legacyPath) == filepath.Clean(keyPath) {
 		return nil
 	}
+	marker := legacySignerKeyMarkerPath(keyPath)
+	if _, err := os.Stat(marker); err == nil {
+		if _, err := os.Lstat(legacyPath); err == nil {
+			fmt.Printf("signer=legacy_key_ignored path=%s reason=migration_already_done\n", legacyPath)
+		}
+		return nil
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	if err := moveLegacySignerKey(keyPath, legacyPath); err != nil {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(marker), 0o700); err != nil {
+		return err
+	}
+	return writeFileAtomic(marker, []byte("legacy="+legacyPath+" checked_at="+time.Now().UTC().Format(time.RFC3339)+"\n"), 0o600)
+}
+
+func moveLegacySignerKey(keyPath, legacyPath string) error {
 	legacy, err := os.ReadFile(legacyPath)
 	if errors.Is(err, os.ErrNotExist) {
 		return nil

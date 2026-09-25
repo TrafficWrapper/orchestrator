@@ -422,7 +422,7 @@ func buildTestAPKWithManifest(t *testing.T, versionCode int64, versionName strin
 	return out.Bytes()
 }
 
-func buildTestBinaryManifest(t *testing.T, versionCode int64, versionName string) []byte {
+func buildTestBinaryManifest(t testing.TB, versionCode int64, versionName string) []byte {
 	t.Helper()
 	pool := buildTestAXMLStringPool(t, []string{
 		"manifest",
@@ -440,7 +440,7 @@ func buildTestBinaryManifest(t *testing.T, versionCode int64, versionName string
 	return out.Bytes()
 }
 
-func buildTestAXMLStringPool(t *testing.T, values []string) []byte {
+func buildTestAXMLStringPool(t testing.TB, values []string) []byte {
 	t.Helper()
 	var data bytes.Buffer
 	offsets := make([]uint32, 0, len(values))
@@ -474,7 +474,7 @@ func buildTestAXMLStringPool(t *testing.T, values []string) []byte {
 	return out.Bytes()
 }
 
-func buildTestAXMLManifestStart(t *testing.T, versionCode int64) []byte {
+func buildTestAXMLManifestStart(t testing.TB, versionCode int64) []byte {
 	t.Helper()
 	if versionCode <= 0 || versionCode > int64(^uint32(0)) {
 		t.Fatalf("bad version code: %d", versionCode)

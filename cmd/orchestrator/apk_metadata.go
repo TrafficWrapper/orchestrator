@@ -96,6 +96,36 @@ func parseTextManifestVersion(raw []byte) (apkVersionInfo, error) {
 	return apkVersionInfo{}, errors.New("manifest element not found")
 }
 
+// AXML string pool budgets. Strings are decoded lazily, only when a lookup
+// needs them, and every decode is charged against the parse so that a
+// manifest cannot turn repeated or oversized pool entries into unbounded
+// allocations.
+const (
+	axmlMaxStringCount   = 1 << 18
+	axmlMaxStringBytes   = 4 << 10
+	axmlMaxDecodedBytes  = 1 << 20
+	axmlMaxStringDecodes = 1 << 14
+)
+
+var errAXMLBudget = errors.New("AndroidManifest.xml string pool exceeds parse budget")
+
+// axmlBudget is shared by every string pool of one manifest parse.
+type axmlBudget struct {
+	decodedBytes int
+	decodes      int
+}
+
+// axmlStringPool indexes a string pool chunk without decoding it.
+type axmlStringPool struct {
+	chunk        []byte
+	headerSize   int
+	count        int
+	stringsStart int
+	utf8         bool
+	cache        map[uint32]string
+	budget       *axmlBudget
+}
+
 func parseBinaryManifestVersion(raw []byte) (apkVersionInfo, error) {
 	if len(raw) < 8 || binary.LittleEndian.Uint16(raw[0:2]) != 0x0003 {
 		return apkVersionInfo{}, errors.New("unsupported AndroidManifest.xml format")
@@ -104,7 +134,8 @@ func parseBinaryManifestVersion(raw []byte) (apkVersionInfo, error) {
 	if pos <= 0 {
 		pos = 8
 	}
-	var pool []string
+	budget := &axmlBudget{}
+	var pool *axmlStringPool
 	for pos+8 <= len(raw) {
 		chunkType := binary.LittleEndian.Uint16(raw[pos : pos+2])
 		headerSize := int(binary.LittleEndian.Uint16(raw[pos+2 : pos+4]))
@@ -115,7 +146,7 @@ func parseBinaryManifestVersion(raw []byte) (apkVersionInfo, error) {
 		chunk := raw[pos : pos+chunkSize]
 		switch chunkType {
 		case 0x0001:
-			parsed, err := parseAXMLStringPool(chunk)
+			parsed, err := parseAXMLStringPool(chunk, budget)
 			if err != nil {
 				return apkVersionInfo{}, err
 			}
@@ -134,7 +165,9 @@ func parseBinaryManifestVersion(raw []byte) (apkVersionInfo, error) {
 	return apkVersionInfo{}, errors.New("manifest start element not found")
 }
 
-func parseAXMLStringPool(chunk []byte) ([]string, error) {
+// parseAXMLStringPool validates the pool header and offset table; strings
+// are decoded on demand by (*axmlStringPool).get.
+func parseAXMLStringPool(chunk []byte, budget *axmlBudget) (*axmlStringPool, error) {
 	if len(chunk) < 28 {
 		return nil, errors.New("short string pool")
 	}
@@ -142,38 +175,72 @@ func parseAXMLStringPool(chunk []byte) ([]string, error) {
 	stringCount := int(binary.LittleEndian.Uint32(chunk[8:12]))
 	flags := binary.LittleEndian.Uint32(chunk[16:20])
 	stringsStart := int(binary.LittleEndian.Uint32(chunk[20:24]))
+	if stringCount > axmlMaxStringCount {
+		return nil, errAXMLBudget
+	}
 	if headerSize < 28 || stringsStart <= 0 || stringsStart > len(chunk) || headerSize+stringCount*4 > len(chunk) {
 		return nil, errors.New("invalid string pool")
 	}
-	utf8Pool := flags&0x00000100 != 0
-	out := make([]string, stringCount)
-	for i := 0; i < stringCount; i++ {
-		offset := int(binary.LittleEndian.Uint32(chunk[headerSize+i*4 : headerSize+i*4+4]))
-		start := stringsStart + offset
-		if start < 0 || start >= len(chunk) {
-			return nil, errors.New("invalid string offset")
-		}
-		var value string
-		var err error
-		if utf8Pool {
-			value, err = decodeAXMLUTF8String(chunk[start:])
-		} else {
-			value, err = decodeAXMLUTF16String(chunk[start:])
-		}
-		if err != nil {
-			return nil, err
-		}
-		out[i] = value
-	}
-	return out, nil
+	return &axmlStringPool{
+		chunk:        chunk,
+		headerSize:   headerSize,
+		count:        stringCount,
+		stringsStart: stringsStart,
+		utf8:         flags&0x00000100 != 0,
+		budget:       budget,
+	}, nil
 }
 
-func parseAXMLStartElementVersion(chunk []byte, pool []string) (apkVersionInfo, bool, error) {
-	if len(chunk) < 36 || len(pool) == 0 {
+// get decodes string idx once and caches it. An absent index (0xffffffff or
+// out of range) is the empty string, as before; a malformed or oversized
+// string, or an exhausted parse budget, is an error.
+func (p *axmlStringPool) get(idx uint32) (string, error) {
+	if p == nil || idx == 0xffffffff || uint64(idx) >= uint64(p.count) {
+		return "", nil
+	}
+	if value, ok := p.cache[idx]; ok {
+		return value, nil
+	}
+	if p.budget.decodes >= axmlMaxStringDecodes {
+		return "", errAXMLBudget
+	}
+	p.budget.decodes++
+	i := int(idx)
+	offset := int(binary.LittleEndian.Uint32(p.chunk[p.headerSize+i*4 : p.headerSize+i*4+4]))
+	start := p.stringsStart + offset
+	if start < 0 || start >= len(p.chunk) {
+		return "", errors.New("invalid string offset")
+	}
+	var value string
+	var err error
+	if p.utf8 {
+		value, err = decodeAXMLUTF8String(p.chunk[start:])
+	} else {
+		value, err = decodeAXMLUTF16String(p.chunk[start:])
+	}
+	if err != nil {
+		return "", err
+	}
+	p.budget.decodedBytes += len(value)
+	if p.budget.decodedBytes > axmlMaxDecodedBytes {
+		return "", errAXMLBudget
+	}
+	if p.cache == nil {
+		p.cache = make(map[uint32]string)
+	}
+	p.cache[idx] = value
+	return value, nil
+}
+
+func parseAXMLStartElementVersion(chunk []byte, pool *axmlStringPool) (apkVersionInfo, bool, error) {
+	if len(chunk) < 36 || pool == nil || pool.count == 0 {
 		return apkVersionInfo{}, false, nil
 	}
 	nameIdx := binary.LittleEndian.Uint32(chunk[20:24])
-	elementName := axmlString(pool, nameIdx)
+	elementName, err := pool.get(nameIdx)
+	if err != nil {
+		return apkVersionInfo{}, false, err
+	}
 	if elementName != "manifest" {
 		return apkVersionInfo{}, false, nil
 	}
@@ -190,25 +257,39 @@ func parseAXMLStartElementVersion(chunk []byte, pool []string) (apkVersionInfo, 
 		if off+20 > len(chunk) {
 			return apkVersionInfo{}, false, errors.New("invalid manifest attribute")
 		}
-		attrName := axmlString(pool, binary.LittleEndian.Uint32(chunk[off+4:off+8]))
-		rawValue := axmlString(pool, binary.LittleEndian.Uint32(chunk[off+8:off+12]))
+		attrName, err := pool.get(binary.LittleEndian.Uint32(chunk[off+4 : off+8]))
+		if err != nil {
+			return apkVersionInfo{}, false, err
+		}
+		rawValueIdx := binary.LittleEndian.Uint32(chunk[off+8 : off+12])
 		dataType := chunk[off+15]
 		data := binary.LittleEndian.Uint32(chunk[off+16 : off+20])
 		switch attrName {
 		case "versionCode":
+			rawValue, err := pool.get(rawValueIdx)
+			if err != nil {
+				return apkVersionInfo{}, false, err
+			}
 			code, err := axmlAttrInt(pool, rawValue, dataType, data)
 			if err != nil {
 				return apkVersionInfo{}, false, err
 			}
 			out.VersionCode = code
 		case "versionName":
-			value := axmlAttrString(pool, rawValue, dataType, data)
+			value, err := axmlAttrString(pool, rawValueIdx, dataType, data)
+			if err != nil {
+				return apkVersionInfo{}, false, err
+			}
 			if strings.HasPrefix(value, "@") {
 				return apkVersionInfo{}, false, errors.New("versionName is a resource reference; fill it manually")
 			}
 			out.VersionName = value
 		case "package":
-			out.Package = strings.TrimSpace(axmlAttrString(pool, rawValue, dataType, data))
+			value, err := axmlAttrString(pool, rawValueIdx, dataType, data)
+			if err != nil {
+				return apkVersionInfo{}, false, err
+			}
+			out.Package = value
 		}
 	}
 	return out, true, nil
@@ -225,12 +306,16 @@ func validateAPKVersionInfo(value apkVersionInfo) (apkVersionInfo, error) {
 	return value, nil
 }
 
-func axmlAttrInt(pool []string, raw string, dataType byte, data uint32) (int64, error) {
+func axmlAttrInt(pool *axmlStringPool, raw string, dataType byte, data uint32) (int64, error) {
 	switch dataType {
 	case 0x10, 0x11:
 		return int64(data), nil
 	case 0x03:
-		return strconv.ParseInt(axmlString(pool, data), 10, 64)
+		value, err := pool.get(data)
+		if err != nil {
+			return 0, err
+		}
+		return strconv.ParseInt(value, 10, 64)
 	default:
 		if strings.TrimSpace(raw) != "" {
 			return strconv.ParseInt(strings.TrimSpace(raw), 10, 64)
@@ -239,18 +324,13 @@ func axmlAttrInt(pool []string, raw string, dataType byte, data uint32) (int64, 
 	return 0, fmt.Errorf("unsupported versionCode type 0x%x", dataType)
 }
 
-func axmlAttrString(pool []string, raw string, dataType byte, data uint32) string {
+func axmlAttrString(pool *axmlStringPool, rawIdx uint32, dataType byte, data uint32) (string, error) {
+	idx := rawIdx
 	if dataType == 0x03 {
-		return strings.TrimSpace(axmlString(pool, data))
+		idx = data
 	}
-	return strings.TrimSpace(raw)
-}
-
-func axmlString(pool []string, idx uint32) string {
-	if idx == 0xffffffff || int(idx) < 0 || int(idx) >= len(pool) {
-		return ""
-	}
-	return pool[idx]
+	value, err := pool.get(idx)
+	return strings.TrimSpace(value), err
 }
 
 func decodeAXMLUTF8String(raw []byte) (string, error) {
@@ -261,6 +341,9 @@ func decodeAXMLUTF8String(raw []byte) (string, error) {
 	byteLen, n2, ok := readAXMLUTF8Length(raw[n1:])
 	if !ok {
 		return "", errors.New("invalid utf8 string byte length")
+	}
+	if byteLen > axmlMaxStringBytes {
+		return "", errAXMLBudget
 	}
 	start := n1 + n2
 	end := start + byteLen
@@ -287,6 +370,9 @@ func decodeAXMLUTF16String(raw []byte) (string, error) {
 	length, used, ok := readAXMLUTF16Length(raw)
 	if !ok {
 		return "", errors.New("invalid utf16 string length")
+	}
+	if length*2 > axmlMaxStringBytes {
+		return "", errAXMLBudget
 	}
 	start := used
 	end := start + length*2

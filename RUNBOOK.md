@@ -32,6 +32,20 @@ different contents, keep the one whose public key matches deployed configs.
 Containers now run as uid `10001`; the entrypoint re-owns the state
 directories, but a seed APK under `./seed` must be world-readable.
 
+The legacy key check runs once. After a successful move, or when there was no
+legacy key, the signer writes the marker
+`./signer-state/orch-config.key.legacy-migrated` and from then on neither
+reads nor modifies `./orch-state`: a file that shows up there later is only
+logged (`signer=legacy_key_ignored`) and does not stop the signer. Until the
+marker exists, keys that differ still stop the signer; that is left to the
+operator. `docker-compose.yml` mounts `./orch-state` read-write into the
+signer only for this move and keeps doing so, so upgrades from older releases
+keep working. Once the marker exists, the `./orch-state:/orch-state` mount of
+the `signer` service may be made `:ro`, or removed together with
+`ORCH_SIGNER_LEGACY_KEY_PATH`: with the marker present the entrypoint no
+longer re-owns the legacy key directory. Without the marker keep the mount
+writable, since the move deletes the legacy copy.
+
 ## Stricter configuration parsing
 
 `serve` now refuses to start on malformed environment values and lists them

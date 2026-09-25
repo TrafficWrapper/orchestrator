@@ -320,3 +320,18 @@ func TestAPKPublishSizeLimit(t *testing.T) {
 		t.Fatalf("APK at the limit: %d", code)
 	}
 }
+
+// X-I12: chunk responses carry server_time like every other Noise response,
+// and stamping keeps the slot release.
+func TestAPKChunkResponseCarriesServerTime(t *testing.T) {
+	released := false
+	stamped := stampServerTime(apkChunkResponse{OK: true, release: func() { released = true }}, time.UnixMilli(1234))
+	resp, ok := stamped.(apkChunkResponse)
+	if !ok || resp.ServerTime != 1234 {
+		t.Fatalf("stamped=%+v", stamped)
+	}
+	resp.releaseAfterWrite()
+	if !released {
+		t.Fatal("stamping dropped the release func")
+	}
+}

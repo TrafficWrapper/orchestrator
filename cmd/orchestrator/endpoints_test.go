@@ -324,8 +324,12 @@ func TestDiscoveryIPv6RateKeyAggregatesWithin48(t *testing.T) {
 	if _, _, ok := s.reserveDiscoveryJSONForKey(lastKey, bundle, now); ok {
 		t.Fatal("rotating /64 addresses inside one /48 bypassed the pair limit")
 	}
-	if got := len(s.discoveryRates); got != 1 {
-		t.Fatalf("one IPv6 /48 created %d rate keys", got)
+	// One /48 source key plus its /32 provider bucket.
+	if got := len(s.discoveryRates); got != 2 {
+		t.Fatalf("one IPv6 /48 created %d rate keys want 2", got)
+	}
+	if _, ok := s.discoveryRates[discoveryRateAggregateKey(firstKey)]; !ok {
+		t.Fatal("IPv6 /48 key has no /32 aggregate bucket")
 	}
 }
 
@@ -354,9 +358,17 @@ func TestDiscoveryRateMapDoesNotEvictLiveCountersAtCapacity(t *testing.T) {
 	if got := len(s.discoveryRates); got != maxDiscoveryRateKeys {
 		t.Fatalf("discovery rate keys=%d want cap %d", got, maxDiscoveryRateKeys)
 	}
+	// ORC-L21: at capacity a new source is admitted by evicting the least
+	// used entry; the busy source's counter is never the one evicted.
 	newKey := discoveryRateKey("203.0.113.250")
-	if _, _, ok := s.reserveDiscoveryJSONForKey(newKey, bundle, now); ok {
-		t.Fatal("new key displaced a live rate entry at capacity")
+	if _, _, ok := s.reserveDiscoveryJSONForKey(newKey, bundle, now); !ok {
+		t.Fatal("new source was refused at table capacity instead of evicting")
+	}
+	if got := len(s.discoveryRates); got > maxDiscoveryRateKeys {
+		t.Fatalf("discovery rate keys=%d exceed cap %d", got, maxDiscoveryRateKeys)
+	}
+	if got := s.discoveryRates[legitimateKey].PairCount; got != discoveryRateLimit-1 {
+		t.Fatalf("busy source counter=%d after eviction want %d", got, discoveryRateLimit-1)
 	}
 	if _, _, ok := s.reserveDiscoveryJSONForKey(legitimateKey, bundle, now); !ok {
 		t.Fatal("legitimate counter was evicted while filling the map")
@@ -366,6 +378,72 @@ func TestDiscoveryRateMapDoesNotEvictLiveCountersAtCapacity(t *testing.T) {
 	}
 	if _, _, ok := s.reserveDiscoveryJSONForKey(legitimateKey, bundle, now); ok {
 		t.Fatal("legitimate source counter was reset by map pressure")
+	}
+}
+
+func TestDiscoveryRateMapAdmitsNewSourcesWhenFullOfLiveEntries(t *testing.T) {
+	s := newTestServer(t)
+	now := time.Now()
+	bundle := discoverySnapshotForRateTest("churn")
+	s.discoveryRates = make(map[string]discoveryRequestRate, maxDiscoveryRateKeys)
+	for i := 0; i < maxDiscoveryRateKeys; i++ {
+		key := discoveryRateKey(fmt.Sprintf("198.18.%d.%d", i/256, i%256))
+		s.discoveryRates[key] = discoveryRequestRate{
+			WindowStart: now.Add(-time.Second),
+			PairCount:   1,
+			LastSeen:    now.Add(-time.Second),
+		}
+	}
+	for i := 0; i < 2*maxDiscoveryRateKeys; i++ {
+		key := discoveryRateKey(fmt.Sprintf("10.%d.%d.%d", i/65536, (i/256)%256, i%256))
+		if _, _, ok := s.reserveDiscoveryJSONForKey(key, bundle, now); !ok {
+			t.Fatalf("new source %d refused with a full table of live entries", i)
+		}
+		if got := len(s.discoveryRates); got > maxDiscoveryRateKeys {
+			t.Fatalf("discovery rate keys=%d exceed cap %d", got, maxDiscoveryRateKeys)
+		}
+	}
+}
+
+func TestDiscoveryRateMapEvictsLeastRecentlySeenFirst(t *testing.T) {
+	s := newTestServer(t)
+	now := time.Now()
+	s.discoveryRates = make(map[string]discoveryRequestRate, maxDiscoveryRateKeys)
+	oldKey := discoveryRateKey("198.51.100.90")
+	for i := 0; i < maxDiscoveryRateKeys-1; i++ {
+		key := discoveryRateKey(fmt.Sprintf("198.18.%d.%d", i/256, i%256))
+		s.discoveryRates[key] = discoveryRequestRate{WindowStart: now.Add(-time.Second), PairCount: 2, LastSeen: now}
+	}
+	s.discoveryRates[oldKey] = discoveryRequestRate{WindowStart: now.Add(-time.Second), PairCount: 2, LastSeen: now.Add(-30 * time.Second)}
+	if _, _, ok := s.reserveDiscoveryJSONForKey(discoveryRateKey("203.0.113.90"), discoverySnapshotForRateTest("lru"), now); !ok {
+		t.Fatal("new source refused at capacity")
+	}
+	if _, exists := s.discoveryRates[oldKey]; exists {
+		t.Fatal("least recently seen entry survived eviction")
+	}
+}
+
+func TestDiscoveryIPv6AggregateBoundsOneAllocation(t *testing.T) {
+	s := newTestServer(t)
+	now := time.Now()
+	bundle := discoverySnapshotForRateTest("ipv6-agg")
+	if got := discoveryRateAggregateKey(discoveryRateKey("2001:db8:1234:1::1")); got != "agg6:2001:db8::/32" {
+		t.Fatalf("aggregate key=%q", got)
+	}
+	if got := discoveryRateAggregateKey(discoveryRateKey("198.51.100.1")); got != "" {
+		t.Fatalf("IPv4 key got aggregate %q", got)
+	}
+	for i := 0; i < discoveryAggregateRateLimit; i++ {
+		key := discoveryRateKey(fmt.Sprintf("2001:db8:%x::1", i%0x10000))
+		if _, _, ok := s.reserveDiscoveryJSONForKey(key, bundle, now); !ok {
+			t.Fatalf("pair %d inside one /32 rejected before the aggregate limit", i)
+		}
+	}
+	if _, _, ok := s.reserveDiscoveryJSONForKey(discoveryRateKey("2001:db8:ffff::1"), bundle, now); ok {
+		t.Fatal("rotating /48 keys inside one /32 bypassed the aggregate limit")
+	}
+	if _, _, ok := s.reserveDiscoveryJSONForKey(discoveryRateKey("2001:db9:1::1"), bundle, now); !ok {
+		t.Fatal("a different /32 was limited by its neighbour's aggregate")
 	}
 }
 

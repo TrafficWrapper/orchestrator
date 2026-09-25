@@ -76,6 +76,9 @@ applying. Signer private key не хранится в web/admin process.
 
 ## Контракт self_describe воркера
 
+Полный сетевой контракт воркер ↔ оркестратор (capabilities, статусы и коды,
+`desired_state`, доставка APK и discovery) — в [CONTRACT.ru.md](CONTRACT.ru.md).
+
 Всё, что воркер присылает в `self_describe`, недоверенное. Описание
 санитизируется один раз при приёме (enroll, nudge, ack), и хранится только
 очищенная копия:

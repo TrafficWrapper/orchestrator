@@ -74,6 +74,10 @@ or applying it. The signer private key is not held by the web/admin process.
 
 ## Worker self_describe contract
 
+The complete worker ↔ orchestrator wire contract (capabilities, statuses and
+codes, `desired_state`, APK and discovery delivery) is in
+[CONTRACT.md](CONTRACT.md).
+
 Everything a worker reports in `self_describe` is untrusted. It is sanitized
 once on intake (enroll, nudge, ack) and only the sanitized copy is stored:
 
