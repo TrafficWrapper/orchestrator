@@ -1,0 +1,14 @@
+# Keep live state, keys and local artifacts out of the build context and the
+# build cache (ORC-M18). Only sources are needed to build the image.
+.git
+.github
+orch-state
+signer-state
+signer-run
+seed
+.env
+.env.*
+!.env.example
+*.key
+*.apk
+cmd/orchestrator/orchestrator
