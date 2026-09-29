@@ -201,6 +201,13 @@ below what they have seen, so it must never go backwards:
   (or set `ORCH_CLIENT_SEQ_FLOOR` before the first start on the restored DB).
 - Workers that are ahead of their config seq after a restore are moved past
   it automatically on their next pull, nudge or ack.
+- On every start the counter is moved above the highest worker seq, so a
+  temporary rollback to a binary that derived the client seq from worker seqs
+  never leaves the counter below what clients saw. This republishes the same
+  content once per start.
+- The signer refuses a seq more than 10,000,000 above the last one it signed,
+  so a floor further than that is refused; raise it in steps.
+  `ORCH_CLIENT_SEQ_FLOOR` is approached in such steps automatically.
 
 ## Discovery feed exposure
 
