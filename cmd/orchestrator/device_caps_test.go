@@ -11,7 +11,7 @@ import (
 
 func enrollRequestForTest(t *testing.T, s *server, req deviceEnrollRequest) deviceEnrollResponse {
 	t.Helper()
-	req.IdentityPubKey, req.IdentityKeyType, req.AWGPublicKey = "identity-pub", "ed25519", "awg-dev"
+	req.IdentityPubKey, req.IdentityKeyType, req.AWGPublicKey = "identity-pub", "ed25519", testDeviceAWGKey("awg-dev")
 	raw, _ := json.Marshal(req)
 	resp, err := s.handleDeviceEnroll(make([]byte, 32), raw)
 	if err != nil {

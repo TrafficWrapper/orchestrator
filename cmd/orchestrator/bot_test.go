@@ -343,7 +343,7 @@ func TestTelegramBotProblemNotifyDebounceCooldownRecovery(t *testing.T) {
 		ID:           deviceID,
 		Status:       "approved",
 		CreatedAt:    time.Now().UTC().Add(-time.Hour),
-		AWGPublicKey: "awg",
+		AWGPublicKey: testDeviceAWGKey("awg"),
 		InternalIP:   "10.13.13.9/32",
 		RealityUUID:  "uuid",
 	})
@@ -400,7 +400,7 @@ func TestBotProblemSnapshotIncludesQuotaAndWorkerDown(t *testing.T) {
 		Limits:         deviceLimits{TrafficQuotaBytes: 100},
 		UsageRxBytes:   100,
 		BlockedReason:  "traffic_quota_bytes",
-		AWGPublicKey:   "awg-quota",
+		AWGPublicKey:   testDeviceAWGKey("awg-quota"),
 		InternalIP:     "10.13.13.10/32",
 		RealityUUID:    "uuid-quota",
 		BootstrapToken: "bootstrap",

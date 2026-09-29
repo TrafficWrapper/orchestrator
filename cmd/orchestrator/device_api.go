@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"slices"
@@ -109,7 +110,12 @@ func (s *server) deviceEnroll(peer []byte, raw []byte) (any, error) {
 		return deviceEnrollResponse{OK: false, Error: "awg_public_key is required"}, nil
 	}
 	identityPub := strings.TrimSpace(req.IdentityPubKey)
-	awgPublic := strings.TrimSpace(req.AWGPublicKey)
+	// Workers compare AWG keys as bytes: accept only a strict 32-byte base64
+	// key and use its canonical spelling everywhere (R2).
+	awgPublic, ok := canonicalAWGKey(req.AWGPublicKey)
+	if !ok {
+		return deviceEnrollResponse{OK: false, Error: "awg_public_key is not a 32-byte base64 key"}, nil
+	}
 	id := deviceID(req.IdentityPubKey, noisePub)
 	workers, err := s.store.workers()
 	if err != nil {
@@ -130,7 +136,7 @@ func (s *server) deviceEnroll(peer []byte, raw []byte) (any, error) {
 	if err == nil {
 		storedIdentityPub := strings.TrimSpace(existing.IdentityPubKey)
 		storedNoisePub := strings.TrimSpace(existing.NoisePublicKey)
-		storedAWGPublic := strings.TrimSpace(existing.AWGPublicKey)
+		storedAWGPublic := canonicalAWGKeyOrText(existing.AWGPublicKey)
 		switch {
 		case existing.Status == "revoked":
 			return deviceEnrollResponse{OK: false, Error: "device is not approved", Code: "device_revoked"}, nil
@@ -299,4 +305,23 @@ func enrollErrorCode(text string) string {
 		return "retry"
 	}
 	return ""
+}
+
+// canonicalAWGKey decodes an AWG public key strictly (standard base64,
+// exactly 32 bytes) and returns its canonical spelling.
+func canonicalAWGKey(value string) (string, bool) {
+	raw, err := base64.StdEncoding.Strict().DecodeString(strings.TrimSpace(value))
+	if err != nil || len(raw) != 32 {
+		return "", false
+	}
+	return base64.StdEncoding.EncodeToString(raw), true
+}
+
+// canonicalAWGKeyOrText is canonicalAWGKey for stored values, falling back
+// to the trimmed text for a key stored before keys were checked.
+func canonicalAWGKeyOrText(value string) string {
+	if key, ok := canonicalAWGKey(value); ok {
+		return key
+	}
+	return strings.TrimSpace(value)
 }
