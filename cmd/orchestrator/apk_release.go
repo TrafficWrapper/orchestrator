@@ -757,18 +757,27 @@ func (s *server) apkManifestTTL() time.Duration {
 }
 
 // checkAPKPackage rejects an APK whose package differs from ORCH_APK_PACKAGE
-// or, when unset, from the current release's package.
+// or, when unset, from the current release's package. Once a package is
+// pinned, an APK whose package cannot be read is rejected too: publishing it
+// would record a release without a package and drop the implicit pin.
 func (s *server) checkAPKPackage(version apkVersionInfo) error {
-	if version.Package == "" {
-		return nil
-	}
 	expected := strings.TrimSpace(s.cfg.APKPackage)
 	if expected == "" {
-		if current, ok, err := s.store.currentAPKRelease(); err == nil && ok {
+		current, ok, err := s.store.currentAPKRelease()
+		if err != nil {
+			return fmt.Errorf("read the published app package: %w", err)
+		}
+		if ok {
 			expected = current.Package
 		}
 	}
-	if expected != "" && version.Package != expected {
+	if expected == "" {
+		return nil
+	}
+	if version.Package == "" {
+		return fmt.Errorf("could not read the APK package; the published app package is %q", expected)
+	}
+	if version.Package != expected {
 		return fmt.Errorf("APK package %q does not match the published app package %q", version.Package, expected)
 	}
 	return nil
@@ -827,6 +836,9 @@ func (s *server) reissueAPKManifestIfDue(now time.Time) (bool, error) {
 	if err != nil {
 		return false, err
 	}
+	if manifestJSON, err = keepManifestExtras(manifestJSON, raw); err != nil {
+		return false, err
+	}
 	minisig := string(minisign.Sign(priv, []byte(manifestJSON)))
 	manifest, err := parseAPKManifest(manifestJSON)
 	if err != nil {
@@ -844,6 +856,30 @@ func (s *server) reissueAPKManifestIfDue(now time.Time) (bool, error) {
 	}
 	log.Printf("re-signed update manifest seq=%d -> %d (same APK) before expiry", rel.Seq, manifest.Seq)
 	return true, nil
+}
+
+// keepManifestExtras carries every field of the original manifest that the
+// re-signed one does not set itself (mandatory, signing_cert_sha256 and
+// whatever else the release was signed with), so a re-sign only renews seq
+// and lifetime.
+func keepManifestExtras(manifestJSON string, original []byte) (string, error) {
+	var next, prev map[string]any
+	for _, doc := range []struct {
+		raw []byte
+		out *map[string]any
+	}{{[]byte(manifestJSON), &next}, {original, &prev}} {
+		dec := json.NewDecoder(strings.NewReader(string(doc.raw)))
+		dec.UseNumber()
+		if err := dec.Decode(doc.out); err != nil {
+			return "", err
+		}
+	}
+	for key, value := range prev {
+		if _, ok := next[key]; !ok {
+			next[key] = value
+		}
+	}
+	return canonicalJSON(next)
 }
 
 // runAPKManifestReissue checks the update manifest's lifetime hourly.

@@ -183,7 +183,13 @@ func (s *server) handlePull(peer []byte, raw []byte) (any, error) {
 		}
 	}
 	if req.HaveSeq >= rec.DesiredSeq {
-		return pullResponse{OK: true, Status: rec.Status, WorkerID: rec.ID, DesiredSeq: rec.DesiredSeq, NotModified: true, OrchestratorCapabilities: orchestratorCapabilities()}, nil
+		// The APK never holds back a NotModified answer (ORC-L22).
+		ref, err := s.updateRefForNotModified(rec, req.WorkerCapabilities)
+		if err != nil {
+			log.Printf("apk update_ref retry for worker %s: %v", rec.ID, err)
+			ref = nil
+		}
+		return pullResponse{OK: true, Status: rec.Status, WorkerID: rec.ID, DesiredSeq: rec.DesiredSeq, NotModified: true, UpdateRef: ref, OrchestratorCapabilities: orchestratorCapabilities()}, nil
 	}
 	wb, cb, err := s.buildBundles(rec)
 	if err != nil {

@@ -132,6 +132,19 @@ func validateAPKLimits(cfg orchConfig) error {
 	return nil
 }
 
+// apkRefApplied reports whether a worker fetching the APK by update_ref
+// already serves rel. Its chunk download ends after it acks the config, so an
+// ack says nothing about the APK: only its own distributed_apk report counts,
+// by sha256 and seq, or by sha256 alone when it reports no seq.
+func apkRefApplied(rec workerRecord, rel apkReleaseRecord) bool {
+	dist, ok := mapFromAny(rec.SelfDescribe["distributed_apk"])
+	if !ok || !strings.EqualFold(stringFromMap(dist, "apk_sha256"), rel.APKSHA256) {
+		return false
+	}
+	seq := int64(intFromMap(dist, "seq", 0))
+	return seq <= 0 || seq == rel.Seq
+}
+
 // apkReleaseApplied reports whether the worker already serves rel: by the
 // sha256 and seq it reports in distributed_apk when it reports a seq, else by
 // the legacy ack marker.
@@ -159,21 +172,17 @@ func (s *server) apkDeliveryForPull(worker workerRecord, haveSeq int64, requestC
 	if err != nil || !ok {
 		return apkDelivery{}, err
 	}
-	if haveSeq > 0 && apkReleaseApplied(worker, rel) {
-		return apkDelivery{}, nil
-	}
 	// Only the running worker's own declaration counts: a stored
 	// self_describe may predate an image downgrade.
 	if slices.Contains(requestCaps, workerCapAPKFetch) {
-		ref, err := s.cachedUpdateRef(rel)
-		if err != nil {
-			log.Printf("apk update_ref for worker %s: %v", worker.ID, err)
-			return apkDelivery{}, s.store.clearWorkerAPKSent(worker.ID)
+		if haveSeq > 0 && apkRefApplied(worker, rel) {
+			return apkDelivery{}, nil
 		}
-		if err := s.store.markWorkerAPKSent(worker.ID, rel.Seq, worker.DesiredSeq); err != nil {
-			return apkDelivery{}, err
-		}
-		return apkDelivery{ref: ref}, nil
+		ref, err := s.updateRefFor(worker, rel)
+		return apkDelivery{ref: ref}, err
+	}
+	if haveSeq > 0 && apkReleaseApplied(worker, rel) {
+		return apkDelivery{}, nil
 	}
 	if rel.APKSize > s.apkInlineMaxBytes() {
 		log.Printf("apk seq=%d (%d bytes) exceeds the inline limit; worker %s gets config only until it supports %s", rel.Seq, rel.APKSize, worker.ID, workerCapAPKFetch)
@@ -213,6 +222,34 @@ func (s *server) apkDeliveryForPull(worker workerRecord, haveSeq int64, requestC
 		return apkDelivery{}, err
 	}
 	return apkDelivery{update: update, release: release, writeTimeout: apkWriteTimeout(int64(len(update.APKBase64)))}, nil
+}
+
+// updateRefFor returns update_ref for rel. It sets no sent markers and clears
+// stale ones: the download runs after the ack, so that ack must not mark the
+// release applied (see apkRefApplied).
+func (s *server) updateRefFor(worker workerRecord, rel apkReleaseRecord) (*updateRef, error) {
+	ref, err := s.cachedUpdateRef(rel)
+	if err != nil {
+		log.Printf("apk update_ref for worker %s: %v", worker.ID, err)
+		return nil, s.store.clearWorkerAPKSent(worker.ID)
+	}
+	return ref, s.store.clearWorkerAPKSent(worker.ID)
+}
+
+// updateRefForNotModified offers update_ref again on a pull that is current
+// on config while the worker does not report the release, so a failed chunk
+// download is retried on the worker's next periodic pull, without a seq bump
+// or a config rebuild. Workers without apk_fetch_v1 get a plain NotModified,
+// as before.
+func (s *server) updateRefForNotModified(worker workerRecord, requestCaps []string) (*updateRef, error) {
+	if !slices.Contains(requestCaps, workerCapAPKFetch) {
+		return nil, nil
+	}
+	rel, ok, err := s.store.currentAPKRelease()
+	if err != nil || !ok || apkRefApplied(worker, rel) {
+		return nil, err
+	}
+	return s.updateRefFor(worker, rel)
 }
 
 // beginAPKInline records an inline shipment of rel. A worker that pulls again

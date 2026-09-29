@@ -2436,14 +2436,6 @@ func forceWorkerResync(rec *workerRecord, haveSeq int64) {
 	rec.DesiredSeq = target
 }
 
-func (s *orchStore) markWorkerAPKSent(id string, apkSeq, atSeq int64) error {
-	return s.updateWorker(id, func(rec *workerRecord) error {
-		rec.APKSentSeq = apkSeq
-		rec.APKSentAtSeq = atSeq
-		return nil
-	})
-}
-
 func (s *orchStore) updateWorker(id string, fn func(*workerRecord) error) error {
 	changed := false
 	err := s.db.Update(func(tx *bolt.Tx) error {
