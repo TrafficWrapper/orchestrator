@@ -438,17 +438,19 @@ func botProblemNoticeOnCooldown(prev, current botProblemState, key string) bool 
 	if botProblemEscalated(prev.Active[key], current.Active[key]) {
 		return false
 	}
+	_, sentHere := current.sentMono[key]
+	last := prev.LastNotified[key]
+	if !botProblemRepeats(current.Active[key].Kind) {
+		// Once per episode, however the send was recorded; LastNotified
+		// and sentMono are cleared when the recovery is announced or
+		// dropped (R2 ORC-I4).
+		return sentHere || !last.IsZero()
+	}
 	if at, ok := current.sentMono[key]; ok && !current.monoNow.IsZero() {
 		return current.monoNow.Sub(at) < botProblemRepeatCooldown
 	}
-	last := prev.LastNotified[key]
 	if last.IsZero() {
 		return false
-	}
-	if !botProblemRepeats(current.Active[key].Kind) {
-		// Already announced in this episode; LastNotified is cleared when
-		// the recovery is announced or dropped.
-		return true
 	}
 	elapsed := current.UpdatedAt.Sub(last.UTC())
 	if elapsed < -botProblemRepeatCooldown {

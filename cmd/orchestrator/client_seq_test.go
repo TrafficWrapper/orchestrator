@@ -312,3 +312,50 @@ func TestPullApplyAckLoopReachesFixedPoint(t *testing.T) {
 		lastSeq, lastDesired = st.Seq, rec.DesiredSeq
 	}
 }
+
+// R2 floor step: a floor further than the signer's seq step above the
+// counter would leave every later bundle unsignable; it is refused (raise it
+// in steps), and the ORCH_CLIENT_SEQ_FLOOR setting is approached in steps.
+func TestClientSeqFloorWithinSignerStep(t *testing.T) {
+	s := newTestServer(t)
+	addApprovedWorkerWithStatic(t, s, "floor-step")
+	if err := s.store.setAdminPassword("owner-secret-value"); err != nil {
+		t.Fatal(err)
+	}
+	bundle, _ := s.buildClientBundle()
+	seq, _ := clientBundleSeq(t, bundle)
+	raw, _ := json.Marshal(map[string]any{"floor": seq + signerMaxSeqStep + 1, "current_secret": "owner-secret-value"})
+	w := httptest.NewRecorder()
+	s.handleAdminClientSeqFloor(w, httptest.NewRequest(http.MethodPost, "/admin/v1/client-seq/floor", bytes.NewReader(raw)))
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("floor beyond the signer step: status=%d", w.Code)
+	}
+	if st, _, _ := s.store.clientBundleState(); st.Seq != seq {
+		t.Fatalf("counter moved: %d -> %d", seq, st.Seq)
+	}
+	s.cfg.ClientSeqFloor = seq + 3*signerMaxSeqStep
+	st, err := s.refreshClientBundle(true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.Seq > seq+signerMaxSeqStep || st.Seq <= seq {
+		t.Fatalf("configured floor jumped past the signer step: %d -> %d", seq, st.Seq)
+	}
+}
+
+// R2 rollback: a binary rolled back to the max(DesiredSeq) scheme may have
+// issued client seqs above the stored counter; on start the counter moves
+// above every worker seq again.
+func TestClientSeqCatchesUpWithWorkerSeqsOnStart(t *testing.T) {
+	s := newTestServer(t)
+	a := addApprovedWorkerWithStatic(t, s, "rollback-a")
+	bundle, _ := s.buildClientBundle()
+	seq, _ := clientBundleSeq(t, bundle)
+	setWorkerSeqs(t, s, a.ID, seq+40, seq+40, "")
+	if err := s.catchUpClientSeq(time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+	if st, _, _ := s.store.clientBundleState(); st.Seq <= seq+40 {
+		t.Fatalf("counter %d not above worker seqs %d", st.Seq, seq+40)
+	}
+}
