@@ -81,9 +81,6 @@ func runServe(cfg orchConfig) error {
 	background.Add(6)
 	go func() { defer background.Done(); s.runNoiseSessionJanitor(ctx) }()
 	go func() { defer background.Done(); s.runWorkerJanitor(ctx) }()
-	if err := s.catchUpClientSeq(time.Now().UTC()); err != nil {
-		log.Printf("client seq catch-up: %v", err)
-	}
 	go func() { defer background.Done(); s.runClientBundlePublisher(ctx) }()
 	go func() { defer background.Done(); s.runAPKManifestReissue(ctx) }()
 	go func() { defer background.Done(); s.runDiscoveryPublisher(ctx) }()
