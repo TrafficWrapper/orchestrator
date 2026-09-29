@@ -73,6 +73,9 @@ func (p *signerPolicy) admit(message string, namespaces ...string) error {
 	if err := json.Unmarshal([]byte(message), &doc); err != nil {
 		return errors.New("signer policy: message is not a JSON document")
 	}
+	if err := checkPolicyKeysUnambiguous(message); err != nil {
+		return err
+	}
 	allowed := false
 	for _, ns := range namespaces {
 		allowed = allowed || doc.NS == ns
@@ -115,4 +118,37 @@ func (p *signerPolicy) saveLocked() error {
 		return err
 	}
 	return writeFileAtomic(p.path, raw, 0o600)
+}
+
+// checkPolicyKeysUnambiguous refuses a document whose top level repeats a
+// key or carries a case variant of a policy key: Go's decoder matches keys
+// case-insensitively and keeps the last duplicate, other parsers may not,
+// so the signed seq must be the only one (R2 ORC-L8).
+func checkPolicyKeysUnambiguous(message string) error {
+	dec := json.NewDecoder(strings.NewReader(message))
+	if tok, err := dec.Token(); err != nil || tok != json.Delim('{') {
+		return errors.New("signer policy: message is not a JSON object")
+	}
+	seen := map[string]bool{}
+	for dec.More() {
+		tok, err := dec.Token()
+		if err != nil {
+			return errors.New("signer policy: malformed JSON")
+		}
+		key, _ := tok.(string)
+		if seen[key] {
+			return fmt.Errorf("signer policy: duplicate key %q", key)
+		}
+		seen[key] = true
+		for _, policyKey := range []string{"ns", "seq", "worker_id"} {
+			if key != policyKey && strings.EqualFold(key, policyKey) {
+				return fmt.Errorf("signer policy: ambiguous key %q", key)
+			}
+		}
+		var skip json.RawMessage
+		if err := dec.Decode(&skip); err != nil {
+			return errors.New("signer policy: malformed JSON")
+		}
+	}
+	return nil
 }

@@ -2,8 +2,10 @@ package main
 
 import (
 	"log"
+	"net/netip"
 	"sort"
 	"strings"
+	"time"
 )
 
 type awgProfile struct {
@@ -14,27 +16,59 @@ type awgProfile struct {
 	Params          map[string]any
 }
 
-// workerAWGProfiles is the fleet's AWG profile set used to allocate device
-// credentials: the union over approved, enabled workers. For each profile the
-// subnet most workers agree on wins (ties: lowest worker ID); a worker whose
-// subnet differs, or is not a sane private pool, is left out of it.
-func workerAWGProfiles(workers []workerRecord) []awgProfile {
-	profiles, _ := fleetAWGProfiles(workers)
+// The fleet's AWG profile set is used to allocate device credentials: the
+// union over approved, enabled workers. For each profile one subnet is
+// chosen; a worker whose subnet differs is left out of client routes and
+// raises an alert. The choice is stable: the subnet devices already hold
+// credentials in wins, then the one most workers use, then the one first
+// approved, so an upgrade or a new worker never moves the pool under issued
+// credentials (R2).
+
+// fleetAWGProfiles is the profile set for this fleet and its devices.
+func (s *server) fleetAWGProfiles(workers []workerRecord) []awgProfile {
+	profiles, _ := fleetAWGProfilesWith(workers, s.issuedAWGCredentials())
 	return profiles
 }
 
-// awgProfileConflictWorkers lists workers whose AWG profiles disagree with the
+// awgConflictWorkers lists workers whose AWG profiles disagree with the
 // fleet set; their AWG routes are not offered to clients.
-func awgProfileConflictWorkers(workers []workerRecord) map[string]bool {
-	_, conflicts := fleetAWGProfiles(workers)
+func (s *server) awgConflictWorkers(workers []workerRecord) map[string]bool {
+	_, conflicts := fleetAWGProfilesWith(workers, s.issuedAWGCredentials())
 	return conflicts
 }
 
-func fleetAWGProfiles(workers []workerRecord) ([]awgProfile, map[string]bool) {
+// issuedAWGCredentials counts the approved devices holding credentials for
+// profile name inside subnet.
+func (s *server) issuedAWGCredentials() func(name, subnet string) int {
+	devices, err := s.store.approvedDevices()
+	if err != nil || len(devices) == 0 {
+		return nil
+	}
+	return func(name, subnet string) int {
+		prefix, err := netip.ParsePrefix(subnet)
+		if err != nil {
+			return 0
+		}
+		n := 0
+		for _, device := range devices {
+			ip := device.AWGProfiles[name].InternalIP
+			if ip == "" && name == "awg" {
+				ip = device.InternalIP
+			}
+			if addr, err := netip.ParseAddr(strings.TrimSuffix(strings.TrimSpace(ip), "/32")); err == nil && prefix.Contains(addr) {
+				n++
+			}
+		}
+		return n
+	}
+}
+
+func fleetAWGProfilesWith(workers []workerRecord, issued func(name, subnet string) int) ([]awgProfile, map[string]bool) {
 	type candidate struct {
-		profile awgProfile
-		votes   int
-		firstID string
+		profile       awgProfile
+		votes         int
+		firstApproved time.Time
+		issued        int
 	}
 	eligible := make([]workerRecord, 0, len(workers))
 	for _, rec := range workers {
@@ -48,6 +82,10 @@ func fleetAWGProfiles(workers []workerRecord) ([]awgProfile, map[string]bool) {
 	bySubnet := map[string]map[string]*candidate{}
 	workerSubnets := map[string]map[string]string{}
 	for _, rec := range eligible {
+		approved := rec.CreatedAt
+		if rec.ApprovedAt != nil {
+			approved = *rec.ApprovedAt
+		}
 		for _, profile := range awgProfilesFromWorker(rec) {
 			subnet := strings.TrimSpace(profile.Subnet)
 			if subnet == "" {
@@ -67,28 +105,44 @@ func fleetAWGProfiles(workers []workerRecord) ([]awgProfile, map[string]bool) {
 			}
 			c := bySubnet[profile.Name][subnet]
 			if c == nil {
-				c = &candidate{profile: profile, firstID: rec.ID}
+				c = &candidate{profile: profile, firstApproved: approved}
+				if issued != nil {
+					c.issued = issued(profile.Name, subnet)
+				}
 				bySubnet[profile.Name][subnet] = c
 			}
 			c.votes++
+			if approved.Before(c.firstApproved) {
+				c.firstApproved = approved
+			}
 			if workerSubnets[rec.ID] == nil {
 				workerSubnets[rec.ID] = map[string]string{}
 			}
 			workerSubnets[rec.ID][profile.Name] = subnet
 		}
 	}
+	better := func(a, b *candidate) bool {
+		switch {
+		case a.issued != b.issued:
+			return a.issued > b.issued
+		case a.votes != b.votes:
+			return a.votes > b.votes
+		case !a.firstApproved.Equal(b.firstApproved):
+			return a.firstApproved.Before(b.firstApproved)
+		}
+		return a.profile.Subnet < b.profile.Subnet
+	}
 	out := make([]awgProfile, 0, len(names))
 	for _, name := range names {
 		var best *candidate
 		for _, c := range bySubnet[name] {
-			if best == nil || c.votes > best.votes || c.votes == best.votes && c.firstID < best.firstID {
+			if best == nil || better(c, best) {
 				best = c
 			}
 		}
 		out = append(out, best.profile)
 		for workerID, subnets := range workerSubnets {
 			if subnet, ok := subnets[name]; ok && subnet != best.profile.Subnet {
-				log.Printf("awg profiles: worker %s profile %s subnet %s conflicts with fleet %s; its AWG is not offered", workerID, name, subnet, best.profile.Subnet)
 				conflicts[workerID] = true
 			}
 		}
