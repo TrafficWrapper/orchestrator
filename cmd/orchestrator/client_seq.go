@@ -6,7 +6,6 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"log"
 	"net/http"
 	"strconv"
@@ -147,11 +146,6 @@ func (s *orchStore) publishClientContent(contentJSON string, now time.Time, ttl 
 			return s.putClientBundleStateTx(tx, st)
 		default:
 			st.Seq++
-		}
-		// The configured floor is approached within the signer's seq step:
-		// a larger jump could never be signed (R2).
-		if !first {
-			floor = min(floor, st.Seq+signerMaxSeqStep)
 		}
 		st.Seq = max(st.Seq, floor)
 		st.ContentJSON = contentJSON
@@ -329,12 +323,6 @@ func (s *server) handleAdminClientSeqFloor(w http.ResponseWriter, r *http.Reques
 		writeStoreError(w, http.StatusInternalServerError, err)
 		return
 	}
-	// The signer refuses seqs more than signerMaxSeqStep above the last one
-	// it signed; a larger floor would leave every later bundle unsignable.
-	if current, _, err := s.store.clientBundleState(); err == nil && req.Floor > current.Seq+signerMaxSeqStep {
-		writeError(w, fmt.Sprintf("floor is more than %d above the current seq %d; raise it in steps", signerMaxSeqStep, current.Seq), http.StatusBadRequest)
-		return
-	}
 	if !s.stepUp(w, r, "client_seq_floor", "raise client config seq to "+strconv.FormatInt(req.Floor, 10), req.stepUpProof) {
 		return
 	}
@@ -345,32 +333,4 @@ func (s *server) handleAdminClientSeqFloor(w http.ResponseWriter, r *http.Reques
 	}
 	s.auditEvent(auditEntry{Event: "client_seq_floor", IP: clientIP(r), Result: "ok", Fields: map[string]string{"seq": strconv.FormatInt(st.Seq, 10), "raised": strconv.FormatBool(raised)}})
 	writeJSON(w, map[string]any{"ok": true, "seq": st.Seq, "raised": raised})
-}
-
-// catchUpClientSeq moves the counter above every worker seq at start. A
-// binary rolled back to the old max(DesiredSeq) scheme may have handed
-// clients seqs above the stored counter; after upgrading again the counter
-// must not publish below them (R2). The jump stays within the signer step.
-func (s *server) catchUpClientSeq(now time.Time) error {
-	st, found, err := s.store.clientBundleState()
-	if err != nil || !found {
-		return err
-	}
-	workers, err := s.store.workers()
-	if err != nil {
-		return err
-	}
-	var highest int64
-	for _, rec := range workers {
-		highest = max(highest, rec.DesiredSeq, rec.AppliedSeq)
-	}
-	if highest < st.Seq {
-		return nil
-	}
-	target := min(highest+1, st.Seq+signerMaxSeqStep)
-	if target <= st.Seq {
-		return nil
-	}
-	_, _, err = s.store.raiseClientSeq(target, now)
-	return err
 }
