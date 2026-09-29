@@ -231,6 +231,6 @@ func TestAdminWorkerRevokeRequiresStepUp(t *testing.T) {
 
 func enrollTestDevice(t *testing.T, s *server) string {
 	t.Helper()
-	putQuotaDevice(t, s, deviceRecord{ID: "rev-dev", Status: "approved", AWGPublicKey: testDeviceAWGKey("k"), RealityUUID: "u", InternalIP: "10.13.13.10/32", CreatedAt: time.Now().UTC(), ConfigSeq: 1})
+	putQuotaDevice(t, s, deviceRecord{ID: "rev-dev", Status: "approved", AWGPublicKey: "k", RealityUUID: "u", InternalIP: "10.13.13.10/32", CreatedAt: time.Now().UTC(), ConfigSeq: 1})
 	return "rev-dev"
 }

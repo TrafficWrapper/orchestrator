@@ -48,7 +48,7 @@ func TestHeartbeatSkipsRedundantWrites(t *testing.T) {
 func TestRecordAckReturnsSeqAfterQuotaBump(t *testing.T) {
 	s := newTestServer(t)
 	w := addApprovedWorkerWithStatic(t, s, "ack-worker")
-	putQuotaDevice(t, s, deviceRecord{ID: "q-dev", Status: "approved", AWGPublicKey: testDeviceAWGKey("k"), RealityUUID: "u", InternalIP: "10.13.13.10/32", Limits: deviceLimits{TrafficQuotaBytes: 10}, CreatedAt: time.Now().UTC(), ConfigSeq: 1})
+	putQuotaDevice(t, s, deviceRecord{ID: "q-dev", Status: "approved", AWGPublicKey: "k", RealityUUID: "u", InternalIP: "10.13.13.10/32", Limits: deviceLimits{TrafficQuotaBytes: 10}, CreatedAt: time.Now().UTC(), ConfigSeq: 1})
 	rec, _ := s.store.worker(w.ID)
 	now := time.Now().UTC()
 	if _, _, err := s.store.recordAck(w.ID, rec.DesiredSeq, "ok", "", nil, nil, []deviceUsage{{DeviceID: "q-dev"}}, now); err != nil {

@@ -17,7 +17,7 @@ func enrollVersionWithCapabilities(t *testing.T, s *server, token, version strin
 	t.Helper()
 	raw, _ := json.Marshal(deviceEnrollRequest{
 		BootstrapToken: token, IdentityPubKey: "identity-pub", IdentityKeyType: "ed25519",
-		ClientVersion: version, AWGPublicKey: testDeviceAWGKey("awg-dev"), Capabilities: caps,
+		ClientVersion: version, AWGPublicKey: "awg-dev", Capabilities: caps,
 	})
 	resp, err := s.handleDeviceEnroll(make([]byte, 32), raw)
 	if err != nil {

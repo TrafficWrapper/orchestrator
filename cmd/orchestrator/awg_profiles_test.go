@@ -97,7 +97,7 @@ func enrollDeviceForTestWithVersion(t *testing.T, s *server, token, version stri
 		DeviceID:        "android-id",
 		IdentityPubKey:  "identity-pub",
 		IdentityKeyType: "ed25519",
-		AWGPublicKey:    testDeviceAWGKey("device-awg-public"),
+		AWGPublicKey:    "device-awg-public",
 		ClientVersion:   version,
 	})
 	resp, err := s.handleDeviceEnroll(make([]byte, 32), raw)
