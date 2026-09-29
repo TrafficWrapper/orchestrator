@@ -370,10 +370,8 @@ func validateAWGSection(name string, section map[string]any, report *selfDescrib
 		}
 	}
 	if subnet := stringFromMap(section, "subnet"); subnet != "" {
-		if prefix, err := validAWGSubnet(subnet); err != nil {
+		if _, err := validAWGSubnet(subnet); err != nil {
 			report.add("%s.subnet: %v", name, err)
-		} else if warning := awgSubnetWarning(prefix); warning != "" {
-			report.add("%s.subnet: %s", name, warning)
 		}
 	}
 }
@@ -450,10 +448,8 @@ func validStdBase64Key(value string) bool {
 	return err == nil && len(raw) == 32
 }
 
-// validAWGSubnet accepts any IPv4 pool, like the worker does: device
-// addresses can be allocated in it. Pools outside the recommended shape are
-// only warned about (awgSubnetWarning), never dropped, so a worker that
-// worked before an upgrade keeps working (R2).
+// validAWGSubnet accepts a private IPv4 pool large enough to be useful and
+// small enough to bound allocation scans.
 func validAWGSubnet(value string) (netip.Prefix, error) {
 	prefix, err := netip.ParsePrefix(strings.TrimSpace(value))
 	if err != nil {
@@ -463,22 +459,13 @@ func validAWGSubnet(value string) (netip.Prefix, error) {
 	if !prefix.Addr().Is4() {
 		return netip.Prefix{}, fmt.Errorf("not IPv4")
 	}
-	if prefix.Bits() > 30 {
-		return netip.Prefix{}, fmt.Errorf("no room for devices")
-	}
-	return prefix, nil
-}
-
-// awgSubnetWarning describes how a pool departs from the recommended
-// private /16../26 range ("" when it does not).
-func awgSubnetWarning(prefix netip.Prefix) string {
 	if !prefix.Addr().IsPrivate() && !netip.MustParsePrefix("100.64.0.0/10").Contains(prefix.Addr()) {
-		return "not a private range"
+		return netip.Prefix{}, fmt.Errorf("not a private range")
 	}
 	if prefix.Bits() > 26 || prefix.Bits() < 16 {
-		return "outside the recommended /16../26 size"
+		return netip.Prefix{}, fmt.Errorf("size must be /16../26")
 	}
-	return ""
+	return prefix, nil
 }
 
 // validDistributorURL matches what workers use for their distributor: an

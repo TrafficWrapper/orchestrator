@@ -115,14 +115,8 @@ func (s *server) deviceEnroll(peer []byte, raw []byte) (any, error) {
 	if err != nil {
 		return nil, err
 	}
-	awgProfiles := s.fleetAWGProfiles(workers)
+	awgProfiles := workerAWGProfiles(workers)
 	serverAWGPublic := workerAWGPublicKeyFromProfiles(awgProfiles)
-	if serverAWGPublic == "" {
-		// No usable AWG profile (every pool unusable or conflicting): enroll
-		// on the default pool with any worker's AWG key rather than failing
-		// every enroll and re-enroll.
-		serverAWGPublic = anyWorkerAWGPublicKey(workers)
-	}
 	if serverAWGPublic == "" {
 		return deviceEnrollResponse{OK: false, Error: "no approved worker with awg public key"}, nil
 	}

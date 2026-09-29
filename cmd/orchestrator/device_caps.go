@@ -212,7 +212,7 @@ func (s *server) backfillAWGCredentials() (int, error) {
 	if err != nil {
 		return 0, err
 	}
-	return s.store.backfillDeviceAWGProfiles(s.fleetAWGProfiles(workers))
+	return s.store.backfillDeviceAWGProfiles(workerAWGProfiles(workers))
 }
 
 // runAWGCredentialBackfill keeps device credentials in step with the fleet's

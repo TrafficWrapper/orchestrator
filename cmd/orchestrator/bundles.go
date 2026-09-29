@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
-	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -69,7 +68,7 @@ func (s *server) clientBundleContent() (map[string]any, error) {
 	}
 	now := time.Now().UTC()
 	items := []any{}
-	awgExcluded := s.awgConflictWorkers(workers)
+	awgExcluded := awgProfileConflictWorkers(workers)
 	for _, rec := range workers {
 		// Clients are only sent to workers heard from recently; an inactive
 		// worker keeps its devices but is not offered as a route.
@@ -345,22 +344,6 @@ func approvedDevicePayloads(devices []deviceRecord) []any {
 		out = append(out, payload)
 	}
 	return out
-}
-
-// anyWorkerAWGPublicKey is the base AWG key of the first serving worker that
-// has one, whatever its pool.
-func anyWorkerAWGPublicKey(workers []workerRecord) string {
-	sorted := slices.Clone(workers)
-	slices.SortFunc(sorted, func(a, b workerRecord) int { return strings.Compare(a.ID, b.ID) })
-	for _, rec := range sorted {
-		if !workerGetsDevices(rec) || rec.SelfDescribeForbidden {
-			continue
-		}
-		if key := workerAWGPublicKeyFromProfiles(awgProfilesFromWorker(rec)); key != "" {
-			return key
-		}
-	}
-	return ""
 }
 
 func workerAWGPublicKeyFromProfiles(profiles []awgProfile) string {

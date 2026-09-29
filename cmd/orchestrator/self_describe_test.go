@@ -224,7 +224,7 @@ func TestFleetAWGProfilesUnionAndConflicts(t *testing.T) {
 		awgWorker("20-c", "10.13.13.0/24", map[string]any{"profile": "awg2", "subnet": "10.14.14.0/24", "min_version_code": 131}),
 		awgWorker("30-d", "10.99.0.0/24"),
 	}
-	profiles, conflicts := fleetAWGProfilesWith(workers, nil)
+	profiles, conflicts := fleetAWGProfiles(workers)
 	got := map[string]string{}
 	for _, p := range profiles {
 		got[p.Name] = p.Subnet
