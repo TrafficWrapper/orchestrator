@@ -20,7 +20,7 @@ func enrollWithIdentityForTest(t *testing.T, s *server, token, identity, awgPubl
 		BootstrapToken:  token,
 		IdentityPubKey:  identity,
 		IdentityKeyType: "ed25519",
-		AWGPublicKey:    testDeviceAWGKeyOf(awgPublic),
+		AWGPublicKey:    awgPublic,
 		ClientVersion:   "0.1.31",
 	})
 	resp, err := s.handleDeviceEnroll(make([]byte, 32), raw)
@@ -238,7 +238,7 @@ func TestExpiryJanitorSkipsPassAfterClockJump(t *testing.T) {
 		t.Fatal(err)
 	}
 	expires := now.Add(24 * time.Hour).Format(time.RFC3339)
-	putQuotaDevice(t, s, deviceRecord{ID: "twpk_jump", Status: "approved", Limits: deviceLimits{ExpiresAt: &expires}, AWGPublicKey: testDeviceAWGKey("awg-jump"), InternalIP: "10.13.13.20/32", RealityUUID: "uuid-jump"})
+	putQuotaDevice(t, s, deviceRecord{ID: "twpk_jump", Status: "approved", Limits: deviceLimits{ExpiresAt: &expires}, AWGPublicKey: "awg-jump", InternalIP: "10.13.13.20/32", RealityUUID: "uuid-jump"})
 
 	s.expiryJanitorPass(now, 0)
 	s.expiryJanitorPass(now.Add(30*24*time.Hour), 30*time.Second)
@@ -264,7 +264,7 @@ func TestExpiryJanitorLiftsBlockWhenExpiryNotReached(t *testing.T) {
 	future := now.Add(24 * time.Hour).Format(time.RFC3339)
 	blockedAt := now.Add(-time.Minute)
 	base := func(id string) deviceRecord {
-		return deviceRecord{ID: id, Status: "revoked", BlockedAt: &blockedAt, Limits: deviceLimits{ExpiresAt: &future}, AWGPublicKey: testDeviceAWGKey("awg-" + id), InternalIP: "10.13.13.30/32", RealityUUID: "uuid-" + id}
+		return deviceRecord{ID: id, Status: "revoked", BlockedAt: &blockedAt, Limits: deviceLimits{ExpiresAt: &future}, AWGPublicKey: "awg-" + id, InternalIP: "10.13.13.30/32", RealityUUID: "uuid-" + id}
 	}
 	auto := base("twpk_auto")
 	auto.BlockedReason, auto.BlockOrigin = "expires_at", deviceBlockOriginAuto
@@ -553,7 +553,7 @@ func TestBotProblemOfflineAlertOncePerEpisode(t *testing.T) {
 // ORC-I4: a steady problem set does not rewrite the stored state each poll.
 func TestBotProblemStateNotRewrittenWhenSteady(t *testing.T) {
 	s := newTestServer(t)
-	putQuotaDevice(t, s, deviceRecord{ID: "twpk_steady", Status: "approved", AWGPublicKey: testDeviceAWGKey("awg"), InternalIP: "10.13.13.9/32", RealityUUID: "uuid"})
+	putQuotaDevice(t, s, deviceRecord{ID: "twpk_steady", Status: "approved", AWGPublicKey: "awg", InternalIP: "10.13.13.9/32", RealityUUID: "uuid"})
 	if err := s.store.setTelemetrySnapshot(telemetrySnapshotRecord{DeviceID: "twpk_steady", ReceivedAt: time.Now().UTC().Add(-botProblemDeviceOfflineAfter - time.Minute)}); err != nil {
 		t.Fatal(err)
 	}

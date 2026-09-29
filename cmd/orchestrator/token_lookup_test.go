@@ -103,7 +103,7 @@ func TestConsumeBootstrapTokenRejectsExistingDeviceWithoutBurningToken(t *testin
 	if _, err := s.store.createBootstrapToken("boot-b", time.Now().Add(time.Hour), nil, nil); err != nil {
 		t.Fatal(err)
 	}
-	dev := deviceRecord{ID: "dev-race", IdentityPubKey: "id", NoisePublicKey: "np", AWGPublicKey: testDeviceAWGKey("awg")}
+	dev := deviceRecord{ID: "dev-race", IdentityPubKey: "id", NoisePublicKey: "np", AWGPublicKey: "awg"}
 	if _, _, err := s.store.consumeBootstrapToken("boot-a", dev, nil); err != nil {
 		t.Fatal(err)
 	}

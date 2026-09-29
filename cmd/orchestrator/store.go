@@ -2644,7 +2644,7 @@ func (x *deviceIPIndex) load() error {
 			}
 		}
 		for _, key := range deviceAWGKeys(rec) {
-			if key = canonicalAWGKeyOrText(key); key != "" {
+			if key != "" {
 				owners[key] = string(k)
 			}
 		}
@@ -2667,7 +2667,7 @@ func (x *deviceIPIndex) awgKeyOwnedByOther(key, id string) (bool, error) {
 	if err := x.load(); err != nil {
 		return false, err
 	}
-	owner, ok := x.awgOwners[canonicalAWGKeyOrText(key)]
+	owner, ok := x.awgOwners[strings.TrimSpace(key)]
 	return ok && owner != id, nil
 }
 

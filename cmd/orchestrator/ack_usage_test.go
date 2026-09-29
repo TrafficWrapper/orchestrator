@@ -10,8 +10,8 @@ func TestApplyReportedDeviceUsageMatchesFullSweep(t *testing.T) {
 		name   string
 		report deviceUsage
 	}{
-		{"by device id", deviceUsage{DeviceID: "device-a", AWGPublicKey: testDeviceAWGKey("awg-pub-a")}},
-		{"legacy awg key only", deviceUsage{AWGPublicKey: testDeviceAWGKey("awg-pub-a")}},
+		{"by device id", deviceUsage{DeviceID: "device-a", AWGPublicKey: "awg-pub-a"}},
+		{"legacy awg key only", deviceUsage{AWGPublicKey: "awg-pub-a"}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			s := newTestServer(t)
@@ -20,7 +20,7 @@ func TestApplyReportedDeviceUsageMatchesFullSweep(t *testing.T) {
 				putQuotaDevice(t, s, deviceRecord{
 					ID:           id,
 					Status:       "approved",
-					AWGPublicKey: testDeviceAWGKey("awg-pub-" + id[len(id)-1:]),
+					AWGPublicKey: "awg-pub-" + id[len(id)-1:],
 					InternalIP:   "10.13.13.10/32",
 					RealityUUID:  "uuid-" + id,
 					Limits:       deviceLimits{TrafficQuotaBytes: 100},
