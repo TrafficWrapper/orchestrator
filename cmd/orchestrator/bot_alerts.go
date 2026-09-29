@@ -121,6 +121,13 @@ func (s *server) botProblemSnapshot(now time.Time) (map[string]botProblemEntry, 
 			out[botProblemKey(entry)] = entry
 		}
 	}
+	// A worker whose AWG pool disagrees with the fleet's is left out of
+	// client AWG routes; say so instead of only logging it (R2).
+	for id := range s.awgConflictWorkers(workers) {
+		entry := botProblemEntry{Scope: "worker", ID: id, Kind: "worker_awg_conflict", Label: botEntityLabel("", id),
+			Detail: "AWG subnet differs from the fleet's; its AWG is not offered to clients"}
+		out[botProblemKey(entry)] = entry
+	}
 	return out, nil
 }
 
