@@ -63,11 +63,6 @@ func (s *server) issuedAWGCredentials() func(name, subnet string) int {
 	}
 }
 
-// fleetAWGProfiles without issued credentials (tests, first start).
-func fleetAWGProfiles(workers []workerRecord) ([]awgProfile, map[string]bool) {
-	return fleetAWGProfilesWith(workers, nil)
-}
-
 func fleetAWGProfilesWith(workers []workerRecord, issued func(name, subnet string) int) ([]awgProfile, map[string]bool) {
 	type candidate struct {
 		profile       awgProfile
