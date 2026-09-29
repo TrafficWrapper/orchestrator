@@ -183,12 +183,9 @@ type deviceRecord struct {
 	// (diagnostics only).
 	ClientVersionCode int `json:"client_version_code,omitempty"`
 	// ClientCapabilities is the capability list the app sent at enrollment.
-	ClientCapabilities []string `json:"client_capabilities,omitempty"`
-	AWGPublicKey       string   `json:"awg_public_key,omitempty"`
-	RealityUUID        string   `json:"reality_uuid,omitempty"`
-	// CredentialRotation is "pending" while a rotation waits for the next
-	// re-enrollment (see device_rotation.go).
-	CredentialRotation string                        `json:"credential_rotation,omitempty"`
+	ClientCapabilities []string                      `json:"client_capabilities,omitempty"`
+	AWGPublicKey       string                        `json:"awg_public_key,omitempty"`
+	RealityUUID        string                        `json:"reality_uuid,omitempty"`
 	InternalIP         string                        `json:"internal_ip,omitempty"`
 	PSK2               string                        `json:"psk2,omitempty"`
 	AWGProfiles        map[string]deviceAWGProfile   `json:"awg_profiles,omitempty"`

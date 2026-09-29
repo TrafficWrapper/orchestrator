@@ -275,13 +275,8 @@ directory and start it again.
    accounts on its normal apply path; after it acks that config (or after 10
    minutes) it is refused too. Live sessions on an old worker survive until
    they reconnect, and the worker still knows every REALITY UUID it served.
-3. Rotate affected per-device transport material:
-   `POST /admin/v1/devices/rotate-credentials {"ids": [...] | "all": true, "current_secret": ..., "totp_code": ...}`
-   (step-up). Each device gets a new REALITY UUID and new AWG pre-shared keys
-   at its next re-enrollment, returned in that same response, so it never
-   loses its routes. Add `"immediate": true` to change them at once instead:
-   the old values stop working right away and each device reconnects after it
-   re-enrolls. Re-enrollment alone does not rotate anything.
+3. Rotate affected per-device transport material: re-enroll the devices the
+   worker served so their REALITY UUIDs and AWG credentials change.
 4. Remove the worker from seed workers.
 5. Preserve logs/state privately for incident analysis.
 
