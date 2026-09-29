@@ -272,8 +272,13 @@ self-signed). Сертификаты прежних релизов содерж�
    конфига (или через 10 минут) он тоже получает отказ. Живые сессии на
    старом worker остаются до переподключения, а все REALITY UUID, которые он
    обслуживал, ему известны.
-3. Ротируйте затронутый per-device transport material: заново проведите
-   enroll устройств этого worker, чтобы сменились REALITY UUID и учётки AWG.
+3. Ротируйте затронутый per-device transport material:
+   `POST /admin/v1/devices/rotate-credentials {"ids": [...] | "all": true, "current_secret": ..., "totp_code": ...}`
+   (step-up). Каждое устройство получит новый REALITY UUID и новые AWG PSK при
+   следующем re-enroll — в том же ответе, так что маршруты не теряются. С
+   `"immediate": true` они меняются сразу: старые значения перестают работать,
+   устройство переподключится после re-enroll. Сам по себе re-enroll ничего не
+   ротирует.
 4. Уберите worker из seed workers.
 5. Сохраните logs/state приватно для incident analysis.
 
