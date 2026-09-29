@@ -8,7 +8,7 @@ import (
 func TestApprovedDevicesCacheFollowsConfigRevision(t *testing.T) {
 	s := newTestServer(t)
 	w := addApprovedWorkerWithStatic(t, s, "cache-worker")
-	dev := deviceRecord{ID: "dev-c", Status: "approved", RealityUUID: "u", AWGPublicKey: "k", InternalIP: "10.13.13.10/32", CreatedAt: time.Now().UTC()}
+	dev := deviceRecord{ID: "dev-c", Status: "approved", RealityUUID: "u", AWGPublicKey: testDeviceAWGKey("k"), InternalIP: "10.13.13.10/32", CreatedAt: time.Now().UTC()}
 	putQuotaDevice(t, s, dev)
 	first, err := s.store.approvedDevices()
 	if err != nil || len(first) != 1 {

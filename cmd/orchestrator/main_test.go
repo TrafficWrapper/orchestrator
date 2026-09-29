@@ -119,7 +119,7 @@ func TestDeviceEnrollConsumesBootstrapOnceAndReturnsClientConfig(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(workerBundle.ConfigJSON, resp.RealityUUID) || !strings.Contains(workerBundle.ConfigJSON, "device-awg-public") {
+	if !strings.Contains(workerBundle.ConfigJSON, resp.RealityUUID) || !strings.Contains(workerBundle.ConfigJSON, testDeviceAWGKey("device-awg-public")) {
 		t.Fatalf("worker config does not contain approved device: %s", workerBundle.ConfigJSON)
 	}
 	used := bootstrapTokenForTest(t, s, token.ID)
@@ -167,7 +167,7 @@ func TestBootstrapTokenConcurrentConsumeDoesNotExceedMaxUses(t *testing.T) {
 				ID:             id,
 				Status:         "approved",
 				IdentityPubKey: id + "-identity",
-				AWGPublicKey:   id + "-awg",
+				AWGPublicKey:   testDeviceAWGKey(id + "-awg"),
 				RealityUUID:    id + "-uuid",
 				InternalIP:     "10.13.13.10/32",
 				PSK2:           id + "-psk",
@@ -532,7 +532,7 @@ func TestDeviceEnrollHTTPNoiseEndToEnd(t *testing.T) {
 		IdentityPubKey:  "identity-http",
 		IdentityKeyType: "ed25519",
 		EnrollmentNonce: "nonce-http",
-		AWGPublicKey:    "device-awg-public",
+		AWGPublicKey:    testDeviceAWGKey("device-awg-public"),
 	}, &resp)
 	if !resp.OK {
 		t.Fatalf("http noise enroll failed: %+v", resp)
@@ -545,7 +545,7 @@ func TestDeviceEnrollHTTPNoiseEndToEnd(t *testing.T) {
 	noiseCallForTest(t, ts.URL, static.Public, clientStatic, "/d/v1/enroll", deviceEnrollRequest{
 		BootstrapToken: secret,
 		IdentityPubKey: "identity-http-2",
-		AWGPublicKey:   "device-awg-public-2",
+		AWGPublicKey:   testDeviceAWGKey("device-awg-public-2"),
 	}, &replay)
 	if replay.OK {
 		t.Fatalf("replay accepted over http noise: %+v", replay)
@@ -583,7 +583,7 @@ func TestWorkerTelemetryRequiresDeviceSignatureAndStoresSnapshot(t *testing.T) {
 		Model:           "A15",
 		EnrollmentNonce: "nonce",
 		ClientVersion:   "public-test",
-		AWGPublicKey:    "device-awg-public",
+		AWGPublicKey:    testDeviceAWGKey("device-awg-public"),
 	})
 	enrollRaw, err := s.handleDeviceEnroll(make([]byte, 32), rawEnroll)
 	if err != nil {

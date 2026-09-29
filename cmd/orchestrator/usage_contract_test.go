@@ -10,12 +10,12 @@ import (
 // dropped; the first report under any key is a baseline.
 func TestAckUsageLegacyAndNewFormats(t *testing.T) {
 	s := newTestServer(t)
-	putQuotaDevice(t, s, deviceRecord{ID: "dev-legacy", Status: "approved", AWGPublicKey: "k-legacy", CreatedAt: time.Now().UTC(), ConfigSeq: 1})
-	putQuotaDevice(t, s, deviceRecord{ID: "dev-new", Status: "approved", AWGPublicKey: "k-new", CreatedAt: time.Now().UTC(), ConfigSeq: 1})
+	putQuotaDevice(t, s, deviceRecord{ID: "dev-legacy", Status: "approved", AWGPublicKey: testDeviceAWGKey("k-legacy"), CreatedAt: time.Now().UTC(), ConfigSeq: 1})
+	putQuotaDevice(t, s, deviceRecord{ID: "dev-new", Status: "approved", AWGPublicKey: testDeviceAWGKey("k-new"), CreatedAt: time.Now().UTC(), ConfigSeq: 1})
 	now := time.Now().UTC()
 	report := func(rx uint64) []deviceUsage {
 		return []deviceUsage{
-			{AWGPublicKey: "k-legacy", RxBytes: rx},
+			{AWGPublicKey: testDeviceAWGKey("k-legacy"), RxBytes: rx},
 			{DeviceID: "dev-new", Source: "awg", RxBytes: rx},
 			{DeviceID: "dev-new", Source: "wireguard-v9", RxBytes: 999999},
 		}

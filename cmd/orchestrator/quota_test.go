@@ -13,7 +13,7 @@ func TestApplyDeviceUsageBlocksAtQuotaAndIsIdempotent(t *testing.T) {
 	putQuotaDevice(t, s, deviceRecord{
 		ID:           "device-a",
 		Status:       "approved",
-		AWGPublicKey: "awg-pub-a",
+		AWGPublicKey: testDeviceAWGKey("awg-pub-a"),
 		InternalIP:   "10.13.13.10/32",
 		RealityUUID:  "uuid-a",
 		Limits:       deviceLimits{TrafficQuotaBytes: 100},
@@ -63,7 +63,7 @@ func TestApplyDeviceUsageQuotaZeroDoesNotBlock(t *testing.T) {
 	putQuotaDevice(t, s, deviceRecord{
 		ID:           "device-a",
 		Status:       "approved",
-		AWGPublicKey: "awg-pub-a",
+		AWGPublicKey: testDeviceAWGKey("awg-pub-a"),
 		InternalIP:   "10.13.13.10/32",
 		RealityUUID:  "uuid-a",
 		Limits:       deviceLimits{TrafficQuotaBytes: 0},
@@ -95,7 +95,7 @@ func TestApplyDeviceUsageSumsPerWorkerAndRebasesOnReset(t *testing.T) {
 	putQuotaDevice(t, s, deviceRecord{
 		ID:           "device-a",
 		Status:       "approved",
-		AWGPublicKey: "awg-pub-a",
+		AWGPublicKey: testDeviceAWGKey("awg-pub-a"),
 		InternalIP:   "10.13.13.10/32",
 		RealityUUID:  "uuid-a",
 		Limits:       deviceLimits{TrafficQuotaBytes: 0},
@@ -104,42 +104,42 @@ func TestApplyDeviceUsageSumsPerWorkerAndRebasesOnReset(t *testing.T) {
 	})
 	now := time.Now().UTC()
 	if _, err := s.store.applyDeviceUsageAndBlocks("worker-a", []deviceUsage{{
-		AWGPublicKey: "awg-pub-a",
+		AWGPublicKey: testDeviceAWGKey("awg-pub-a"),
 		RxBytes:      0,
 		TxBytes:      0,
 	}}, now); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := s.store.applyDeviceUsageAndBlocks("worker-b", []deviceUsage{{
-		AWGPublicKey: "awg-pub-a",
+		AWGPublicKey: testDeviceAWGKey("awg-pub-a"),
 		RxBytes:      0,
 		TxBytes:      0,
 	}}, now); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := s.store.applyDeviceUsageAndBlocks("worker-a", []deviceUsage{{
-		AWGPublicKey: "awg-pub-a",
+		AWGPublicKey: testDeviceAWGKey("awg-pub-a"),
 		RxBytes:      50,
 		TxBytes:      5,
 	}}, now); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := s.store.applyDeviceUsageAndBlocks("worker-b", []deviceUsage{{
-		AWGPublicKey: "awg-pub-a",
+		AWGPublicKey: testDeviceAWGKey("awg-pub-a"),
 		RxBytes:      50,
 		TxBytes:      5,
 	}}, now); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := s.store.applyDeviceUsageAndBlocks("worker-b", []deviceUsage{{
-		AWGPublicKey: "awg-pub-a",
+		AWGPublicKey: testDeviceAWGKey("awg-pub-a"),
 		RxBytes:      50,
 		TxBytes:      5,
 	}}, now); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := s.store.applyDeviceUsageAndBlocks("worker-a", []deviceUsage{{
-		AWGPublicKey: "awg-pub-a",
+		AWGPublicKey: testDeviceAWGKey("awg-pub-a"),
 		RxBytes:      10,
 		TxBytes:      1,
 	}}, now); err != nil {
@@ -162,7 +162,7 @@ func TestApplyDeviceUsageCountsRealityAndBlocksAtQuota(t *testing.T) {
 	putQuotaDevice(t, s, deviceRecord{
 		ID:           "device-a",
 		Status:       "approved",
-		AWGPublicKey: "awg-pub-a",
+		AWGPublicKey: testDeviceAWGKey("awg-pub-a"),
 		RealityUUID:  "uuid-a",
 		Limits:       deviceLimits{TrafficQuotaBytes: 100},
 		CreatedAt:    time.Now().UTC(),
@@ -201,7 +201,7 @@ func TestApplyDeviceUsageSumsAWGAndRealitySources(t *testing.T) {
 	putQuotaDevice(t, s, deviceRecord{
 		ID:           "device-a",
 		Status:       "approved",
-		AWGPublicKey: "awg-pub-a",
+		AWGPublicKey: testDeviceAWGKey("awg-pub-a"),
 		RealityUUID:  "uuid-a",
 		CreatedAt:    time.Now().UTC(),
 		ConfigSeq:    1,
@@ -209,13 +209,13 @@ func TestApplyDeviceUsageSumsAWGAndRealitySources(t *testing.T) {
 	now := time.Now().UTC()
 	if _, err := s.store.applyDeviceUsageAndBlocks("worker-a", []deviceUsage{{
 		DeviceID:     "device-a",
-		AWGPublicKey: "awg-pub-a",
+		AWGPublicKey: testDeviceAWGKey("awg-pub-a"),
 	}}, now); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := s.store.applyDeviceUsageAndBlocks("worker-a", []deviceUsage{{
 		DeviceID:     "device-a",
-		AWGPublicKey: "awg-pub-a",
+		AWGPublicKey: testDeviceAWGKey("awg-pub-a"),
 		RxBytes:      50,
 		TxBytes:      5,
 	}, {
@@ -318,7 +318,7 @@ func TestApplyDeviceUsageAdoptsFirstBaselineForLegacyUsage(t *testing.T) {
 	putQuotaDevice(t, s, deviceRecord{
 		ID:           "device-a",
 		Status:       "approved",
-		AWGPublicKey: "awg-pub-a",
+		AWGPublicKey: testDeviceAWGKey("awg-pub-a"),
 		InternalIP:   "10.13.13.10/32",
 		RealityUUID:  "uuid-a",
 		UsageRxBytes: 80,
@@ -328,7 +328,7 @@ func TestApplyDeviceUsageAdoptsFirstBaselineForLegacyUsage(t *testing.T) {
 	})
 	now := time.Now().UTC()
 	if _, err := s.store.applyDeviceUsageAndBlocks("worker-a", []deviceUsage{{
-		AWGPublicKey: "awg-pub-a",
+		AWGPublicKey: testDeviceAWGKey("awg-pub-a"),
 		RxBytes:      80,
 		TxBytes:      20,
 	}}, now); err != nil {
@@ -342,7 +342,7 @@ func TestApplyDeviceUsageAdoptsFirstBaselineForLegacyUsage(t *testing.T) {
 		t.Fatalf("first legacy report double-counted usage=(%d,%d), want (80,20)", rec.UsageRxBytes, rec.UsageTxBytes)
 	}
 	if _, err := s.store.applyDeviceUsageAndBlocks("worker-a", []deviceUsage{{
-		AWGPublicKey: "awg-pub-a",
+		AWGPublicKey: testDeviceAWGKey("awg-pub-a"),
 		RxBytes:      90,
 		TxBytes:      25,
 	}}, now); err != nil {
@@ -364,7 +364,7 @@ func TestApplyDeviceUsageBlocksExpiredDeviceWithoutUsage(t *testing.T) {
 	putQuotaDevice(t, s, deviceRecord{
 		ID:           "device-a",
 		Status:       "approved",
-		AWGPublicKey: "awg-pub-a",
+		AWGPublicKey: testDeviceAWGKey("awg-pub-a"),
 		InternalIP:   "10.13.13.10/32",
 		RealityUUID:  "uuid-a",
 		Limits:       deviceLimits{ExpiresAt: &expired},

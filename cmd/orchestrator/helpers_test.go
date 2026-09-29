@@ -88,7 +88,7 @@ func enrollDeviceForTestWithAWG(t *testing.T, s *server, token string, awgPublic
 		Model:           "A15",
 		EnrollmentNonce: "nonce",
 		ClientVersion:   "public-test",
-		AWGPublicKey:    awgPublicKey,
+		AWGPublicKey:    testDeviceAWGKeyOf(awgPublicKey),
 	})
 	resp, err := s.handleDeviceEnroll(make([]byte, 32), raw)
 	if err != nil {
@@ -554,3 +554,18 @@ const (
 	testRealityPublicKey = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
 	testAWGPublicKey     = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
 )
+
+// testDeviceAWGKey is a valid 32-byte AWG public key derived from label, for
+// fixtures: enrollment only accepts strict base64 keys.
+func testDeviceAWGKey(label string) string {
+	sum := sha256.Sum256([]byte("awg-test-key:" + label))
+	return base64.StdEncoding.EncodeToString(sum[:])
+}
+
+// testDeviceAWGKeyOf keeps a valid key and maps a fixture label to one.
+func testDeviceAWGKeyOf(value string) string {
+	if key, ok := canonicalAWGKey(value); ok {
+		return key
+	}
+	return testDeviceAWGKey(value)
+}
