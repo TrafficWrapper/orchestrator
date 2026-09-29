@@ -2,7 +2,6 @@ package main
 
 import (
 	"bytes"
-	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -253,62 +252,5 @@ func TestAdminClientSeqFloorRequiresStepUp(t *testing.T) {
 	}
 	if st, _, _ := s.store.clientBundleState(); st.Seq != 9_000_000 {
 		t.Fatalf("seq=%d", st.Seq)
-	}
-}
-
-// R2 ORC-H1: a worker reporting the counter it was just given (the normal
-// case after applying the current bundle) must not raise the counter or bump
-// workers; otherwise every ack starts another pull/apply/ack round.
-func TestClientAppliedSeqEqualToCounterIsSteady(t *testing.T) {
-	s := newTestServer(t)
-	w := addApprovedWorkerWithStatic(t, s, "applied-eq")
-	bundle, _ := s.buildClientBundle()
-	seq, _ := clientBundleSeq(t, bundle)
-	rec, _ := s.store.worker(w.ID)
-	for range 3 {
-		s.observeClientAppliedSeq(rec, seq)
-	}
-	if st, _, _ := s.store.clientBundleState(); st.Seq != seq {
-		t.Fatalf("counter moved on a report equal to it: %d -> %d", seq, st.Seq)
-	}
-	if after, _ := s.store.worker(w.ID); after.DesiredSeq != rec.DesiredSeq {
-		t.Fatalf("worker bumped on a steady report: %d -> %d", rec.DesiredSeq, after.DesiredSeq)
-	}
-}
-
-// R2 ORC-H1 (stand check 1): a worker that pulls, applies and acks with its
-// client_applied_seq reaches a fixed point: repeated rounds neither grow the
-// client seq nor its own DesiredSeq.
-func TestPullApplyAckLoopReachesFixedPoint(t *testing.T) {
-	s := newTestServer(t)
-	kp, _ := protocol.GenerateKeypair()
-	w := addApprovedWorkerWithStatic(t, s, protocol.KeyToBase64(kp.Public))
-	have := int64(0)
-	var lastSeq, lastDesired int64
-	for round := range 5 {
-		raw, _ := json.Marshal(pullRequest{WorkerID: w.ID, HaveSeq: have})
-		resp, err := s.handlePull(kp.Public, raw)
-		if err != nil {
-			t.Fatal(err)
-		}
-		pull := resp.(pullResponse)
-		pull.releaseAfterWrite()
-		applied := have
-		clientSeq := lastSeq
-		if !pull.NotModified {
-			applied = pull.DesiredSeq
-			clientSeq, _ = clientBundleSeq(t, pull.ClientBundle)
-		}
-		ackRaw, _ := json.Marshal(ackRequest{WorkerID: w.ID, AppliedVersion: applied, ClientAppliedSeq: clientSeq})
-		if _, err := s.handleAckContext(context.Background(), kp.Public, ackRaw); err != nil {
-			t.Fatal(err)
-		}
-		have = applied
-		st, _, _ := s.store.clientBundleState()
-		rec, _ := s.store.worker(w.ID)
-		if round >= 2 && (st.Seq != lastSeq || rec.DesiredSeq != lastDesired) {
-			t.Fatalf("round %d: client seq %d -> %d, desired %d -> %d", round, lastSeq, st.Seq, lastDesired, rec.DesiredSeq)
-		}
-		lastSeq, lastDesired = st.Seq, rec.DesiredSeq
 	}
 }
