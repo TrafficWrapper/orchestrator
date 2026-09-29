@@ -153,6 +153,11 @@ func (s *server) deviceEnroll(peer []byte, raw []byte) (any, error) {
 		if err != nil {
 			return nil, err
 		}
+		if existing.CredentialRotation == deviceRotationPending {
+			if existing, err = s.store.applyPendingRotation(existing.ID); err != nil {
+				return nil, err
+			}
+		}
 		// Re-enrollment after an app upgrade or downgrade re-negotiates Vision
 		// and records the new version, so the returned bundle picks the AWG
 		// profile for the version actually installed.

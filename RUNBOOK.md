@@ -201,6 +201,13 @@ below what they have seen, so it must never go backwards:
   (or set `ORCH_CLIENT_SEQ_FLOOR` before the first start on the restored DB).
 - Workers that are ahead of their config seq after a restore are moved past
   it automatically on their next pull, nudge or ack.
+- On every start the counter is moved above the highest worker seq, so a
+  temporary rollback to a binary that derived the client seq from worker seqs
+  never leaves the counter below what clients saw. This republishes the same
+  content once per start.
+- The signer refuses a seq more than 10,000,000 above the last one it signed,
+  so a floor further than that is refused; raise it in steps.
+  `ORCH_CLIENT_SEQ_FLOOR` is approached in such steps automatically.
 
 ## Discovery feed exposure
 
@@ -268,8 +275,13 @@ directory and start it again.
    accounts on its normal apply path; after it acks that config (or after 10
    minutes) it is refused too. Live sessions on an old worker survive until
    they reconnect, and the worker still knows every REALITY UUID it served.
-3. Rotate affected per-device transport material: re-enroll the devices the
-   worker served so their REALITY UUIDs and AWG credentials change.
+3. Rotate affected per-device transport material:
+   `POST /admin/v1/devices/rotate-credentials {"ids": [...] | "all": true, "current_secret": ..., "totp_code": ...}`
+   (step-up). Each device gets a new REALITY UUID and new AWG pre-shared keys
+   at its next re-enrollment, returned in that same response, so it never
+   loses its routes. Add `"immediate": true` to change them at once instead:
+   the old values stop working right away and each device reconnects after it
+   re-enrolls. Re-enrollment alone does not rotate anything.
 4. Remove the worker from seed workers.
 5. Preserve logs/state privately for incident analysis.
 

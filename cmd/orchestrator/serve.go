@@ -81,6 +81,9 @@ func runServe(cfg orchConfig) error {
 	background.Add(6)
 	go func() { defer background.Done(); s.runNoiseSessionJanitor(ctx) }()
 	go func() { defer background.Done(); s.runWorkerJanitor(ctx) }()
+	if err := s.catchUpClientSeq(time.Now().UTC()); err != nil {
+		log.Printf("client seq catch-up: %v", err)
+	}
 	go func() { defer background.Done(); s.runClientBundlePublisher(ctx) }()
 	go func() { defer background.Done(); s.runAPKManifestReissue(ctx) }()
 	go func() { defer background.Done(); s.runDiscoveryPublisher(ctx) }()
@@ -486,6 +489,7 @@ func (s *server) apiRoutes() []apiRoute {
 		{"/admin/v1/workers/short-id", s.admin(adminPOST, s.handleAdminWorkerShortID)},
 		{"/admin/v1/workers/awg-drain", s.admin(adminPOST, s.handleAdminWorkerAWGDrain)},
 		{"/admin/v1/devices", s.admin(adminGET, s.handleAdminDevices)},
+		{"/admin/v1/devices/rotate-credentials", s.admin(adminPOST, s.handleAdminRotateDeviceCredentials)},
 		{"/admin/v1/config", s.admin(adminGET, s.handleAdminConfig)},
 		{"/admin/v1/config/edit", s.admin(adminPOST, s.handleAdminConfigEdit)},
 		{"/admin/v1/apk/status", s.admin(adminGET, s.handleAdminAPKStatus)},
