@@ -60,8 +60,11 @@ func workerRevokeFinal(rec workerRecord, request []string, now time.Time) bool {
 }
 
 // workerGetsDevices reports whether a worker may receive device credentials.
+// "inactive" only means the orchestrator has not heard from the worker for a
+// while (it may be the orchestrator's own downtime): it stays an approved
+// worker, so a returning worker keeps its devices and its reports count.
 func workerGetsDevices(rec workerRecord) bool {
-	return (rec.Status == "approved" || rec.Status == "active") && !rec.Disabled
+	return (rec.Status == "approved" || rec.Status == "active" || rec.Status == "inactive") && !rec.Disabled
 }
 
 type workerRefusal struct {

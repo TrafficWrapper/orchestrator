@@ -190,7 +190,7 @@ func (s *orchStore) raiseClientSeq(seq int64, now time.Time) (clientBundleState,
 }
 
 // observeClientAppliedSeq handles an ack's client_applied_seq: a worker that
-// already applied a client bundle at or above the counter (restored DB)
+// already applied a client bundle above the counter (restored DB)
 // moves the counter past it, within a bounded window; anything further is
 // only reported.
 func (s *server) observeClientAppliedSeq(rec workerRecord, applied int64) {
@@ -198,7 +198,9 @@ func (s *server) observeClientAppliedSeq(rec workerRecord, applied int64) {
 		return
 	}
 	st, found, err := s.store.clientBundleState()
-	if err != nil || !found || applied < st.Seq {
+	// A report equal to the counter is the steady state (the worker applied
+	// the current bundle); only a report above it means a restored DB.
+	if err != nil || !found || applied <= st.Seq {
 		return
 	}
 	if applied > st.Seq+clientAppliedSeqWindow {

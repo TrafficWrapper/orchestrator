@@ -71,7 +71,9 @@ func (s *server) clientBundleContent() (map[string]any, error) {
 	items := []any{}
 	awgExcluded := s.awgConflictWorkers(workers)
 	for _, rec := range workers {
-		if !workerGetsDevices(rec) || !workerFreshForClients(rec, now) {
+		// Clients are only sent to workers heard from recently; an inactive
+		// worker keeps its devices but is not offered as a route.
+		if !workerGetsDevices(rec) || rec.Status == "inactive" || !workerFreshForClients(rec, now) {
 			continue
 		}
 		// Each worker is validated on its own: one bad self_describe drops
