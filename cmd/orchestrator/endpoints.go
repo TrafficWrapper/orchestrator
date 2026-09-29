@@ -554,7 +554,7 @@ func (s *server) discoveryBundleJSON(now time.Time) (string, error) {
 			continue
 		}
 		// Validate per worker so one bad worker never takes the feed down.
-		if item, ok := discoveryAWGEndpoint(rec); ok {
+		if item, ok := discoveryAWGEndpoint(rec); ok && feedEntryDecodes(rec.ID, "awg", item, &feedAWGEntry{}) {
 			if _, bad := findForbiddenKey(item); !bad {
 				item["worker_id"] = rec.ID
 				awg = append(awg, item)
@@ -565,7 +565,7 @@ func (s *server) discoveryBundleJSON(now time.Time) (string, error) {
 		if !full {
 			continue
 		}
-		if item, ok := discoveryRealityEndpoint(rec); ok {
+		if item, ok := discoveryRealityEndpoint(rec); ok && feedEntryDecodes(rec.ID, "reality", item, &feedRealityEntry{}) {
 			if _, bad := findForbiddenKey(item); !bad {
 				item["worker_id"] = rec.ID
 				reality = append(reality, item)
